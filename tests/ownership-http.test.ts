@@ -6,6 +6,7 @@ import { POST as submitAttemptRoute } from "@/app/api/children/[id]/attempts/rou
 import { GET as getConsent, POST as postConsent } from "@/app/api/children/[id]/consent/route";
 import { GET as getCompanion } from "@/app/api/children/[id]/companion/route";
 import { GET as getHome } from "@/app/api/children/[id]/home/route";
+import { GET as getParentSummary } from "@/app/api/children/[id]/parent-summary/route";
 import { POST as startSessionRoute } from "@/app/api/children/[id]/sessions/route";
 import { GET as getBoundaryOptionsRoute } from "@/app/api/children/[id]/sessions/[sessionId]/boundary-options/route";
 import { POST as endSessionRoute } from "@/app/api/children/[id]/sessions/[sessionId]/end/route";
@@ -105,6 +106,24 @@ describe("child route ownership", () => {
     expect(sessionId).toBeTruthy();
     expect(count("practice_sessions")).toBe(1);
 
+    const summary = await call(
+      getParentSummary,
+      `http://127.0.0.1/api/children/${childId}/parent-summary`,
+      { id: childId },
+    );
+    expect(summary.status).toBe(200);
+    expect(summary.body).toMatchObject({
+      childId,
+      practiced: false,
+      minutes: 0,
+      focusConcept: null,
+      bandMovement: { from: null, to: null, moved: false },
+      story: "No practice yet.",
+    });
+    expect(JSON.stringify(summary.body)).not.toMatch(
+      /attemptId|\/attempts|score|confidence|href/i,
+    );
+
     const companion = await call(
       getCompanion,
       `http://127.0.0.1/api/children/${childId}/companion`,
@@ -125,6 +144,15 @@ describe("child route ownership", () => {
         name: "home",
         run: () =>
           call(getHome, `http://127.0.0.1/api/children/${childId}/home`, { id: childId }),
+      },
+      {
+        name: "parent summary",
+        run: () =>
+          call(
+            getParentSummary,
+            `http://127.0.0.1/api/children/${childId}/parent-summary`,
+            { id: childId },
+          ),
       },
       {
         name: "companion",
@@ -248,6 +276,12 @@ describe("child route ownership", () => {
       { id: childId },
     );
     expect(companion.status).toBe(401);
+    const summary = await call(
+      getParentSummary,
+      `http://127.0.0.1/api/children/${childId}/parent-summary`,
+      { id: childId },
+    );
+    expect(summary.status).toBe(401);
   });
 
   it("still lets the owner submit and end that same session", async () => {

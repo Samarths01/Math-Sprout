@@ -18,6 +18,8 @@ import { currentGuardian } from "@/lib/http";
 import { interfaceCopy } from "@/lib/interface-copy";
 import { readOfflineCap } from "@/lib/offline-cap";
 import { readPauseHold } from "@/lib/pause-hold";
+import { ParentOneBreathCard } from "@/components/parent-one-breath";
+import { readParentSummary } from "@/lib/parent-summary";
 import { formatTimeZone } from "@/lib/timezones";
 import { cn } from "@/lib/utils";
 import { redirect } from "next/navigation";
@@ -127,6 +129,9 @@ export default async function ParentHomePage() {
                         ? "Practice is allowed. The child home can start a session."
                         : child.reason}
                     </p>
+                    <ParentOneBreathCard
+                      summary={readParentSummary(getDb(), guardian.id, child.id)}
+                    />
                     <PauseHoldNotice guardianId={guardian.id} childId={child.id} />
                     <OfflineCapNotice guardianId={guardian.id} childId={child.id} />
                     <ConsentControls

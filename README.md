@@ -10,7 +10,9 @@ Slice 4 replaces the quiet-mint stub. XP is an append-only credit on the Qualify
 
 A qualifying practice day is an honest Recommended or Challenge try on the child's local calendar day. That event is the only heat. The first qualifying day sets the streak to Warm. A qualifying day on the next calendar day, while the flame is still Hot, Warm, or Ember, sets it to Hot. Any longer gap starts again at Warm. The same local day does not heat again. With no new qualifying day, the flame cools to Ember until `ember_expires_at`, then to Dormant. The server stores `streak_state`, `ember_expires_at`, and `last_qualifying_day` using `child.timezone`. Nothing subtracts XP.
 
-Slice 5 projects that bus onto the child companion. One BuildGoal is active. Its pieces are the `BadgeMilestone`, `BuildPieceUnlock`, and `LevelUpSlight` rows already on the bus, in that order. A hot streak is the `BuildPieceUnlock` whose source is `streak_hot`. There is no piece balance, no shop, and no second XP ledger. The badge screen lists `BadgeMilestone` rows. The sprout on the child home follows the streak machine: Warm, Hot, Ember, or Dormant. Ember is the only state with a recovery affordance, and that affordance is a careful practice try, still behind consent. The parent home still does not tell a progress story.
+Slice 5 projects that bus onto the child companion. One BuildGoal is active. Its pieces are the `BadgeMilestone`, `BuildPieceUnlock`, and `LevelUpSlight` rows already on the bus, in that order. A hot streak is the `BuildPieceUnlock` whose source is `streak_hot`. There is no piece balance, no shop, and no second XP ledger. The badge screen lists `BadgeMilestone` rows. The sprout on the child home follows the streak machine: Warm, Hot, Ember, or Dormant. Ember is the only state with a recovery affordance, and that affordance is a careful practice try, still behind consent. The child home and parent home payloads stay free of a second progress ledger.
+
+Slice 6 is the parent one-breath card on that home. It reads today's committed practice: minutes, the focus concept, and whether that concept's band moved. It does not list answers or link to them.
 
 Each attempt and practice session stores `policy_version` (`rules-v0`). The server attempt log carries that same string with the concept, item, difficulty, lanes, correctness, latency, integrity flags, session id, and idempotency key. Kids still receive only `ClientView`. Production scoring stays the rules `MasteryEstimator`. The eval harness that baselines later policies against `rules-v0` is Signal-owned and offline. This app does not run a second scorer.
 
@@ -42,7 +44,7 @@ npm start
 
 1. Create a parent account or log in. Children do not sign up.
 2. Add a child. Timezone is required on the profile. If you leave the default selected, the server stores your timezone, or `America/Los_Angeles` when yours is unset.
-3. Grant, pause, or revoke consent from the parent home. Only `granted` allows practice.
+3. Grant, pause, or revoke consent from the parent home. Only `granted` allows practice. Each child card also shows today's one-breath story: minutes, the focus concept, and the band. Before any committed practice, that story is "No practice yet."
 4. Open the child home. The Start practice button stays disabled until consent is granted. Missing, paused, and revoked consent do not start a session.
 5. With consent granted, start practice. Answer a problem from the operations or fractions pack. The response names what went well, one focus, what to try next, and a lock-in. One focus is the server string from that item's misconception tag, shown as sent. A queued try does not move the skill band until the server commits it. The response does not show a score or a confidence number.
 6. If the connection drops while consent is still granted, the answer stays in a device queue and syncs with the same idempotency key when the connection returns. A replay returns the original attempt, the original `ClientView`, and the original event ids. That response is the saved try, not an empty 409. The unsynced queue holds at most 3 tries. At that cap the child stays on the same problem, and the parent home shows a sync-limit note. That note does not say practice is paused. Pause holds a pending queue for a parent-visible wait and a quiet resume. Pause does not drop the queue. Revoke drops the queue and does not sync it. This offline queue is not claimed as a kid-reachable ship. One focus is the server string assembled from that item's misconception tag, shown as sent.
@@ -72,6 +74,7 @@ The same Next.js server is the API. All child and consent routes require the par
 | GET | `/api/children/:id/home` | `{ practiceAllowed, reason?, child }`. |
 | GET | `/api/children/:id/companion` | The child companion: one active BuildGoal, badge rows, and the streak surface. Pieces and badges are projections of QualifyingEvent ids. Ember includes a recovery copy key. This payload has no XP total, score, or confidence. |
 | GET | `/api/parent/home` | Guardian plus children and consent. |
+| GET | `/api/children/:id/parent-summary` | One-breath card for the child's local today: `minutes`, `focusConcept`, `bandMovement`, and `story`. Derived from committed attempts and `MasteryBandTransition` events. No attempt list, answer, score, or confidence. |
 | POST | `/api/children/:id/sessions` | Start or resume a practice session when consent is `granted`. Returns `{ sessionId, item, lane, atBoundary, clientView }`. `clientView` is the stored chip for that problem's skill, when one exists. |
 | POST | `/api/children/:id/pause-hold` | Record one paused try on the parent-visible hold. Body matches an attempt. Allowed only while consent is `paused`. The stored receipt is the idempotency key and session id. |
 | GET | `/api/children/:id/pause-hold` | `{ visible, waiting }` for a paused child, or for a granted child who still has uncredited holds. Otherwise `{ visible: false, waiting: 0 }`. |
@@ -151,3 +154,11 @@ Slice 5 adds:
 - the badge screen lists bus `BadgeMilestone` rows
 - Ember is the only streak state with a recovery affordance, and Warm, Hot, and Dormant are not
 - the child home and parent home payloads stay free of a second progress ledger
+
+Slice 6 adds:
+
+- `GET /api/children/:id/parent-summary` is a one-breath card: minutes, focus concept, and band movement for the child's local today
+- the focus concept is the skill with the most committed answering time today; the band is that skill's latest `MasteryBandTransition`, or the held soft-state label when the band did not move
+- the card and the parent home do not link to attempt history, and the summary does not include answers, scores, or confidence
+- a day with no committed practice is "No practice yet." or "No practice yet today."
+- pause still holds practice and revoke still blocks it; the story of work already committed stays, because revoke is not a delete

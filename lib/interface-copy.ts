@@ -31,6 +31,9 @@ export const INTERFACE_COPY = {
   "offline.cap.kid": "These answers are waiting to sync. Stay with this problem.",
   "offline.cap.waiting": "The offline limit is full. Answers are waiting to sync.",
   "offline.cap.detail": "They stay on this focus until the practice record catches up.",
+  "parent.breath.empty": "No practice yet.",
+  "parent.breath.emptyToday": "No practice yet today.",
+  "parent.breath.noBand": "No band movement yet",
 } as const;
 
 export type InterfaceCopyKey = keyof typeof INTERFACE_COPY;
