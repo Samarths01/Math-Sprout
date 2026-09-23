@@ -10,6 +10,8 @@ Slice 4 replaces the quiet-mint stub. XP is an append-only credit on the Qualify
 
 A qualifying practice day is an honest Recommended or Challenge try on the child's local calendar day. That event is the only heat for the streak: Hot, then Warm, then Ember, then Dormant. The server stores `streak_state`, `ember_expires_at`, and `last_qualifying_day` using `child.timezone`. Badge screens, BuildGoal, and ember recovery chrome are Slice 5. Nothing subtracts XP.
 
+Each attempt and practice session stores `policy_version` (`rules-v0`). The server attempt log carries that same string with the concept, item, difficulty, lanes, correctness, latency, integrity flags, session id, and idempotency key. Kids still receive only `ClientView`. Production scoring stays the rules `MasteryEstimator`. The eval harness that baselines later policies against `rules-v0` is Signal-owned and offline. This app does not run a second scorer.
+
 ## Run locally
 
 Requirements: Node.js 22 and npm.
@@ -125,3 +127,5 @@ Slice 4 adds:
 - `celebrationTier` matches the mints in that transaction, and `full` without a credit fails closed
 - review sessions per week are capped at the mint, and review cannot mint LevelUpSlight, a badge, or a build piece
 - QualifyingPracticeDay heats the streak from the child timezone: Hot, Warm, Ember, Dormant
+- attempts and sessions store `policy_version` `rules-v0`, and the server attempt log includes it
+- empty, too-fast, duplicate-key, and identical-spam responses keep `ClientView` free of score and confidence

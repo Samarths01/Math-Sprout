@@ -35,6 +35,8 @@ import {
   planAttemptEconomy,
   readChildTimeZone,
 } from "@/lib/qualifying-bus";
+import { readAttemptLog } from "@/lib/attempt-log";
+import { POLICY_VERSION } from "@/lib/policy";
 import { practiceGate } from "@/lib/practice-gate";
 
 const KEY_PATTERN = /^[A-Za-z0-9_-]{8,80}$/;
@@ -291,9 +293,10 @@ export function startPracticeSession(
     const sessionId = randomUUID();
     db.prepare(
       `INSERT INTO practice_sessions (
-         id, child_id, status, item_index, started_at, practice_lane, phase
-       ) VALUES (?, ?, 'active', ?, ?, ?, 'practicing')`,
-    ).run(sessionId, childId, itemIndex, nowIso(), progress.nextLane);
+         id, child_id, status, item_index, started_at, practice_lane, phase,
+         policy_version
+       ) VALUES (?, ?, 'active', ?, ?, ?, 'practicing', ?)`,
+    ).run(sessionId, childId, itemIndex, nowIso(), progress.nextLane, POLICY_VERSION);
     const created = readPracticeSession(db, childId, sessionId);
     if (!created) throw new DomainError("Practice session was not saved.", 500);
     return created;
@@ -392,11 +395,11 @@ export function submitAttempt(
       `INSERT INTO attempts (
          id, child_id, session_id, idempotency_key, item_id, answer, shown_at,
          submitted_at, correct, lane, celebration_tier, flags_json, beats_json,
-         client_view_json, created_at
+         client_view_json, created_at, policy_version
        ) VALUES (
          @id, @child_id, @session_id, @idempotency_key, @item_id, @answer, @shown_at,
          @submitted_at, @correct, @lane, @celebration_tier, @flags_json, @beats_json,
-         @client_view_json, @created_at
+         @client_view_json, @created_at, @policy_version
        )`,
     ).run({
       id: attemptId,
@@ -414,6 +417,7 @@ export function submitAttempt(
       beats_json: JSON.stringify(beats),
       client_view_json: JSON.stringify(economy.clientView),
       created_at: createdAt,
+      policy_version: POLICY_VERSION,
     });
     commitAttemptEconomy(db, {
       childId,
@@ -433,6 +437,10 @@ export function submitAttempt(
     ).run((session.item_index + 1) % ITEM_CATALOG.length, session.id);
     const stored = findAttempt(db, childId, idempotencyKey);
     if (!stored) throw new DomainError("Attempt was not saved.", 500);
+    const log = readAttemptLog(db, stored.id);
+    if (log.policyVersion !== POLICY_VERSION) {
+      throw new DomainError("Attempt log is missing policy_version.", 500);
+    }
     return resultFromRow(db, stored, false);
   });
 

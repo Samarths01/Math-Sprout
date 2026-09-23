@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import Database from "better-sqlite3";
+import { POLICY_VERSION } from "./policy";
 
 const MIGRATION = `
 CREATE TABLE IF NOT EXISTS guardians (
@@ -44,7 +45,8 @@ CREATE TABLE IF NOT EXISTS practice_sessions (
   started_at TEXT NOT NULL,
   practice_lane TEXT NOT NULL DEFAULT 'recommended' CHECK (practice_lane IN ('recommended', 'challenge', 'review')),
   phase TEXT NOT NULL DEFAULT 'practicing' CHECK (phase IN ('practicing', 'boundary', 'closed')),
-  progression TEXT CHECK (progression IN ('stay', 'remediate', 'levelUpSlight'))
+  progression TEXT CHECK (progression IN ('stay', 'remediate', 'levelUpSlight')),
+  policy_version TEXT NOT NULL DEFAULT '${POLICY_VERSION}'
 );
 
 CREATE TABLE IF NOT EXISTS learner_skill_state (
@@ -91,6 +93,7 @@ CREATE TABLE IF NOT EXISTS attempts (
   beats_json TEXT NOT NULL,
   client_view_json TEXT NOT NULL,
   created_at TEXT NOT NULL,
+  policy_version TEXT NOT NULL DEFAULT '${POLICY_VERSION}',
   UNIQUE (child_id, idempotency_key)
 );
 
@@ -315,6 +318,18 @@ export function migrateEconomy(db: Database.Database): void {
   }
   if (progress.size > 0 && !progress.has("last_qualifying_day")) {
     db.exec(`ALTER TABLE learner_progress ADD COLUMN last_qualifying_day TEXT`);
+  }
+  const sessions = tableColumns(db, "practice_sessions");
+  if (sessions.size > 0 && !sessions.has("policy_version")) {
+    db.exec(
+      `ALTER TABLE practice_sessions ADD COLUMN policy_version TEXT NOT NULL DEFAULT '${POLICY_VERSION}'`,
+    );
+  }
+  const attempts = tableColumns(db, "attempts");
+  if (attempts.size > 0 && !attempts.has("policy_version")) {
+    db.exec(
+      `ALTER TABLE attempts ADD COLUMN policy_version TEXT NOT NULL DEFAULT '${POLICY_VERSION}'`,
+    );
   }
   db.exec(`
     CREATE TRIGGER IF NOT EXISTS xp_events_no_update

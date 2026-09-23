@@ -9,6 +9,7 @@ import { XP_AMOUNT, type CelebrationTier } from "@/lib/attempt-contract";
 import { startPracticeSession, submitAttempt, type SubmitAttemptInput } from "@/lib/attempts";
 import { choosePracticeLane, endPracticeSession } from "@/lib/boundary";
 import { openDatabase } from "@/lib/db";
+import { POLICY_VERSION } from "@/lib/policy";
 import { createChild, createGuardian, setConsent } from "@/lib/domain";
 import { REVIEW_SESSIONS_PER_WEEK } from "@/lib/economy-config";
 import {
@@ -580,5 +581,62 @@ describe("slice 3 economy upgrade", () => {
         .all() as Array<{ name: string }>
     ).map((table) => table.name);
     expect(names).toEqual(["qualifying_events"]);
+  });
+
+  it("backfills policy_version on sessions and attempts that predate the column", () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "math-sprout-policy-upgrade-"));
+    const filename = path.join(dir, "old.sqlite");
+    const raw = new Database(filename);
+    raw.exec(`
+      CREATE TABLE practice_sessions (
+        id TEXT PRIMARY KEY,
+        child_id TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('active')),
+        item_index INTEGER NOT NULL,
+        started_at TEXT NOT NULL
+      );
+      INSERT INTO practice_sessions (id, child_id, status, item_index, started_at)
+      VALUES ('sess-old', 'child-old', 'active', 0, '2026-01-01T00:00:00.000Z');
+      CREATE TABLE attempts (
+        id TEXT PRIMARY KEY,
+        child_id TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        idempotency_key TEXT NOT NULL,
+        item_id TEXT NOT NULL,
+        answer TEXT NOT NULL,
+        shown_at TEXT NOT NULL,
+        submitted_at TEXT NOT NULL,
+        correct INTEGER NOT NULL,
+        lane TEXT NOT NULL,
+        celebration_tier TEXT NOT NULL,
+        flags_json TEXT NOT NULL,
+        beats_json TEXT NOT NULL,
+        client_view_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      INSERT INTO attempts (
+        id, child_id, session_id, idempotency_key, item_id, answer, shown_at,
+        submitted_at, correct, lane, celebration_tier, flags_json, beats_json,
+        client_view_json, created_at
+      ) VALUES (
+        'attempt-old', 'child-old', 'sess-old', 'old-key-0001', 'ops-g2-add', '42',
+        '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:02.000Z', 1, 'celebrate', 'full',
+        '[]', '{}', '{}', '2026-01-01T00:00:02.000Z'
+      );
+    `);
+    raw.close();
+    const db = openDatabase(filename);
+    cleanups.push(() => {
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    });
+    const session = db
+      .prepare(`SELECT policy_version FROM practice_sessions WHERE id = ?`)
+      .get("sess-old") as { policy_version: string };
+    const attempt = db
+      .prepare(`SELECT policy_version FROM attempts WHERE id = ?`)
+      .get("attempt-old") as { policy_version: string };
+    expect(session.policy_version).toBe(POLICY_VERSION);
+    expect(attempt.policy_version).toBe("rules-v0");
   });
 });

@@ -22,7 +22,9 @@ import { openDatabase } from "@/lib/db";
 import { DomainError, createChild, createGuardian, setConsent } from "@/lib/domain";
 import { ITEM_CATALOG } from "@/lib/item-catalog";
 import { assertBankMatchesCatalog, gradeAnswer } from "@/lib/item-bank";
+import { readAttemptLog } from "@/lib/attempt-log";
 import { MasteryEstimator } from "@/lib/mastery";
+import { POLICY_VERSION } from "@/lib/policy";
 import {
   createAttemptQueue,
   memoryQueueStore,
@@ -87,6 +89,28 @@ function input(
   };
 }
 
+function expectClientViewSealed(result: AttemptResult) {
+  expect(Object.keys(result.clientView).sort()).toEqual([
+    "bandLabel",
+    "celebrationTier",
+    "showConceptChip",
+  ]);
+  expect(["Still learning", "Getting it", "Got it"]).toContain(result.clientView.bandLabel);
+  expect(["none", "quietXp", "full"]).toContain(result.clientView.celebrationTier);
+  expect(typeof result.clientView.showConceptChip).toBe("boolean");
+  const view = JSON.stringify(result.clientView);
+  expect(view).not.toMatch(/score|confidence|percent/i);
+  expect(result.clientView).not.toHaveProperty("score");
+  expect(result.clientView).not.toHaveProperty("confidence");
+  expect(result.clientView).not.toHaveProperty("scorePercent");
+  expect(result).not.toHaveProperty("score");
+  expect(result).not.toHaveProperty("confidence");
+  expect(result).not.toHaveProperty("policyVersion");
+  expect(JSON.stringify(result)).not.toMatch(
+    /scorePercent|confidence|rawConfidence|percentCorrect/i,
+  );
+}
+
 function xpRows(db: Database.Database) {
   return db
     .prepare(
@@ -120,6 +144,8 @@ describe("idempotent attempt replay", () => {
     expect(replay.celebrationTier).toBe(first.celebrationTier);
     expect(replay.xpAmount).toBe(first.xpAmount);
     expect(replay.whatWentWell).toBe(first.whatWentWell);
+    expectClientViewSealed(replay);
+    expect(replay.clientView).toEqual(first.clientView);
     expect(count(db, "attempts")).toBe(1);
     expect(count(db, "xp_events")).toBe(1);
     expect(xpRows(db)[0]?.id).toBe(first.eventIds[0]);
@@ -139,6 +165,7 @@ describe("idempotent attempt replay", () => {
       replayed: true,
     });
     expect(replay.eventIds.length).toBeGreaterThan(0);
+    expectClientViewSealed(replay);
     expect(count(db, "xp_events")).toBe(1);
   });
 
@@ -187,6 +214,7 @@ describe("integrity gates", () => {
     });
     expect(result.eventIds).toEqual([]);
     expect(result.xpAmount).toBe(0);
+    expectClientViewSealed(result);
     expect(count(db, "xp_events")).toBe(0);
   });
 
@@ -208,6 +236,7 @@ describe("integrity gates", () => {
     expect(result.lane).toBe("review");
     expect(result.celebrationTier).toBe("none");
     expect(result.eventIds).toEqual([]);
+    expectClientViewSealed(result);
     expect(count(db, "xp_events")).toBe(0);
   });
 
@@ -241,6 +270,7 @@ describe("integrity gates", () => {
     expect(spam?.xpAmount).toBe(XP_AMOUNT.quietXp);
     expect(["quietXp", "none"]).toContain(spam?.celebrationTier);
     expect(spam?.celebrationTier).not.toBe("full");
+    expectClientViewSealed(spam as AttemptResult);
   });
 
   it("limits every review lane to quietXp or none", () => {
@@ -540,6 +570,34 @@ describe("attempt response shape", () => {
     expect(result).not.toHaveProperty("confidence");
     expect(result.clientView).not.toHaveProperty("score");
     expect(result.clientView).not.toHaveProperty("confidence");
+    expectClientViewSealed(result);
+
+    const log = readAttemptLog(db, result.attemptId);
+    expect(log.policyVersion).toBe(POLICY_VERSION);
+    expect(log).toMatchObject({
+      attemptId: result.attemptId,
+      sessionId: session.sessionId,
+      idempotencyKey: result.idempotencyKey,
+      concept: "adding two-digit numbers",
+      itemId: "ops-g2-add",
+      difficulty: 2,
+      practiceLane: "recommended",
+      integrityLane: "celebrate",
+      correct: true,
+      latencyMs: 2_000,
+      clientView: result.clientView,
+    });
+    expect(JSON.stringify(log)).not.toMatch(/score|confidence|percent/i);
+    expect(log).not.toHaveProperty("score");
+    expect(log).not.toHaveProperty("confidence");
+    const sessionPolicy = db
+      .prepare(`SELECT policy_version FROM practice_sessions WHERE id = ?`)
+      .get(session.sessionId) as { policy_version: string };
+    const attemptPolicy = db
+      .prepare(`SELECT policy_version FROM attempts WHERE id = ?`)
+      .get(result.attemptId) as { policy_version: string };
+    expect(sessionPolicy.policy_version).toBe("rules-v0");
+    expect(attemptPolicy.policy_version).toBe("rules-v0");
   });
 
   it("uses the mastery estimator stub without a numeric score", () => {
