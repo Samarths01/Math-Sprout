@@ -5,11 +5,10 @@
 export const INTERFACE_COPY = {
   "streak.hot": "The flame is hot. A qualifying day followed the one before it.",
   "streak.warm": "The flame is warm. A qualifying day started it.",
-  "streak.ember": "The flame is an ember. It cools when today ends.",
+  "streak.ember": "The flame is an ember. A careful try can warm it.",
   "streak.dormant": "The flame is quiet. A careful practice day starts it warm again.",
-  "streak.ember.recover": "Practice today to bring the flame back",
-  "streak.ember.recover.detail":
-    "A careful try before the ember goes out keeps this streak alive.",
+  "streak.ember.recover": "Practice today to warm the flame",
+  "streak.ember.recover.detail": "There is no rush. A careful try today is enough.",
   "build.empty": "Open spots fill from a badge, a slightly harder step, or a hot streak.",
   "build.complete": "This build is full.",
   "badge.empty": "Badges show up here when a skill reaches Got it.",
@@ -19,6 +18,11 @@ export const INTERFACE_COPY = {
   "piece.level": "A little harder",
   "piece.build": "Build piece",
   "piece.streak": "Streak",
+  "fuel.xp.full": "A sprout for that try.",
+  "fuel.xp.quiet": "A quiet sprout. This one stays small.",
+  "fuel.xp.none": "No sprout this time.",
+  "fuel.piece": "A piece of the build is in place.",
+  "fuel.home.sprout": "A sprout grew from a careful try.",
   "pause.hold.waiting": "Answers are waiting while practice is paused.",
   "pause.hold.resuming": "Answers are still waiting to save.",
   "pause.hold.waiting.detail":

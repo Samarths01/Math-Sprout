@@ -7,6 +7,7 @@ import { displayedOneFocus, FOUR_BEAT_KEYS } from "@/lib/attempt-contract";
 import type { BoundaryOptions, PracticeLane } from "@/lib/mastery";
 import { itemAt, ITEM_CATALOG } from "@/lib/item-catalog";
 import { interfaceCopy } from "@/lib/interface-copy";
+import { MintToast } from "@/components/mint-toast";
 import {
   consentQueueReason,
   createAttemptQueue,
@@ -34,12 +35,6 @@ const BEAT_LABELS: Record<(typeof FOUR_BEAT_KEYS)[number], string> = {
   tryNext: "Try next",
   lockIn: "Lock in",
 };
-
-function tierLine(tier: AttemptResult["clientView"]["celebrationTier"]): string {
-  if (tier === "full") return "A sprout for that try.";
-  if (tier === "quietXp") return "A quiet sprout. This one stays small.";
-  return "No sprout this time.";
-}
 
 const PROGRESS_COPY: Record<BoundaryOptions["progression"], string> = {
   stay: "Recommended stays the usual next step.",
@@ -492,13 +487,13 @@ export function PracticeSession({
           {feedback ? (
             <div data-testid="practice-feedback" className="grid gap-4" aria-live="polite">
               {showResumeCelebration(feedback) ? (
-                <p
-                  className="text-sm text-muted-foreground"
-                  data-celebration-tier={feedback.clientView.celebrationTier}
-                >
-                  {tierLine(feedback.clientView.celebrationTier)}
-                  {feedback.replayed ? " This try was already saved." : ""}
-                </p>
+                <MintToast
+                  tier={feedback.clientView.celebrationTier}
+                  credit={feedback.fuel.credit}
+                  eventCount={feedback.eventIds.length}
+                  pieceEventIds={feedback.fuel.pieceEventIds}
+                  replayed={feedback.replayed}
+                />
               ) : (
                 <p
                   data-testid="quiet-resume"

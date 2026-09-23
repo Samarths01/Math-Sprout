@@ -45,7 +45,10 @@ function CompanionFigure({
       viewBox="0 0 120 88"
       className={cn("h-24 w-full", TONE[state])}
       data-testid="companion-figure"
+      data-fuel="heat"
+      data-fuel-source="qualifying-event"
       data-streak-state={state}
+      data-waning={state === "ember" ? "true" : "false"}
       data-growth={grown.toFixed(2)}
       aria-hidden="true"
     >
@@ -86,10 +89,13 @@ export function CompanionState({
   childId,
   practiceAllowed,
   companion,
+  sproutGlance = false,
 }: {
   childId: string;
   practiceAllowed: boolean;
   companion: CompanionView;
+  /** True when accrued XP credits exist. A glance, not a count and not a link. */
+  sproutGlance?: boolean;
 }) {
   const { active, completed } = companion.build;
   const slots = active.complete
@@ -98,7 +104,13 @@ export function CompanionState({
   const recovery = companion.streak.recovery;
 
   return (
-    <Card data-testid="companion" data-streak-state={companion.streak.state}>
+    <Card
+      data-testid="companion"
+      data-streak-state={companion.streak.state}
+      data-fuel-source="qualifying-event"
+      data-heat-event-id={companion.streak.sourceEventId ?? ""}
+      data-waning={companion.streak.state === "ember" ? "true" : "false"}
+    >
       <CardHeader>
         <CardTitle id="companion-heading" className="font-heading text-2xl">
           The sprout
@@ -115,6 +127,17 @@ export function CompanionState({
           <p data-testid="streak-copy" data-copy-key={companion.streak.copyKey}>
             {interfaceCopy(companion.streak.copyKey)}
           </p>
+          {sproutGlance ? (
+            <p
+              data-testid="sprout-glance"
+              data-fuel="xp"
+              data-fuel-source="qualifying-event"
+              data-copy-key="fuel.home.sprout"
+              className="text-sm leading-6 text-muted-foreground"
+            >
+              {interfaceCopy("fuel.home.sprout")}
+            </p>
+          ) : null}
           {recovery ? (
             <div className="grid gap-2" data-testid="ember-recovery">
               <p className="text-sm leading-6 text-muted-foreground" data-copy-key={recovery.detailKey}>
@@ -145,6 +168,8 @@ export function CompanionState({
         <div
           className="grid gap-2"
           data-testid="build-goal"
+          data-fuel="pieces"
+          data-fuel-source="qualifying-event"
           data-goal-id={active.id}
           data-goal-active="true"
           data-piece-count={active.pieces.length}
