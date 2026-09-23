@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { createElement } from "react";
@@ -122,6 +122,22 @@ function assertDerivedOnly(summary: ParentSummary, hidden: string[]) {
   }
 }
 
+describe("parent home chrome order", () => {
+  it("renders pause and sync notices above the one-breath card", () => {
+    const source = readFileSync(new URL("../app/parent/page.tsx", import.meta.url), "utf8");
+    const reason = source.indexOf("child.reason");
+    const pause = source.indexOf("<PauseHoldNotice");
+    const cap = source.indexOf("<OfflineCapNotice");
+    const card = source.indexOf("<ParentOneBreathCard");
+    const consent = source.indexOf("<ConsentControls");
+    expect(reason).toBeGreaterThan(-1);
+    expect(pause).toBeGreaterThan(reason);
+    expect(cap).toBeGreaterThan(pause);
+    expect(card).toBeGreaterThan(cap);
+    expect(consent).toBeGreaterThan(card);
+  });
+});
+
 describe("parent one-breath summary", () => {
   it("stays empty when no practice has been committed", () => {
     const db = tempDb();
@@ -193,6 +209,34 @@ describe("parent one-breath summary", () => {
     expect(html).not.toContain("→");
     expect(html).not.toContain(short.attemptId);
     expect(html).not.toMatch(/\/attempts|attemptId|score|confidence/i);
+  });
+
+  it("does not treat a first band as a movement", () => {
+    const db = tempDb();
+    const { guardian, child, session } = grantedChild(db);
+    submitAttempt(
+      db,
+      guardian.id,
+      child.id,
+      tryInput(
+        session.sessionId,
+        "2026-04-01T18:00:00.000Z",
+        "2026-04-01T18:00:15.000Z",
+      ),
+    );
+    const summary = summaryOf(db, guardian.id, child.id);
+    expect(summary.bandMovement).toEqual({
+      from: null,
+      to: "Getting it",
+      moved: false,
+    });
+    expect(summary.story).toBe(
+      "Today · under a minute. Focus: adding two-digit numbers. Getting it.",
+    );
+    expect(summary.story).not.toContain("→");
+    const html = renderToStaticMarkup(createElement(ParentOneBreathCard, { summary }));
+    expect(html).toContain('data-moved="false"');
+    expect(html).not.toContain("→");
   });
 
   it("shows an arrow only when the focus band moved", () => {

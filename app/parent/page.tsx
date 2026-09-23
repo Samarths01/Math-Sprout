@@ -129,11 +129,11 @@ export default async function ParentHomePage() {
                         ? "Practice is allowed. The child home can start a session."
                         : child.reason}
                     </p>
+                    <PauseHoldNotice guardianId={guardian.id} childId={child.id} />
+                    <OfflineCapNotice guardianId={guardian.id} childId={child.id} />
                     <ParentOneBreathCard
                       summary={readParentSummary(getDb(), guardian.id, child.id)}
                     />
-                    <PauseHoldNotice guardianId={guardian.id} childId={child.id} />
-                    <OfflineCapNotice guardianId={guardian.id} childId={child.id} />
                     <ConsentControls
                       childId={child.id}
                       status={child.consentStatus}

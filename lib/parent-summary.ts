@@ -172,7 +172,7 @@ function movementFor(
   return {
     from: parsed.from,
     to: parsed.to,
-    moved: parsed.from !== parsed.to,
+    moved: parsed.from !== null && parsed.from !== parsed.to,
   };
 }
 
