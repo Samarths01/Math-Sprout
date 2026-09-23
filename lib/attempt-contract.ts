@@ -9,6 +9,11 @@ export type FourBeatKey = (typeof FOUR_BEAT_KEYS)[number];
 
 export type FourBeat = Record<FourBeatKey, string>;
 
+/** Practice renders this server string as sent. Do not substitute local praise. */
+export function displayedOneFocus(beat: Pick<FourBeat, "oneFocus">): string {
+  return beat.oneFocus;
+}
+
 export type IntegrityFlag = "empty_answer" | "too_fast" | "spam_window";
 
 export type ReviewLane = "celebrate" | "review";

@@ -64,15 +64,13 @@ export function emptyQueue(): QueueData {
 
 /**
  * Kid-path disposition for a 403.
- * Pause hold is kept only when `parentVisible` is true — the parent waiting
- * record was saved. A hold the parent cannot see is forbidden and becomes a drop.
- * Revoke and any other 403 drop. Resume of a real hold credits the try quietly.
+ * Pause is hold only: parent-visible waiting, then a quiet resume.
+ * There is no drop-on-pause path. Revoke and missing consent drop.
  */
 export function consentQueueReason(
   body: { error?: string; queueDisposition?: unknown } | null,
-  parentVisible = false,
 ): "hold" | "drop" {
-  if (body?.queueDisposition === "hold" && parentVisible) return "hold";
+  if (body?.queueDisposition === "hold") return "hold";
   return "drop";
 }
 

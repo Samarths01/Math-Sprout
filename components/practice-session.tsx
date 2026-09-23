@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import Link from "next/link";
 import type { AttemptResult, ClientView, PublicItem } from "@/lib/attempt-contract";
-import { FOUR_BEAT_KEYS } from "@/lib/attempt-contract";
+import { displayedOneFocus, FOUR_BEAT_KEYS } from "@/lib/attempt-contract";
 import type { BoundaryOptions, PracticeLane } from "@/lib/mastery";
 import { itemAt, ITEM_CATALOG } from "@/lib/item-catalog";
 import { interfaceCopy } from "@/lib/interface-copy";
@@ -69,12 +69,12 @@ async function postAttempt(childId: string, attempt: QueuedAttempt): Promise<Syn
       | (AttemptResult & { error?: string; queueDisposition?: unknown })
       | null;
     if (response.status === 403) {
-      const parentVisible =
-        body?.queueDisposition === "hold" ? await registerVisibleHold(childId, attempt) : false;
-      const reason = consentQueueReason(body, parentVisible);
+      if (body?.queueDisposition === "hold") {
+        await registerVisibleHold(childId, attempt);
+      }
       return {
         ok: false,
-        reason,
+        reason: consentQueueReason(body),
         message: body?.error ?? "Practice is blocked.",
       };
     }
@@ -478,7 +478,7 @@ export function PracticeSession({
                   <div key={key} className="grid gap-1">
                     <dt className="text-sm font-medium">{BEAT_LABELS[key]}</dt>
                     <dd data-testid={`beat-${key}`} className="text-sm leading-6">
-                      {feedback[key]}
+                      {key === "oneFocus" ? displayedOneFocus(feedback) : feedback[key]}
                     </dd>
                   </div>
                 ))}

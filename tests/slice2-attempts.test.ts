@@ -5,6 +5,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import type Database from "better-sqlite3";
 import {
+  displayedOneFocus,
   FOUR_BEAT_KEYS,
   foldRewards,
   resolveCelebration,
@@ -543,21 +544,20 @@ describe("offline queue reconcile", () => {
         queueDisposition: "hold",
         error: "Practice is paused. A parent can grant consent again from the parent home.",
       }),
-    ).toBe("drop");
-    expect(
-      consentQueueReason({ queueDisposition: "hold" }, true),
     ).toBe("hold");
-    expect(consentQueueReason({ queueDisposition: "drop" }, true)).toBe("drop");
+    expect(consentQueueReason({ queueDisposition: "drop" })).toBe("drop");
+    expect(consentQueueReason(null)).toBe("drop");
 
-    const silent = createAttemptQueue(memoryQueueStore());
-    silent.enqueue(attempt);
-    const droppedSilent = await silent.reconcile(async () => ({
+    const pauseOnly = createAttemptQueue(memoryQueueStore());
+    pauseOnly.enqueue(attempt);
+    const stillHeld = await pauseOnly.reconcile(async () => ({
       ok: false as const,
-      reason: consentQueueReason({ queueDisposition: "hold" }, false),
+      reason: consentQueueReason({ queueDisposition: "hold" }),
       message: "Practice is paused.",
     }));
-    expect(droppedSilent.pending).toEqual([]);
-    expect(droppedSilent.dropped).toHaveLength(1);
+    expect(stillHeld.pending.map((item) => item.idempotencyKey)).toEqual(["paused-key-0001"]);
+    expect(stillHeld.dropped).toEqual([]);
+    expect(stillHeld.held).toBe(1);
     expect(count(db, "attempts")).toBe(0);
 
     const post = async (queued: QueuedAttempt): Promise<SyncPost> => {
@@ -565,17 +565,15 @@ describe("offline queue reconcile", () => {
         return { ok: true, result: submitAttempt(db, guardian.id, child.id, queued) };
       } catch (error) {
         if (error instanceof DomainError && error.status === 403) {
-          let parentVisible = false;
           if (error.queueDisposition === "hold") {
-            const view = registerPauseHold(db, guardian.id, child.id, queued);
-            parentVisible = view.visible === true;
+            registerPauseHold(db, guardian.id, child.id, queued);
           }
           return {
             ok: false,
-            reason: consentQueueReason(
-              { error: error.message, queueDisposition: error.queueDisposition },
-              parentVisible,
-            ),
+            reason: consentQueueReason({
+              error: error.message,
+              queueDisposition: error.queueDisposition,
+            }),
             message: error.message,
           };
         }
@@ -864,6 +862,7 @@ describe("attempt response shape", () => {
     });
     expect(result.celebrationTier).toBe(result.clientView.celebrationTier);
     expect(result.oneFocus).toBe(oneFocusForItem("ops-g2-add"));
+    expect(displayedOneFocus(result)).toBe(result.oneFocus);
     expect(result.oneFocus).toBe("Watch regrouping when the ones pass nine.");
     expect(result.oneFocus).not.toMatch(/keep reading|look again|great job|awesome/i);
     const missed = submitAttempt(

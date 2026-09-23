@@ -22,9 +22,9 @@ export const PRACTICE_BLOCK_REASONS = {
 
 /**
  * Device-queue disposition when practice is not allowed.
- * Pause holds the pending queue. The hold is parent-visible and resumes quietly.
- * Revoke and missing consent drop the pending queue. Nothing syncs after revoke.
- * A silent hold is not a disposition. Drop-on-pause is not used: the visible hold ships.
+ * Pause holds the pending queue for a parent-visible wait and a quiet resume.
+ * There is no drop-on-pause path. Revoke and missing consent drop the queue.
+ * Nothing syncs after revoke.
  * Granted consent has no disposition because a live try may sync.
  */
 export function queueDisposition(
