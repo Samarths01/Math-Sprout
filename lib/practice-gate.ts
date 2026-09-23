@@ -1,0 +1,45 @@
+export type ConsentAction = "grant" | "pause" | "revoke";
+export type StoredConsentStatus = "granted" | "paused" | "revoked";
+export type ConsentViewStatus = StoredConsentStatus | "none";
+
+export function statusForAction(action: ConsentAction): StoredConsentStatus {
+  switch (action) {
+    case "grant":
+      return "granted";
+    case "pause":
+      return "paused";
+    case "revoke":
+      return "revoked";
+  }
+}
+
+export const PRACTICE_BLOCK_REASONS = {
+  none: "Practice is blocked until a parent grants consent.",
+  paused:
+    "Practice is paused. A parent can grant consent again from the parent home.",
+  revoked: "Practice is blocked because a parent revoked consent.",
+} as const;
+
+export function practiceGate(status: ConsentViewStatus): {
+  practiceAllowed: boolean;
+  reason?: string;
+} {
+  if (status === "granted") {
+    return { practiceAllowed: true };
+  }
+  return {
+    practiceAllowed: false,
+    reason: PRACTICE_BLOCK_REASONS[status],
+  };
+}
+
+/**
+ * Click outcome for the practice control.
+ * Neither result starts a practice session. Sessions are out of scope for this slice.
+ */
+export function practiceClickOutcome(
+  practiceAllowed: boolean,
+): "blocked" | "no-session" {
+  if (!practiceAllowed) return "blocked";
+  return "no-session";
+}
