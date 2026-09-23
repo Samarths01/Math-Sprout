@@ -4,6 +4,7 @@ import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { POST as submitAttemptRoute } from "@/app/api/children/[id]/attempts/route";
 import { GET as getConsent, POST as postConsent } from "@/app/api/children/[id]/consent/route";
+import { GET as getCompanion } from "@/app/api/children/[id]/companion/route";
 import { GET as getHome } from "@/app/api/children/[id]/home/route";
 import { POST as startSessionRoute } from "@/app/api/children/[id]/sessions/route";
 import { GET as getBoundaryOptionsRoute } from "@/app/api/children/[id]/sessions/[sessionId]/boundary-options/route";
@@ -104,6 +105,17 @@ describe("child route ownership", () => {
     expect(sessionId).toBeTruthy();
     expect(count("practice_sessions")).toBe(1);
 
+    const companion = await call(
+      getCompanion,
+      `http://127.0.0.1/api/children/${childId}/companion`,
+      { id: childId },
+    );
+    expect(companion.status).toBe(200);
+    expect(companion.body).toMatchObject({
+      streak: { state: "dormant", recovery: null },
+    });
+    expect(companion.body).not.toHaveProperty("xp");
+
     cookieState.token = otherToken;
     const routes: Array<{
       name: string;
@@ -113,6 +125,13 @@ describe("child route ownership", () => {
         name: "home",
         run: () =>
           call(getHome, `http://127.0.0.1/api/children/${childId}/home`, { id: childId }),
+      },
+      {
+        name: "companion",
+        run: () =>
+          call(getCompanion, `http://127.0.0.1/api/children/${childId}/companion`, {
+            id: childId,
+          }),
       },
       {
         name: "consent read",
@@ -223,6 +242,12 @@ describe("child route ownership", () => {
     );
     expect(result.status).toBe(401);
     expect(result.body?.error).toMatch(/sign in/i);
+    const companion = await call(
+      getCompanion,
+      `http://127.0.0.1/api/children/${childId}/companion`,
+      { id: childId },
+    );
+    expect(companion.status).toBe(401);
   });
 
   it("still lets the owner submit and end that same session", async () => {
