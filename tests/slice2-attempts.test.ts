@@ -561,6 +561,11 @@ describe("consent still gates practice", () => {
     expect(started.sessionId).toBeTruthy();
     expect(started.item.id).toBe(ITEM_CATALOG[0]?.id);
     expect(count(db, "practice_sessions")).toBe(1);
+
+    const resumed = startPracticeSession(db, guardian.id, child.id);
+    expect(resumed.sessionId).toBe(started.sessionId);
+    expect(resumed.item.id).toBe(started.item.id);
+    expect(count(db, "practice_sessions")).toBe(1);
   });
 });
 

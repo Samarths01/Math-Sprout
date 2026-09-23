@@ -199,18 +199,25 @@ export function startPracticeSession(
       403,
     );
   }
-  const existing = db
-    .prepare(
-      `SELECT COUNT(*) AS count FROM practice_sessions WHERE child_id = ?`,
-    )
-    .get(childId) as { count: number };
-  const itemIndex = existing.count % ITEM_CATALOG.length;
-  const sessionId = randomUUID();
-  db.prepare(
-    `INSERT INTO practice_sessions (id, child_id, status, item_index, started_at)
-     VALUES (?, ?, 'active', ?, ?)`,
-  ).run(sessionId, childId, itemIndex, nowIso());
-  return { sessionId, item: itemAt(itemIndex) };
+  const open = db.transaction(() => {
+    const existing = db
+      .prepare(
+        `SELECT id, item_index FROM practice_sessions
+         WHERE child_id = ? AND status = 'active'
+         ORDER BY started_at ASC
+         LIMIT 1`,
+      )
+      .get(childId) as { id: string; item_index: number } | undefined;
+    if (existing) return existing;
+    const sessionId = randomUUID();
+    db.prepare(
+      `INSERT INTO practice_sessions (id, child_id, status, item_index, started_at)
+       VALUES (?, ?, 'active', 0, ?)`,
+    ).run(sessionId, childId, nowIso());
+    return { id: sessionId, item_index: 0 };
+  });
+  const session = open.immediate();
+  return { sessionId: session.id, item: itemAt(session.item_index) };
 }
 
 export function submitAttempt(
