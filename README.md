@@ -2,6 +2,10 @@
 
 Math Sprout is a parent-managed math practice app for grades 2–4. A guardian account owns each child profile. Practice starts only when that guardian's consent is `granted`.
 
+## Product docs
+
+- [Design first principles (Interface)](docs/DESIGN_PRINCIPLES.md)
+
 Practice attempts are idempotent, can be queued offline, and return `correct`, four beats, and a `ClientView` (`bandLabel`, `showConceptChip`, `celebrationTier` of `none`, `quietXp`, or `full`). There is no score and no confidence value.
 
 Slice 3 adds learner state and progression. A rules `MasteryEstimator` maps attempt evidence to the soft-state bands. Got it and a slightly-harder step need Recommended or Challenge evidence in the recent window, so a Review lane cannot pretend a skill is finished. Lane choice (Recommended, Challenge, or Review with skills still going) happens at the end of a session. Recommended is the default. Chips are stored per skill and come back on the next session.
