@@ -15,14 +15,21 @@ import {
   choosePracticeLane,
   endPracticeSession,
   getBoundaryOptions,
+  parseLaneChoice,
 } from "@/lib/boundary";
 import { openDatabase } from "@/lib/db";
 import { DomainError, createChild, createGuardian, setConsent } from "@/lib/domain";
 import { canonicalAnswer } from "@/lib/item-bank";
-import { readDifficulty, readSkillClientView } from "@/lib/learner-state";
+import {
+  evidenceForSkill,
+  readDifficulty,
+  readPracticeSession,
+  readSkillClientView,
+} from "@/lib/learner-state";
 import {
   MasteryEstimator,
   isQualifyingEvidence,
+  practiceLaneOrRecommended,
   type MasteryEstimator as MasteryEstimatorContract,
   type SkillEvidence,
 } from "@/lib/mastery";
@@ -212,6 +219,61 @@ describe("mastery rules", () => {
       showConceptChip: true,
       celebrationTier: "quietXp",
     });
+  });
+
+  it("treats an unknown lane as Recommended", () => {
+    expect(practiceLaneOrRecommended("sideways")).toBe("recommended");
+    expect(practiceLaneOrRecommended(null)).toBe("recommended");
+    expect(practiceLaneOrRecommended("")).toBe("recommended");
+    expect(parseLaneChoice("nope")).toBe("recommended");
+    expect(parseLaneChoice("challenge")).toBe("challenge");
+    expect(parseLaneChoice("review")).toBe("review");
+
+    const db = new Database(":memory:");
+    db.exec(`
+      CREATE TABLE practice_sessions (
+        id TEXT PRIMARY KEY,
+        child_id TEXT NOT NULL,
+        status TEXT NOT NULL,
+        item_index INTEGER NOT NULL,
+        started_at TEXT NOT NULL,
+        practice_lane TEXT NOT NULL,
+        phase TEXT NOT NULL,
+        progression TEXT
+      );
+      CREATE TABLE attempts (
+        id TEXT PRIMARY KEY,
+        child_id TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        correct INTEGER NOT NULL,
+        lane TEXT NOT NULL,
+        item_id TEXT NOT NULL,
+        submitted_at TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      INSERT INTO practice_sessions (
+        id, child_id, status, item_index, started_at, practice_lane, phase, progression
+      ) VALUES (
+        'sess-unknown', 'child-1', 'active', 0, '2026-04-01T00:00:00.000Z',
+        'sideways', 'practicing', NULL
+      );
+      INSERT INTO attempts (
+        id, child_id, session_id, correct, lane, item_id, submitted_at, created_at
+      ) VALUES (
+        'attempt-1', 'child-1', 'sess-unknown', 1, 'celebrate', 'ops-g2-add',
+        '2026-04-01T00:00:02.000Z', '2026-04-01T00:00:02.000Z'
+      );
+    `);
+
+    expect(readPracticeSession(db, "child-1", "sess-unknown")?.practice_lane).toBe(
+      "recommended",
+    );
+    const evidence = evidenceForSkill(db, "child-1", "adding two-digit numbers");
+    expect(evidence).toEqual([
+      { correct: true, lane: "celebrate", practiceLane: "recommended" },
+    ]);
+    expect(isQualifyingEvidence(evidence[0] as SkillEvidence)).toBe(true);
+    db.close();
   });
 
   it("drops Got it when the latest careful try misses", () => {

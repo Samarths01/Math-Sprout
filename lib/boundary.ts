@@ -13,7 +13,7 @@ import {
 } from "@/lib/learner-state";
 import {
   MasteryEstimator,
-  parsePracticeLane,
+  practiceLaneOrRecommended,
   type BoundaryLaneOption,
   type BoundaryOptions,
   type PracticeLane,
@@ -172,11 +172,7 @@ export function getBoundaryOptions(
 }
 
 export function parseLaneChoice(value: unknown): PracticeLane {
-  const lane = parsePracticeLane(value);
-  if (!lane) {
-    throw new DomainError("Choose Recommended, Challenge, or Review.", 400);
-  }
-  return lane;
+  return practiceLaneOrRecommended(value);
 }
 
 export function choosePracticeLane(

@@ -3,7 +3,7 @@ import type { ClientView } from "@/lib/attempt-contract";
 import { catalogItem, ITEM_CATALOG } from "@/lib/item-catalog";
 import {
   DEFAULT_PRACTICE_LANE,
-  parsePracticeLane,
+  practiceLaneOrRecommended,
   type PracticeLane,
   type ProgressionDecision,
   type SkillEvidence,
@@ -70,7 +70,7 @@ export function readPracticeSession(
       }
     | undefined;
   if (!row) return undefined;
-  const practiceLane = parsePracticeLane(row.practice_lane) ?? "review";
+  const practiceLane = practiceLaneOrRecommended(row.practice_lane);
   return {
     id: row.id,
     item_index: row.item_index,
@@ -99,11 +99,10 @@ export function evidenceForSkill(
   const evidence: SkillEvidence[] = [];
   for (const row of rows) {
     if (catalogItem(row.item_id)?.skill !== skill) continue;
-    const parsed = parsePracticeLane(row.practice_lane);
     evidence.push({
       correct: row.correct === 1,
       lane: row.lane === "celebrate" ? "celebrate" : "review",
-      practiceLane: parsed ?? "review",
+      practiceLane: practiceLaneOrRecommended(row.practice_lane),
     });
   }
   return evidence;
@@ -190,7 +189,7 @@ export function ensureLearnerProgress(
     )
     .get(childId) as { next_lane: string; difficulty_step: number };
   return {
-    nextLane: parsePracticeLane(row.next_lane) ?? DEFAULT_PRACTICE_LANE,
+    nextLane: practiceLaneOrRecommended(row.next_lane),
     difficultyStep: row.difficulty_step,
   };
 }

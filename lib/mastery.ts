@@ -83,6 +83,11 @@ export function parsePracticeLane(value: unknown): PracticeLane | null {
   return null;
 }
 
+/** Unknown or missing lanes use Recommended, the default. They do not become Review. */
+export function practiceLaneOrRecommended(value: unknown): PracticeLane {
+  return parsePracticeLane(value) ?? DEFAULT_PRACTICE_LANE;
+}
+
 /**
  * A qualifying success is a careful correct try on Recommended or Challenge.
  * Review-lane tries never qualify, so they cannot mint Got it or LevelUpSlight.
