@@ -207,20 +207,25 @@ function resultFromRow(
   row: AttemptRow,
   replayed: boolean,
 ): AttemptResult {
-  const events = db
+  const credits = db
     .prepare(
-      `SELECT id, amount FROM xp_events WHERE attempt_id = ? ORDER BY minted_at ASC, id ASC`,
+      `SELECT amount FROM xp_events WHERE attempt_id = ? ORDER BY minted_at ASC, id ASC`,
     )
-    .all(row.id) as Array<{ id: string; amount: number }>;
+    .all(row.id) as Array<{ amount: number }>;
+  const qualifying = db
+    .prepare(
+      `SELECT id FROM qualifying_events WHERE attempt_id = ? ORDER BY rowid ASC`,
+    )
+    .all(row.id) as Array<{ id: string }>;
   const session = db
     .prepare(`SELECT item_index FROM practice_sessions WHERE id = ?`)
     .get(row.session_id) as { item_index: number } | undefined;
   if (!session) throw new DomainError("Practice session not found.", 404);
   const beats = readBeats(row.beats_json);
-  if (row.celebration_tier === "full" && events.length === 0) {
+  if (row.celebration_tier === "full" && credits.length === 0) {
     throw new DomainError("full celebration requires a mint.", 500);
   }
-  if (row.celebration_tier === "quietXp" && events.length === 0) {
+  if (row.celebration_tier === "quietXp" && credits.length === 0) {
     throw new DomainError("quietXp celebration requires a mint.", 500);
   }
   const clientView = readClientView(row.client_view_json, row.celebration_tier);
@@ -234,8 +239,8 @@ function resultFromRow(
     celebrationTier: row.celebration_tier,
     lane: row.lane,
     flags,
-    eventIds: events.map((event) => event.id),
-    xpAmount: events.reduce((sum, event) => sum + event.amount, 0),
+    eventIds: qualifying.map((event) => event.id),
+    xpAmount: credits.reduce((sum, event) => sum + event.amount, 0),
     clientView,
     nextItem: itemAt(session.item_index),
   };

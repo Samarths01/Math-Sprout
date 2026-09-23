@@ -44,6 +44,7 @@ export type AttemptResult = FourBeat & {
   celebrationTier: CelebrationTier;
   lane: ReviewLane;
   flags: IntegrityFlag[];
+  /** QualifyingEvent ids for this attempt. XP credits point at these ids. */
   eventIds: string[];
   xpAmount: number;
   clientView: ClientView;

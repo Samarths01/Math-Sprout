@@ -264,7 +264,16 @@ describe("qualifying event bus", () => {
       idempotency_key: string;
     };
     expect(result.celebrationTier).toBe("full");
-    expect(result.eventIds).toEqual([credit.id]);
+    const busIds = (
+      db
+        .prepare(
+          `SELECT id FROM qualifying_events WHERE attempt_id = ? ORDER BY rowid ASC`,
+        )
+        .all(result.attemptId) as Array<{ id: string }>
+    ).map((row) => row.id);
+    expect(result.eventIds).toEqual(busIds);
+    expect(result.eventIds).toContain(credit.qualifying_event_id);
+    expect(result.eventIds).not.toContain(credit.id);
     expect(credit.amount).toBe(XP_AMOUNT.full);
     expect(credit.celebration_tier).toBe("full");
     expect(credit.kind).toBe("HonestAttempt");

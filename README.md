@@ -8,7 +8,7 @@ Slice 3 adds learner state and progression. A rules `MasteryEstimator` maps atte
 
 Slice 4 replaces the quiet-mint stub. XP is an append-only credit on the QualifyingEvent bus, written in the same transaction as the attempt. `celebrationTier` is derived from those mints: `full` is not stored without a credit, and review stays `quietXp` or `none`. A review week is capped (`review_sessions_per_week`, stub 3). The boundary shows how many review sets are left, and the server drops the mint when the week is used up. Review never mints LevelUpSlight, a badge, or a build piece.
 
-A qualifying practice day is an honest Recommended or Challenge try on the child's local calendar day. That event is the only heat for the streak: Hot, then Warm, then Ember, then Dormant. The server stores `streak_state`, `ember_expires_at`, and `last_qualifying_day` using `child.timezone`. Badge screens, BuildGoal, and ember recovery chrome are Slice 5. Nothing subtracts XP.
+A qualifying practice day is an honest Recommended or Challenge try on the child's local calendar day. That event is the only heat. The first qualifying day sets the streak to Warm. A qualifying day on the next calendar day, while the flame is still Hot, Warm, or Ember, sets it to Hot. Any longer gap starts again at Warm. The same local day does not heat again. With no new qualifying day, the flame cools to Ember until `ember_expires_at`, then to Dormant. The server stores `streak_state`, `ember_expires_at`, and `last_qualifying_day` using `child.timezone`. Badge screens, BuildGoal, and ember recovery chrome are Slice 5. Nothing subtracts XP.
 
 Each attempt and practice session stores `policy_version` (`rules-v0`). The server attempt log carries that same string with the concept, item, difficulty, lanes, correctness, latency, integrity flags, session id, and idempotency key. Kids still receive only `ClientView`. Production scoring stays the rules `MasteryEstimator`. The eval harness that baselines later policies against `rules-v0` is Signal-owned and offline. This app does not run a second scorer.
 
@@ -69,7 +69,7 @@ The same Next.js server is the API. All child and consent routes require the par
 | GET | `/api/children/:id/home` | `{ practiceAllowed, reason?, child }`. |
 | GET | `/api/parent/home` | Guardian plus children and consent. |
 | POST | `/api/children/:id/sessions` | Start or resume a practice session when consent is `granted`. Returns `{ sessionId, item, lane, atBoundary, clientView }`. `clientView` is the stored chip for that problem's skill, when one exists. |
-| POST | `/api/children/:id/attempts` | Submit one try. Body: `idempotencyKey`, `sessionId`, `itemId`, `answer`, `shownAt`, `submittedAt`. The same key returns the original attempt, four-beat copy, `clientView`, and `eventIds`. |
+| POST | `/api/children/:id/attempts` | Submit one try. Body: `idempotencyKey`, `sessionId`, `itemId`, `answer`, `shownAt`, `submittedAt`. The same key returns the original attempt, four-beat copy, `clientView`, and `eventIds`. `eventIds` are the QualifyingEvent ids for that try. XP credits point at those ids. |
 | POST | `/api/children/:id/sessions/:sessionId/end` | Reach the session boundary after at least one try. Returns lane options, including `reviewSessionsRemaining`. A second call does not fire LevelUpSlight again. |
 | GET | `/api/children/:id/sessions/:sessionId/boundary-options` | Lane menu. Only while the session is at that boundary. Recommended is the default. Review shows skills still going and review sets left this week. |
 | POST | `/api/children/:id/sessions/:sessionId/lane` | Body: `{ "lane": "recommended" \| "challenge" \| "review" }`. Closes the session and stores the lane for the next one. |
@@ -128,6 +128,6 @@ Slice 4 adds:
 - XP credits reference a QualifyingEvent; a replay does not mint a second credit
 - `celebrationTier` matches the mints in that transaction, and `full` without a credit fails closed
 - review sessions per week are capped at the mint, and review cannot mint LevelUpSlight, a badge, or a build piece
-- QualifyingPracticeDay heats the streak from the child timezone: Hot, Warm, Ember, Dormant
+- QualifyingPracticeDay heats Warm on the first qualifying day, and Hot on the next calendar day while the flame is still alive, using `child.timezone`
 - attempts and sessions store `policy_version` `rules-v0`, and the server attempt log includes it
 - empty, too-fast, duplicate-key, and identical-spam responses keep `ClientView` free of score, confidence, and judgment copy, and do not mint full XP, a badge, or a build piece

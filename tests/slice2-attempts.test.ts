@@ -115,14 +115,26 @@ function expectClientViewSealed(result: AttemptResult) {
 function xpRows(db: Database.Database) {
   return db
     .prepare(
-      `SELECT id, attempt_id, amount, celebration_tier FROM xp_events ORDER BY minted_at ASC, id ASC`,
+      `SELECT id, attempt_id, amount, celebration_tier, qualifying_event_id
+       FROM xp_events ORDER BY minted_at ASC, id ASC`,
     )
     .all() as Array<{
     id: string;
     attempt_id: string;
     amount: number;
     celebration_tier: string;
+    qualifying_event_id: string;
   }>;
+}
+
+function qualifyingIds(db: Database.Database, attemptId: string): string[] {
+  return (
+    db
+      .prepare(
+        `SELECT id FROM qualifying_events WHERE attempt_id = ? ORDER BY rowid ASC`,
+      )
+      .all(attemptId) as Array<{ id: string }>
+  ).map((row) => row.id);
 }
 
 describe("idempotent attempt replay", () => {
@@ -140,7 +152,8 @@ describe("idempotent attempt replay", () => {
     expect(replay.replayed).toBe(true);
     expect(replay.attemptId).toBe(first.attemptId);
     expect(replay.eventIds).toEqual(first.eventIds);
-    expect(replay.eventIds).toHaveLength(1);
+    expect(replay.eventIds).toEqual(qualifyingIds(db, first.attemptId));
+    expect(replay.eventIds.length).toBeGreaterThan(0);
     expect(replay.correct).toBe(true);
     expect(replay.celebrationTier).toBe(first.celebrationTier);
     expect(replay.xpAmount).toBe(first.xpAmount);
@@ -149,7 +162,8 @@ describe("idempotent attempt replay", () => {
     expect(replay.clientView).toEqual(first.clientView);
     expect(count(db, "attempts")).toBe(1);
     expect(count(db, "xp_events")).toBe(1);
-    expect(xpRows(db)[0]?.id).toBe(first.eventIds[0]);
+    expect(first.eventIds).toContain(xpRows(db)[0]?.qualifying_event_id);
+    expect(first.eventIds).not.toContain(xpRows(db)[0]?.id);
   });
 
   it("does not answer a duplicate key with an empty 409", () => {
@@ -307,7 +321,8 @@ describe("celebration mint", () => {
     const result = submitAttempt(db, guardian.id, child.id, input(session.sessionId));
     const row = db
       .prepare(
-        `SELECT a.celebration_tier AS attempt_tier, e.celebration_tier AS event_tier, e.amount, e.id
+        `SELECT a.celebration_tier AS attempt_tier, e.celebration_tier AS event_tier,
+                e.amount, e.id, e.qualifying_event_id
          FROM attempts a JOIN xp_events e ON e.attempt_id = a.id
          WHERE a.id = ?`,
       )
@@ -316,12 +331,15 @@ describe("celebration mint", () => {
       event_tier: string;
       amount: number;
       id: string;
+      qualifying_event_id: string;
     };
 
     expect(row.attempt_tier).toBe("full");
     expect(row.event_tier).toBe("full");
     expect(row.amount).toBe(XP_AMOUNT.full);
-    expect(result.eventIds).toEqual([row.id]);
+    expect(result.eventIds).toEqual(qualifyingIds(db, result.attemptId));
+    expect(result.eventIds).toContain(row.qualifying_event_id);
+    expect(result.eventIds).not.toContain(row.id);
   });
 
   it("rolls the attempt back when the mint fails", () => {
@@ -480,7 +498,12 @@ describe("offline queue reconcile", () => {
     }));
     expect(calls).toBe(1);
     expect(synced.pending).toHaveLength(0);
-    expect(synced.synced[0]?.eventIds).toHaveLength(1);
+    expect(synced.synced[0]?.eventIds.length).toBeGreaterThan(0);
+    const credit = db
+      .prepare(`SELECT id, qualifying_event_id FROM xp_events`)
+      .get() as { id: string; qualifying_event_id: string };
+    expect(synced.synced[0]?.eventIds).toContain(credit.qualifying_event_id);
+    expect(synced.synced[0]?.eventIds).not.toContain(credit.id);
     expect(count(db, "xp_events")).toBe(1);
   });
 
