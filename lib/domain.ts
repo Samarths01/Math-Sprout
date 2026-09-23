@@ -4,6 +4,7 @@ import { hashPassword, verifyPassword } from "@/lib/passwords";
 import {
   PRACTICE_BLOCK_REASONS,
   practiceGate,
+  queueDisposition,
   statusForAction,
   type ConsentAction,
   type ConsentViewStatus,
@@ -15,6 +16,7 @@ export class DomainError extends Error {
   constructor(
     message: string,
     readonly status: number,
+    readonly queueDisposition?: "hold" | "drop",
   ) {
     super(message);
     this.name = "DomainError";
@@ -146,6 +148,16 @@ export function resolveChildTimezone(input: {
     return assertTimeZone(guardianTimezone, "Guardian timezone");
   }
   return FALLBACK_TIMEZONE;
+}
+
+/** Consent block for a new learning write. Replay of an existing key does not use this. */
+export function consentDenied(status: ConsentViewStatus): DomainError {
+  const gate = practiceGate(status);
+  return new DomainError(
+    gate.reason ?? PRACTICE_BLOCK_REASONS.none,
+    403,
+    queueDisposition(status) ?? "drop",
+  );
 }
 
 export function parseConsentAction(value: unknown): ConsentAction {
@@ -374,6 +386,11 @@ export function setConsent(
        updated_at = excluded.updated_at,
        updated_by = excluded.updated_by`,
   ).run(childId, status, updatedAt, guardianId);
+  if (action === "revoke") {
+    db.prepare(
+      `UPDATE consents SET hold_json = NULL, offline_cap_json = NULL WHERE child_id = ?`,
+    ).run(childId);
+  }
   const gate = practiceGate(status);
   return {
     childId,

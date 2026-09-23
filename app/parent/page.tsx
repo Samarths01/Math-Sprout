@@ -15,11 +15,57 @@ import {
 import { getDb } from "@/lib/db";
 import { getParentHome } from "@/lib/domain";
 import { currentGuardian } from "@/lib/http";
+import { interfaceCopy } from "@/lib/interface-copy";
+import { readOfflineCap } from "@/lib/offline-cap";
+import { readPauseHold } from "@/lib/pause-hold";
 import { formatTimeZone } from "@/lib/timezones";
 import { cn } from "@/lib/utils";
 import { redirect } from "next/navigation";
 
 export const metadata = { title: "Parent home" };
+
+function PauseHoldNotice({
+  guardianId,
+  childId,
+}: {
+  guardianId: string;
+  childId: string;
+}) {
+  const hold = readPauseHold(getDb(), guardianId, childId);
+  if (!hold) return null;
+  return (
+    <p
+      data-testid="pause-hold"
+      data-visible="true"
+      data-waiting={hold.waiting}
+      className="text-sm leading-6"
+    >
+      {hold.waiting > 0 ? `${hold.waiting} waiting. ` : ""}
+      {interfaceCopy(hold.copyKey)} {interfaceCopy(hold.detailKey)}
+    </p>
+  );
+}
+
+function OfflineCapNotice({
+  guardianId,
+  childId,
+}: {
+  guardianId: string;
+  childId: string;
+}) {
+  const cap = readOfflineCap(getDb(), guardianId, childId);
+  if (!cap) return null;
+  return (
+    <p
+      data-testid="offline-cap-hold"
+      data-visible="true"
+      data-waiting={cap.waiting}
+      className="text-sm leading-6"
+    >
+      {interfaceCopy(cap.copyKey)} {interfaceCopy(cap.detailKey)}
+    </p>
+  );
+}
 
 export default async function ParentHomePage() {
   const guardian = await currentGuardian();
@@ -81,6 +127,8 @@ export default async function ParentHomePage() {
                         ? "Practice is allowed. The child home can start a session."
                         : child.reason}
                     </p>
+                    <PauseHoldNotice guardianId={guardian.id} childId={child.id} />
+                    <OfflineCapNotice guardianId={guardian.id} childId={child.id} />
                     <ConsentControls
                       childId={child.id}
                       status={child.consentStatus}

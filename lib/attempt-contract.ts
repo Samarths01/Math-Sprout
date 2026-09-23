@@ -9,6 +9,11 @@ export type FourBeatKey = (typeof FOUR_BEAT_KEYS)[number];
 
 export type FourBeat = Record<FourBeatKey, string>;
 
+/** Practice renders this server string as sent. No local rewrite and no model line. */
+export function displayedOneFocus(beat: Pick<FourBeat, "oneFocus">): string {
+  return beat.oneFocus;
+}
+
 export type IntegrityFlag = "empty_answer" | "too_fast" | "spam_window";
 
 export type ReviewLane = "celebrate" | "review";
@@ -49,6 +54,11 @@ export type AttemptResult = FourBeat & {
   xpAmount: number;
   clientView: ClientView;
   nextItem: PublicItem;
+  /**
+   * Set when this try was held across pause. The mint still stands.
+   * Callers must not present a celebration for a quiet resume.
+   */
+  resumePresentation?: "quiet";
 };
 
 export const TOO_FAST_MS = 500;

@@ -20,6 +20,21 @@ export const PRACTICE_BLOCK_REASONS = {
   revoked: "Practice is blocked because a parent revoked consent.",
 } as const;
 
+/**
+ * Device-queue disposition when practice is not allowed.
+ * Pause holds the pending queue for a parent-visible wait and a quiet resume.
+ * There is no drop-on-pause path. Revoke and missing consent drop the queue.
+ * Nothing syncs after revoke.
+ * Granted consent has no disposition because a live try may sync.
+ */
+export function queueDisposition(
+  status: ConsentViewStatus,
+): "hold" | "drop" | null {
+  if (status === "granted") return null;
+  if (status === "paused") return "hold";
+  return "drop";
+}
+
 export function practiceGate(status: ConsentViewStatus): {
   practiceAllowed: boolean;
   reason?: string;

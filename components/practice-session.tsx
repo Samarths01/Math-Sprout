@@ -3,15 +3,20 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import Link from "next/link";
 import type { AttemptResult, ClientView, PublicItem } from "@/lib/attempt-contract";
-import { FOUR_BEAT_KEYS } from "@/lib/attempt-contract";
+import { displayedOneFocus, FOUR_BEAT_KEYS } from "@/lib/attempt-contract";
 import type { BoundaryOptions, PracticeLane } from "@/lib/mastery";
 import { itemAt, ITEM_CATALOG } from "@/lib/item-catalog";
+import { interfaceCopy } from "@/lib/interface-copy";
 import {
+  consentQueueReason,
   createAttemptQueue,
+  OFFLINE_QUEUE_CAP,
   storageQueueStore,
   type QueuedAttempt,
   type SyncPost,
 } from "@/lib/offline-queue";
+import { showResumeCelebration } from "@/lib/pause-hold";
+import { postPauseHoldUntilVisible } from "@/lib/pause-hold-receipt";
 import { Button } from "@/components/ui/button";
 import {
   Card,
@@ -62,12 +67,16 @@ async function postAttempt(childId: string, attempt: QueuedAttempt): Promise<Syn
       body: JSON.stringify(attempt),
     });
     const body = (await response.json().catch(() => null)) as
-      | (AttemptResult & { error?: string })
+      | (AttemptResult & { error?: string; queueDisposition?: unknown })
       | null;
     if (response.status === 403) {
+      if (body?.queueDisposition === "hold") {
+        // Receipt retries stay on hold. A failed POST never becomes a drop.
+        await registerVisibleHold(childId, attempt);
+      }
       return {
         ok: false,
-        reason: "blocked",
+        reason: consentQueueReason(body),
         message: body?.error ?? "Practice is blocked.",
       };
     }
@@ -82,6 +91,18 @@ async function postAttempt(childId: string, attempt: QueuedAttempt): Promise<Syn
   } catch {
     return { ok: false, reason: "offline" };
   }
+}
+
+async function registerVisibleHold(childId: string, attempt: QueuedAttempt): Promise<boolean> {
+  return postPauseHoldUntilVisible(async () => {
+    const response = await fetch(`/api/children/${childId}/pause-hold`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(attempt),
+    });
+    const body = (await response.json().catch(() => null)) as { visible?: boolean } | null;
+    return response.ok && body?.visible === true;
+  });
 }
 
 export function PracticeSession({
@@ -99,6 +120,8 @@ export function PracticeSession({
   const [answer, setAnswer] = useState("");
   const [feedback, setFeedback] = useState<AttemptResult | null>(null);
   const [savedOffline, setSavedOffline] = useState(false);
+  const [heldNotice, setHeldNotice] = useState(false);
+  const [quietResume, setQuietResume] = useState(false);
   const [pending, setPending] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -118,18 +141,40 @@ export function PracticeSession({
   async function flush() {
     const snapshot = await queue().reconcile((attempt) => postAttempt(childId, attempt));
     setPending(snapshot.pending.length);
+    if (snapshot.quietCredits) setQuietResume(true);
+    if (snapshot.held) setHeldNotice(true);
     if (waitingKey.current) {
       const synced = snapshot.synced.find(
         (result) => result.idempotencyKey === waitingKey.current,
       );
-      if (synced) {
+      if (synced && showResumeCelebration(synced)) {
         setFeedback(synced);
         setSavedOffline(false);
+        setHeldNotice(false);
+        waitingKey.current = null;
+      } else if (synced) {
+        setFeedback(null);
+        setQuietResume(true);
+        setSavedOffline(false);
+        setHeldNotice(false);
         waitingKey.current = null;
       }
     }
     if (snapshot.lastError) setError(snapshot.lastError);
+    await publishOfflineCap(snapshot.pending.length);
     return snapshot;
+  }
+
+  async function publishOfflineCap(waiting: number): Promise<void> {
+    try {
+      await fetch(`/api/children/${childId}/offline-cap`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ waiting }),
+      });
+    } catch {
+      // The try stays on this focus. A later flush retries the parent receipt.
+    }
   }
 
   useEffect(() => {
@@ -141,7 +186,10 @@ export function PracticeSession({
         });
         const body = (await response.json().catch(() => null)) as SessionStart | null;
         if (!response.ok || !body?.sessionId || !body.item) {
-          if (!cancelled) setError(body?.error ?? "Practice could not start.");
+          if (!cancelled) {
+            await flush();
+            setError(body?.error ?? "Practice could not start.");
+          }
           return;
         }
         if (cancelled) return;
@@ -258,6 +306,12 @@ export function PracticeSession({
     if (!sessionId || !item || !shownAt || busy) return;
     setBusy(true);
     setError(null);
+    if (queue().snapshot().pending.length >= OFFLINE_QUEUE_CAP) {
+      setPending(OFFLINE_QUEUE_CAP);
+      await publishOfflineCap(OFFLINE_QUEUE_CAP);
+      setBusy(false);
+      return;
+    }
     const idempotencyKey = crypto.randomUUID();
     const queued: QueuedAttempt = {
       idempotencyKey,
@@ -272,12 +326,20 @@ export function PracticeSession({
     queue().enqueue(queued);
     const snapshot = await flush();
     const synced = snapshot.synced.find((result) => result.idempotencyKey === idempotencyKey);
-    if (synced) {
+    if (synced && showResumeCelebration(synced)) {
       setFeedback(synced);
       setPersistedView(synced.clientView);
       setSavedOffline(false);
+      setHeldNotice(false);
+    } else if (synced) {
+      setFeedback(null);
+      setPersistedView(synced.clientView);
+      setQuietResume(true);
+      setSavedOffline(false);
+      setHeldNotice(false);
     } else if (snapshot.pending.some((entry) => entry.idempotencyKey === idempotencyKey)) {
-      setSavedOffline(true);
+      setSavedOffline(!snapshot.held);
+      setHeldNotice(Boolean(snapshot.held));
       setFeedback(null);
     }
     setBusy(false);
@@ -289,8 +351,34 @@ export function PracticeSession({
         <CardHeader>
           <CardTitle className="font-heading text-2xl">Practice is closed</CardTitle>
         </CardHeader>
-        <CardContent>
+        <CardContent className="grid gap-3">
           <p className="text-sm leading-6">{error}</p>
+          {heldNotice ? (
+            <p data-testid="pause-hold-kid" role="status" className="text-sm leading-6">
+              {interfaceCopy("pause.hold.kid")}
+            </p>
+          ) : null}
+          {quietResume ? (
+            <p
+              data-testid="quiet-resume"
+              data-presentation="quiet"
+              role="status"
+              className="text-sm leading-6"
+            >
+              {interfaceCopy("pause.resume.quiet")}
+            </p>
+          ) : null}
+          {pending >= OFFLINE_QUEUE_CAP ? (
+            <p
+              data-testid="offline-queue-cap"
+              data-cap={OFFLINE_QUEUE_CAP}
+              data-pattern="calm-wait"
+              role="status"
+              className="text-sm leading-6"
+            >
+              {interfaceCopy("offline.cap.kid")}
+            </p>
+          ) : null}
         </CardContent>
       </Card>
     );
@@ -302,6 +390,7 @@ export function PracticeSession({
 
   const nextFromFeedback = feedback?.nextItem;
   const localNext = itemAt(ITEM_CATALOG.findIndex((entry) => entry.id === item.id) + 1);
+  const offlineCapped = pending >= OFFLINE_QUEUE_CAP;
 
   return (
     <div className="grid gap-4">
@@ -314,6 +403,32 @@ export function PracticeSession({
           ? `${pending} ${pending === 1 ? "answer is" : "answers are"} waiting to sync.`
           : "Saved answers sync with the practice record."}
       </p>
+      {quietResume ? (
+        <p
+          data-testid="quiet-resume"
+          data-presentation="quiet"
+          role="status"
+          className="text-sm leading-6"
+        >
+          {interfaceCopy("pause.resume.quiet")}
+        </p>
+      ) : null}
+      {heldNotice && !quietResume ? (
+        <p data-testid="pause-hold-kid" role="status" className="text-sm leading-6">
+          {interfaceCopy("pause.hold.kid")}
+        </p>
+      ) : null}
+      {offlineCapped ? (
+        <p
+          data-testid="offline-queue-cap"
+          data-cap={OFFLINE_QUEUE_CAP}
+          data-pattern="calm-wait"
+          role="status"
+          className="text-sm leading-6"
+        >
+          {interfaceCopy("offline.cap.kid")}
+        </p>
+      ) : null}
       {persistedView && !boundary && !feedback ? (
         <p data-testid="persisted-band" data-band-label={persistedView.bandLabel}>
           {persistedView.bandLabel}
@@ -376,19 +491,30 @@ export function PracticeSession({
         <CardContent>
           {feedback ? (
             <div data-testid="practice-feedback" className="grid gap-4" aria-live="polite">
-              <p
-                className="text-sm text-muted-foreground"
-                data-celebration-tier={feedback.clientView.celebrationTier}
-              >
-                {tierLine(feedback.clientView.celebrationTier)}
-                {feedback.replayed ? " This try was already saved." : ""}
-              </p>
+              {showResumeCelebration(feedback) ? (
+                <p
+                  className="text-sm text-muted-foreground"
+                  data-celebration-tier={feedback.clientView.celebrationTier}
+                >
+                  {tierLine(feedback.clientView.celebrationTier)}
+                  {feedback.replayed ? " This try was already saved." : ""}
+                </p>
+              ) : (
+                <p
+                  data-testid="quiet-resume"
+                  data-presentation="quiet"
+                  role="status"
+                  className="text-sm leading-6"
+                >
+                  {interfaceCopy("pause.resume.quiet")}
+                </p>
+              )}
               <dl className="grid gap-3">
                 {FOUR_BEAT_KEYS.map((key) => (
                   <div key={key} className="grid gap-1">
                     <dt className="text-sm font-medium">{BEAT_LABELS[key]}</dt>
                     <dd data-testid={`beat-${key}`} className="text-sm leading-6">
-                      {feedback[key]}
+                      {key === "oneFocus" ? displayedOneFocus(feedback) : feedback[key]}
                     </dd>
                   </div>
                 ))}
@@ -403,17 +529,19 @@ export function PracticeSession({
                   </p>
                 ) : null}
               </div>
-              <Button
-                type="button"
-                className="h-12 text-base"
-                onClick={() => showNext(nextFromFeedback ?? localNext)}
-              >
-                Next problem
-              </Button>
+              {offlineCapped ? null : (
+                <Button
+                  type="button"
+                  className="h-12 text-base"
+                  onClick={() => showNext(nextFromFeedback ?? localNext)}
+                >
+                  Next problem
+                </Button>
+              )}
             </div>
           ) : (
             <form className="grid gap-3" onSubmit={onSubmit}>
-              {savedOffline ? (
+              {savedOffline && !offlineCapped ? (
                 <p role="status" className="text-sm leading-6">
                   Saved on this device. It will check in when you reconnect.
                 </p>
@@ -433,12 +561,12 @@ export function PracticeSession({
               <Button
                 type="submit"
                 data-testid="practice-submit"
-                disabled={busy}
+                disabled={busy || offlineCapped}
                 className="h-12 text-base"
               >
                 {busy ? "Checking…" : "Check answer"}
               </Button>
-              {savedOffline ? (
+              {savedOffline && !offlineCapped ? (
                 <Button
                   type="button"
                   variant="outline"

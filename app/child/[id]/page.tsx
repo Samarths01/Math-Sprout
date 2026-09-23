@@ -1,6 +1,7 @@
 import Link from "next/link";
 import { notFound, redirect } from "next/navigation";
 import { AppHeader } from "@/components/app-header";
+import { CompanionState } from "@/components/companion-state";
 import { LogoutButton } from "@/components/logout-button";
 import { PracticeCta } from "@/components/practice-cta";
 import { Shell } from "@/components/shell";
@@ -12,6 +13,7 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
+import { readCompanion } from "@/lib/companion";
 import { getDb } from "@/lib/db";
 import { DomainError, getChildHome } from "@/lib/domain";
 import { currentGuardian } from "@/lib/http";
@@ -35,6 +37,7 @@ export default async function ChildHomePage({
     if (error instanceof DomainError && error.status === 404) notFound();
     throw error;
   }
+  const companion = readCompanion(getDb(), home.child.id, new Date().toISOString());
 
   return (
     <Shell width="narrow">
@@ -52,6 +55,11 @@ export default async function ChildHomePage({
             </p>
           </div>
         </div>
+        <CompanionState
+          childId={home.child.id}
+          practiceAllowed={home.practiceAllowed}
+          companion={companion}
+        />
         <Card>
           <CardHeader>
             <CardTitle className="font-heading text-2xl">Practice</CardTitle>

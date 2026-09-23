@@ -13,10 +13,18 @@ export type QueuedAttempt = {
 
 export type BlockedAttempt = QueuedAttempt & { message: string };
 
+/** A revoked try kept only as an id. The answer and problem are not stored. */
+export type DroppedAttempt = {
+  idempotencyKey: string;
+  childId: string;
+  sessionId: string;
+};
+
 export type QueueData = {
   version: 1;
   pending: QueuedAttempt[];
   blocked: BlockedAttempt[];
+  dropped: DroppedAttempt[];
   synced: AttemptResult[];
 };
 
@@ -28,15 +36,66 @@ export type QueueStore = {
 export type SyncPost =
   | { ok: true; result: AttemptResult }
   | { ok: false; reason: "offline" }
-  | { ok: false; reason: "blocked"; message: string }
+  | { ok: false; reason: "hold"; message: string }
+  | { ok: false; reason: "drop"; message: string }
   | { ok: false; reason: "error"; message: string };
 
-export type QueueSnapshot = QueueData & { lastError?: string };
+export type QueueSnapshot = QueueData & {
+  lastError?: string;
+  /** Tries credited on this pass with quiet resume. They must not celebrate. */
+  quietCredits?: number;
+  /** Tries kept on this pass because a parent-visible pause hold was recorded. */
+  held?: number;
+  /** A new try was refused because the unsynced queue is already at the cap. */
+  capped?: boolean;
+};
 
 const SYNCED_CAP = 40;
 
+/**
+ * Short unsynced queue. Architecture §24 offline guard (a).
+ * Further tries wait until these sync. Frozen next-item is not this seam.
+ */
+export const OFFLINE_QUEUE_CAP = 3;
+
 export function emptyQueue(): QueueData {
-  return { version: 1, pending: [], blocked: [], synced: [] };
+  return { version: 1, pending: [], blocked: [], dropped: [], synced: [] };
+}
+
+/**
+ * Kid-path disposition for a 403.
+ * Pause is hold only: parent-visible waiting, then a quiet resume.
+ * There is no drop-on-pause path. Revoke and missing consent drop.
+ */
+export function consentQueueReason(
+  body: { error?: string; queueDisposition?: unknown } | null,
+): "hold" | "drop" {
+  if (body?.queueDisposition === "hold") return "hold";
+  return "drop";
+}
+
+function anonymize(attempt: QueuedAttempt): DroppedAttempt {
+  return {
+    idempotencyKey: attempt.idempotencyKey,
+    childId: attempt.childId,
+    sessionId: attempt.sessionId,
+  };
+}
+
+function readDropped(value: unknown): DroppedAttempt[] {
+  if (!Array.isArray(value)) return [];
+  const dropped: DroppedAttempt[] = [];
+  for (const item of value) {
+    if (!item || typeof item !== "object") continue;
+    const row = item as Partial<QueuedAttempt>;
+    if (typeof row.idempotencyKey !== "string" || row.idempotencyKey.length === 0) continue;
+    dropped.push({
+      idempotencyKey: row.idempotencyKey,
+      childId: typeof row.childId === "string" ? row.childId : "",
+      sessionId: typeof row.sessionId === "string" ? row.sessionId : "",
+    });
+  }
+  return dropped;
 }
 
 export function memoryQueueStore(initial?: QueueData): QueueStore {
@@ -63,7 +122,11 @@ export function storageQueueStore(
         return {
           version: 1,
           pending: parsed.pending,
-          blocked: Array.isArray(parsed.blocked) ? parsed.blocked : [],
+          blocked: [],
+          dropped: [
+            ...readDropped(parsed.dropped),
+            ...readDropped(parsed.blocked),
+          ],
           synced: Array.isArray(parsed.synced) ? parsed.synced : [],
         };
       } catch {
@@ -96,8 +159,14 @@ export function createAttemptQueue(store: QueueStore) {
       const known =
         data.pending.some((item) => item.idempotencyKey === attempt.idempotencyKey) ||
         data.synced.some((item) => item.idempotencyKey === attempt.idempotencyKey) ||
-        data.blocked.some((item) => item.idempotencyKey === attempt.idempotencyKey);
-      if (!known) data.pending.push(attempt);
+        data.blocked.some((item) => item.idempotencyKey === attempt.idempotencyKey) ||
+        data.dropped.some((item) => item.idempotencyKey === attempt.idempotencyKey);
+      if (!known) {
+        if (data.pending.length >= OFFLINE_QUEUE_CAP) {
+          return { ...store.load(), capped: true };
+        }
+        data.pending.push(attempt);
+      }
       store.save(remember(data));
       return store.load();
     },
@@ -108,6 +177,8 @@ export function createAttemptQueue(store: QueueStore) {
       let lastError: string | undefined;
       const stillPending: QueuedAttempt[] = [];
       let stopped = false;
+      let quietCredits = 0;
+      let held = 0;
       for (const attempt of data.pending) {
         if (stopped) {
           stillPending.push(attempt);
@@ -127,8 +198,15 @@ export function createAttemptQueue(store: QueueStore) {
           stopped = true;
           continue;
         }
-        if (!posted.ok && posted.reason === "blocked") {
-          data.blocked.push({ ...attempt, message: posted.message });
+        if (!posted.ok && posted.reason === "hold") {
+          // Visible hold only. Keep walking so every waiting try can be registered.
+          // Resume credits these later and does not dump a celebration.
+          stillPending.push(attempt);
+          held += 1;
+          continue;
+        }
+        if (!posted.ok && posted.reason === "drop") {
+          data.dropped.push(anonymize(attempt));
           continue;
         }
         if (!posted.ok) {
@@ -143,10 +221,16 @@ export function createAttemptQueue(store: QueueStore) {
             item.idempotencyKey === posted.result.idempotencyKey,
         );
         if (!already) data.synced.push(posted.result);
+        if (posted.result.resumePresentation === "quiet") quietCredits += 1;
       }
       data.pending = stillPending;
       store.save(remember(data));
-      return { ...store.load(), ...(lastError ? { lastError } : {}) };
+      return {
+        ...store.load(),
+        ...(lastError ? { lastError } : {}),
+        ...(quietCredits > 0 ? { quietCredits } : {}),
+        ...(held > 0 ? { held } : {}),
+      };
     },
   };
 }

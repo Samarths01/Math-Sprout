@@ -5,6 +5,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import type Database from "better-sqlite3";
 import {
+  displayedOneFocus,
   FOUR_BEAT_KEYS,
   foldRewards,
   resolveCelebration,
@@ -21,17 +22,24 @@ import {
 import { openDatabase } from "@/lib/db";
 import { DomainError, createChild, createGuardian, setConsent } from "@/lib/domain";
 import { ITEM_CATALOG } from "@/lib/item-catalog";
-import { assertBankMatchesCatalog, gradeAnswer } from "@/lib/item-bank";
+import { assertBankMatchesCatalog, gradeAnswer, oneFocusForItem, tryNextForItem } from "@/lib/item-bank";
 import { readAttemptLog } from "@/lib/attempt-log";
 import { MasteryEstimator } from "@/lib/mastery";
 import { POLICY_VERSION } from "@/lib/policy";
 import {
+  consentQueueReason,
   createAttemptQueue,
   memoryQueueStore,
+  OFFLINE_QUEUE_CAP,
   storageQueueStore,
   type QueuedAttempt,
   type SyncPost,
 } from "@/lib/offline-queue";
+import { readPauseHold, registerPauseHold, showResumeCelebration } from "@/lib/pause-hold";
+import { postPauseHoldUntilVisible } from "@/lib/pause-hold-receipt";
+import { readOfflineCap, registerOfflineCap } from "@/lib/offline-cap";
+import { queueDisposition } from "@/lib/practice-gate";
+import { interfaceCopy } from "@/lib/interface-copy";
 
 const cleanups: Array<() => void> = [];
 const T0 = Date.parse("2026-01-01T00:00:00.000Z");
@@ -56,7 +64,10 @@ function at(offsetMs: number): string {
   return new Date(T0 + offsetMs).toISOString();
 }
 
-function count(db: Database.Database, table: "attempts" | "xp_events" | "practice_sessions") {
+function count(
+  db: Database.Database,
+  table: "attempts" | "xp_events" | "practice_sessions" | "qualifying_events",
+) {
   return (
     db.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get() as { count: number }
   ).count;
@@ -507,7 +518,172 @@ describe("offline queue reconcile", () => {
     expect(count(db, "xp_events")).toBe(1);
   });
 
-  it("does not mint when a queued attempt syncs after consent is revoked", async () => {
+  it("retries a pause-hold receipt and keeps hold when every post fails", async () => {
+    const wait = async () => {};
+    let calls = 0;
+    const visible = await postPauseHoldUntilVisible(
+      async () => {
+        calls += 1;
+        if (calls < 3) throw new Error("receipt missed");
+        return true;
+      },
+      { tries: 4, wait },
+    );
+    expect(visible).toBe(true);
+    expect(calls).toBe(3);
+
+    let misses = 0;
+    const stillHeld = await postPauseHoldUntilVisible(
+      async () => {
+        misses += 1;
+        return false;
+      },
+      { tries: 4, wait },
+    );
+    expect(stillHeld).toBe(false);
+    expect(misses).toBe(4);
+    expect(consentQueueReason({ queueDisposition: "hold" })).toBe("hold");
+  });
+
+  it("holds a paused queue where a parent can see it and credits it quietly", async () => {
+    const db = tempDb();
+    const { guardian, child, session } = grantedChild(db);
+    const queue = createAttemptQueue(memoryQueueStore());
+    const attempt = {
+      idempotencyKey: "paused-key-0001",
+      childId: child.id,
+      sessionId: session.sessionId,
+      itemId: "ops-g2-add",
+      answer: "42",
+      shownAt: at(0),
+      submittedAt: at(2_000),
+    };
+    const second = {
+      ...attempt,
+      idempotencyKey: "paused-key-0002",
+      submittedAt: at(4_000),
+    };
+    queue.enqueue(attempt);
+    queue.enqueue(second);
+    setConsent(db, guardian.id, child.id, "pause");
+    expect(queueDisposition("paused")).toBe("hold");
+    expect(queueDisposition("revoked")).toBe("drop");
+    expect(queueDisposition("none")).toBe("drop");
+    expect(
+      consentQueueReason({
+        queueDisposition: "hold",
+        error: "Practice is paused. A parent can grant consent again from the parent home.",
+      }),
+    ).toBe("hold");
+    expect(consentQueueReason({ queueDisposition: "drop" })).toBe("drop");
+    expect(consentQueueReason(null)).toBe("drop");
+
+    const pauseOnly = createAttemptQueue(memoryQueueStore());
+    pauseOnly.enqueue(attempt);
+    const stillHeld = await pauseOnly.reconcile(async () => ({
+      ok: false as const,
+      reason: consentQueueReason({ queueDisposition: "hold" }),
+      message: "Practice is paused.",
+    }));
+    expect(stillHeld.pending.map((item) => item.idempotencyKey)).toEqual(["paused-key-0001"]);
+    expect(stillHeld.dropped).toEqual([]);
+    expect(stillHeld.held).toBe(1);
+    expect(count(db, "attempts")).toBe(0);
+
+    const post = async (queued: QueuedAttempt): Promise<SyncPost> => {
+      try {
+        return { ok: true, result: submitAttempt(db, guardian.id, child.id, queued) };
+      } catch (error) {
+        if (error instanceof DomainError && error.status === 403) {
+          if (error.queueDisposition === "hold") {
+            registerPauseHold(db, guardian.id, child.id, queued);
+          }
+          return {
+            ok: false,
+            reason: consentQueueReason({
+              error: error.message,
+              queueDisposition: error.queueDisposition,
+            }),
+            message: error.message,
+          };
+        }
+        throw error;
+      }
+    };
+
+    const held = await queue.reconcile(post);
+    expect(held.pending.map((item) => item.idempotencyKey)).toEqual([
+      "paused-key-0001",
+      "paused-key-0002",
+    ]);
+    expect(held.synced).toEqual([]);
+    expect(held.dropped).toEqual([]);
+    expect(held.held).toBe(2);
+    expect(count(db, "attempts")).toBe(0);
+    expect(count(db, "xp_events")).toBe(0);
+    expect(count(db, "qualifying_events")).toBe(0);
+    const waiting = readPauseHold(db, guardian.id, child.id);
+    expect(waiting).toEqual({
+      visible: true,
+      waiting: 2,
+      copyKey: "pause.hold.waiting",
+      detailKey: "pause.hold.waiting.detail",
+    });
+    expect(waiting).not.toHaveProperty("answer");
+    const storedHold = db
+      .prepare(`SELECT hold_json FROM consents WHERE child_id = ?`)
+      .get(child.id) as { hold_json: string };
+    const stored = JSON.parse(storedHold.hold_json) as {
+      pending: Array<Record<string, string>>;
+    };
+    expect(stored.pending).toEqual([
+      { idempotencyKey: "paused-key-0001", sessionId: session.sessionId },
+      { idempotencyKey: "paused-key-0002", sessionId: session.sessionId },
+    ]);
+    expect(stored.pending.every((item) => !("answer" in item))).toBe(true);
+
+    expect(() => registerPauseHold(db, guardian.id, child.id, attempt)).not.toThrow();
+    setConsent(db, guardian.id, child.id, "grant");
+    expect(readPauseHold(db, guardian.id, child.id)).toEqual({
+      visible: true,
+      waiting: 2,
+      copyKey: "pause.hold.resuming",
+      detailKey: "pause.hold.waiting.detail",
+    });
+    expect(() => registerPauseHold(db, guardian.id, child.id, attempt)).toThrow(DomainError);
+    const resumed = await queue.reconcile(post);
+    expect(resumed.pending).toEqual([]);
+    expect(resumed.dropped).toEqual([]);
+    expect(resumed.quietCredits).toBe(2);
+    expect(resumed.synced).toHaveLength(2);
+    for (const result of resumed.synced) {
+      expect(result.resumePresentation).toBe("quiet");
+      expect(result.celebrationTier).toBe("full");
+      expect(result.clientView.celebrationTier).toBe("full");
+      expect(showResumeCelebration(result)).toBe(false);
+      expectClientViewSealed(result);
+    }
+    expect(count(db, "attempts")).toBe(2);
+    expect(count(db, "xp_events")).toBe(2);
+    expect(readPauseHold(db, guardian.id, child.id)).toBeNull();
+    const replay = submitAttempt(db, guardian.id, child.id, attempt);
+    expect(replay.replayed).toBe(true);
+    expect(replay.resumePresentation).toBe("quiet");
+    expect(showResumeCelebration(replay)).toBe(false);
+    expect(count(db, "xp_events")).toBe(2);
+
+    const emptyPause = readPauseHold(db, guardian.id, child.id);
+    expect(emptyPause).toBeNull();
+    setConsent(db, guardian.id, child.id, "pause");
+    expect(readPauseHold(db, guardian.id, child.id)).toEqual({
+      visible: true,
+      waiting: 0,
+      copyKey: "pause.hold.empty",
+      detailKey: "pause.hold.waiting.detail",
+    });
+  });
+
+  it("drops a revoked queue and never syncs it", async () => {
     const db = tempDb();
     const { guardian, child, session } = grantedChild(db);
     const queue = createAttemptQueue(memoryQueueStore());
@@ -522,6 +698,14 @@ describe("offline queue reconcile", () => {
     };
     queue.enqueue(attempt);
     setConsent(db, guardian.id, child.id, "pause");
+    registerPauseHold(db, guardian.id, child.id, attempt);
+    expect(readPauseHold(db, guardian.id, child.id)?.waiting).toBe(1);
+    setConsent(db, guardian.id, child.id, "revoke");
+    expect(readPauseHold(db, guardian.id, child.id)).toBeNull();
+    const storedHold = db
+      .prepare(`SELECT hold_json FROM consents WHERE child_id = ?`)
+      .get(child.id) as { hold_json: string | null };
+    expect(storedHold.hold_json).toBeNull();
 
     const snapshot = await queue.reconcile(async (queued) => {
       try {
@@ -530,19 +714,155 @@ describe("offline queue reconcile", () => {
           result: submitAttempt(db, guardian.id, child.id, queued),
         };
       } catch (error) {
-        if (error instanceof DomainError && error.status === 403) {
-          return { ok: false as const, reason: "blocked" as const, message: error.message };
+        if (error instanceof DomainError && error.queueDisposition) {
+          return { ok: false as const, reason: error.queueDisposition, message: error.message };
         }
         throw error;
       }
     });
 
-    expect(snapshot.pending).toHaveLength(0);
-    expect(snapshot.blocked).toHaveLength(1);
-    expect(snapshot.synced).toHaveLength(0);
+    expect(snapshot.pending).toEqual([]);
+    expect(snapshot.synced).toEqual([]);
+    expect(snapshot.dropped).toEqual([
+      {
+        idempotencyKey: "revoked-key-001",
+        childId: child.id,
+        sessionId: session.sessionId,
+      },
+    ]);
+    expect(Object.keys(snapshot.dropped[0] ?? {}).sort()).toEqual([
+      "childId",
+      "idempotencyKey",
+      "sessionId",
+    ]);
+    expect(snapshot.dropped[0]).not.toHaveProperty("answer");
+    expect(snapshot.dropped[0]).not.toHaveProperty("itemId");
     expect(count(db, "attempts")).toBe(0);
     expect(count(db, "xp_events")).toBe(0);
+    expect(count(db, "qualifying_events")).toBe(0);
     expect(queue.rewards()).toEqual({ eventIds: [], totalXp: 0 });
+
+    setConsent(db, guardian.id, child.id, "grant");
+    queue.enqueue(attempt);
+    const again = await queue.reconcile(async (queued) => ({
+      ok: true as const,
+      result: submitAttempt(db, guardian.id, child.id, queued),
+    }));
+    expect(again.pending).toEqual([]);
+    expect(again.synced).toEqual([]);
+    expect(count(db, "attempts")).toBe(0);
+  });
+
+  it("caps the unsynced queue so offline tries stay short", () => {
+    const queue = createAttemptQueue(memoryQueueStore());
+    const attempts = Array.from({ length: OFFLINE_QUEUE_CAP }, (_, index) => ({
+      idempotencyKey: `cap-key-${index}0001`,
+      childId: "child",
+      sessionId: "session",
+      itemId: "ops-g2-add",
+      answer: "42",
+      shownAt: at(0),
+      submittedAt: at(2_000 + index),
+    }));
+    for (const attempt of attempts) queue.enqueue(attempt);
+    const overflow = queue.enqueue({
+      ...attempts[0],
+      idempotencyKey: "cap-key-overflow",
+      submittedAt: at(9_000),
+    });
+    expect(overflow.capped).toBe(true);
+    expect(overflow.pending).toHaveLength(OFFLINE_QUEUE_CAP);
+    expect(overflow.pending.map((item) => item.idempotencyKey)).not.toContain("cap-key-overflow");
+    const again = queue.enqueue(attempts[0]);
+    expect(again.capped).toBeUndefined();
+    expect(again.pending).toHaveLength(OFFLINE_QUEUE_CAP);
+  });
+
+  it("shows a full offline cap as a sync limit a parent can see", () => {
+    const db = tempDb();
+    const { guardian, child } = grantedChild(db);
+    expect(readOfflineCap(db, guardian.id, child.id)).toBeNull();
+
+    const view = registerOfflineCap(db, guardian.id, child.id, OFFLINE_QUEUE_CAP);
+    expect(view).toEqual({
+      visible: true,
+      waiting: OFFLINE_QUEUE_CAP,
+      copyKey: "offline.cap.waiting",
+      detailKey: "offline.cap.detail",
+    });
+    if (!("copyKey" in view)) throw new Error("expected a visible cap");
+    const lines = [
+      interfaceCopy(view.copyKey),
+      interfaceCopy(view.detailKey),
+      interfaceCopy("offline.cap.kid"),
+    ];
+    for (const line of lines) {
+      expect(line.toLowerCase()).not.toContain("paused");
+      expect(line.toLowerCase()).not.toContain("revoked");
+    }
+    const stored = db
+      .prepare(`SELECT offline_cap_json FROM consents WHERE child_id = ?`)
+      .get(child.id) as { offline_cap_json: string };
+    expect(JSON.parse(stored.offline_cap_json)).toEqual({ waiting: OFFLINE_QUEUE_CAP });
+    expect(stored.offline_cap_json).not.toContain("answer");
+
+    setConsent(db, guardian.id, child.id, "pause");
+    expect(readOfflineCap(db, guardian.id, child.id)).toBeNull();
+    expect(() => registerOfflineCap(db, guardian.id, child.id, OFFLINE_QUEUE_CAP)).toThrow(
+      DomainError,
+    );
+
+    setConsent(db, guardian.id, child.id, "grant");
+    expect(readOfflineCap(db, guardian.id, child.id)?.waiting).toBe(OFFLINE_QUEUE_CAP);
+    expect(registerOfflineCap(db, guardian.id, child.id, 0)).toEqual({
+      visible: false,
+      waiting: 0,
+    });
+    const cleared = db
+      .prepare(`SELECT offline_cap_json FROM consents WHERE child_id = ?`)
+      .get(child.id) as { offline_cap_json: string | null };
+    expect(cleared.offline_cap_json).toBeNull();
+
+    registerOfflineCap(db, guardian.id, child.id, 9);
+    setConsent(db, guardian.id, child.id, "revoke");
+    const revoked = db
+      .prepare(`SELECT offline_cap_json FROM consents WHERE child_id = ?`)
+      .get(child.id) as { offline_cap_json: string | null };
+    expect(revoked.offline_cap_json).toBeNull();
+  });
+
+  it("does not promote a band while the attempt is only queued", async () => {
+    const db = tempDb();
+    const { guardian, child, session } = grantedChild(db);
+    const queue = createAttemptQueue(memoryQueueStore());
+    const attempt = {
+      ...input(session.sessionId, { idempotencyKey: "offline-band-0001" }),
+      childId: child.id,
+    };
+    queue.enqueue(attempt);
+    const offline = await queue.reconcile(async () => ({ ok: false as const, reason: "offline" }));
+    expect(offline.pending).toHaveLength(1);
+    expect(count(db, "attempts")).toBe(0);
+    expect(count(db, "xp_events")).toBe(0);
+    expect(count(db, "qualifying_events")).toBe(0);
+    const bands = db.prepare(`SELECT COUNT(*) AS count FROM learner_skill_state`).get() as {
+      count: number;
+    };
+    expect(bands.count).toBe(0);
+
+    const synced = await queue.reconcile(async (queued) => ({
+      ok: true as const,
+      result: submitAttempt(db, guardian.id, child.id, queued),
+    }));
+    expect(synced.pending).toEqual([]);
+    expect(synced.synced[0]?.clientView.bandLabel).toBe("Getting it");
+    expect(synced.synced[0]?.celebrationTier).toBe(synced.synced[0]?.clientView.celebrationTier);
+    expect(synced.synced[0]?.oneFocus).toBe(oneFocusForItem(attempt.itemId));
+    expect(displayedOneFocus(synced.synced[0]!)).toBe(synced.synced[0]?.oneFocus);
+    const stored = db
+      .prepare(`SELECT band_label FROM learner_skill_state WHERE child_id = ?`)
+      .get(child.id) as { band_label: string };
+    expect(stored.band_label).toBe("Getting it");
   });
 
   it("reloads a persisted queue from storage", () => {
@@ -568,6 +888,42 @@ describe("offline queue reconcile", () => {
       "stored-key-0001",
     ]);
   });
+
+  it("strips a stored answer when a blocked queue is reloaded", () => {
+    const saved = new Map<string, string>();
+    const storage = {
+      getItem: (key: string) => saved.get(key) ?? null,
+      setItem: (key: string, value: string) => {
+        saved.set(key, value);
+      },
+    };
+    saved.set(
+      "math-sprout-queue",
+      JSON.stringify({
+        version: 1,
+        pending: [],
+        blocked: [
+          {
+            idempotencyKey: "old-blocked-001",
+            childId: "child",
+            sessionId: "session",
+            itemId: "ops-g2-add",
+            answer: "42",
+            shownAt: at(0),
+            submittedAt: at(2_000),
+            message: "Practice is blocked because a parent revoked consent.",
+          },
+        ],
+        synced: [],
+      }),
+    );
+    const restored = createAttemptQueue(storageQueueStore(storage, "math-sprout-queue"));
+    expect(restored.snapshot().pending).toEqual([]);
+    expect(restored.snapshot().dropped).toEqual([
+      { idempotencyKey: "old-blocked-001", childId: "child", sessionId: "session" },
+    ]);
+    expect(JSON.stringify(restored.snapshot().dropped)).not.toContain("42");
+  });
 });
 
 describe("attempt response shape", () => {
@@ -591,6 +947,29 @@ describe("attempt response shape", () => {
       celebrationTier: "full",
     });
     expect(result.celebrationTier).toBe(result.clientView.celebrationTier);
+    expect(result.oneFocus).toBe(oneFocusForItem("ops-g2-add"));
+    expect(displayedOneFocus(result)).toBe(result.oneFocus);
+    expect(result.oneFocus).toBe("Watch regrouping when the ones pass nine.");
+    expect(result.oneFocus).not.toMatch(/keep reading|look again|great job|awesome/i);
+    const missed = submitAttempt(
+      db,
+      guardian.id,
+      child.id,
+      input(session.sessionId, { idempotencyKey: "focus-miss-0001", answer: "41" }),
+    );
+    expect(missed.oneFocus).toBe(result.oneFocus);
+    expect(missed.tryNext).toBe(tryNextForItem("ops-g2-add"));
+    const blank = submitAttempt(
+      db,
+      guardian.id,
+      child.id,
+      input(session.sessionId, { idempotencyKey: "focus-blank-001", answer: "" }),
+    );
+    expect(blank.oneFocus).toBe("Write an answer before you check.");
+    for (const item of ITEM_CATALOG) {
+      expect(item).not.toHaveProperty("misconception");
+      expect(item).not.toHaveProperty("oneFocus");
+    }
     expect(result.clientView).not.toHaveProperty("softState");
     expect(result.clientView).not.toHaveProperty("line");
     const dumped = JSON.stringify(result);

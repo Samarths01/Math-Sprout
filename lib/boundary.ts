@@ -1,5 +1,5 @@
 import type Database from "better-sqlite3";
-import { DomainError, getChild } from "@/lib/domain";
+import { consentDenied, DomainError, getChild } from "@/lib/domain";
 import { catalogItem } from "@/lib/item-catalog";
 import {
   evidenceForSkill,
@@ -37,12 +37,7 @@ function nowIso(): string {
 function assertPracticeAllowed(db: Database.Database, guardianId: string, childId: string) {
   const child = getChild(db, guardianId, childId);
   const gate = practiceGate(child.consentStatus);
-  if (!gate.practiceAllowed) {
-    throw new DomainError(
-      gate.reason ?? "Practice is blocked until a parent grants consent.",
-      403,
-    );
-  }
+  if (!gate.practiceAllowed) throw consentDenied(child.consentStatus);
 }
 
 function requireSession(
@@ -130,6 +125,10 @@ function boundaryOptions(
 /**
  * SessionBoundary. SetBoundary is deferred. Calling this again does not
  * mint a second LevelUpSlight.
+ */
+/**
+ * Consent is checked before the boundary write.
+ * Revoke does not finish the session: the phase stays put and LevelUpSlight is not minted.
  */
 export function endPracticeSession(
   db: Database.Database,

@@ -8,7 +8,9 @@ Slice 3 adds learner state and progression. A rules `MasteryEstimator` maps atte
 
 Slice 4 replaces the quiet-mint stub. XP is an append-only credit on the QualifyingEvent bus, written in the same transaction as the attempt. `celebrationTier` is derived from those mints: `full` is not stored without a credit, and review stays `quietXp` or `none`. A review week is capped (`review_sessions_per_week`, stub 3). The boundary shows how many review sets are left, and the server drops the mint when the week is used up. Review never mints LevelUpSlight, a badge, or a build piece.
 
-A qualifying practice day is an honest Recommended or Challenge try on the child's local calendar day. That event is the only heat. The first qualifying day sets the streak to Warm. A qualifying day on the next calendar day, while the flame is still Hot, Warm, or Ember, sets it to Hot. Any longer gap starts again at Warm. The same local day does not heat again. With no new qualifying day, the flame cools to Ember until `ember_expires_at`, then to Dormant. The server stores `streak_state`, `ember_expires_at`, and `last_qualifying_day` using `child.timezone`. Badge screens, BuildGoal, and ember recovery chrome are Slice 5. Nothing subtracts XP.
+A qualifying practice day is an honest Recommended or Challenge try on the child's local calendar day. That event is the only heat. The first qualifying day sets the streak to Warm. A qualifying day on the next calendar day, while the flame is still Hot, Warm, or Ember, sets it to Hot. Any longer gap starts again at Warm. The same local day does not heat again. With no new qualifying day, the flame cools to Ember until `ember_expires_at`, then to Dormant. The server stores `streak_state`, `ember_expires_at`, and `last_qualifying_day` using `child.timezone`. Nothing subtracts XP.
+
+Slice 5 projects that bus onto the child companion. One BuildGoal is active. Its pieces are the `BadgeMilestone`, `BuildPieceUnlock`, and `LevelUpSlight` rows already on the bus, in that order. A hot streak is the `BuildPieceUnlock` whose source is `streak_hot`. There is no piece balance, no shop, and no second XP ledger. The badge screen lists `BadgeMilestone` rows. The sprout on the child home follows the streak machine: Warm, Hot, Ember, or Dormant. Ember is the only state with a recovery affordance, and that affordance is a careful practice try, still behind consent. The parent home still does not tell a progress story.
 
 Each attempt and practice session stores `policy_version` (`rules-v0`). The server attempt log carries that same string with the concept, item, difficulty, lanes, correctness, latency, integrity flags, session id, and idempotency key. Kids still receive only `ClientView`. Production scoring stays the rules `MasteryEstimator`. The eval harness that baselines later policies against `rules-v0` is Signal-owned and offline. This app does not run a second scorer.
 
@@ -16,7 +18,7 @@ Architecture §21 supersedes treating those integrity fixtures as a Slice 2 exit
 
 ## Run locally
 
-Requirements: Node.js 22 and npm.
+Requirements: Node.js 22 or newer (`package.json` `engines.node` is `>=22`) and npm. GitHub Checks runs `npm test` on Node 22.
 
 ```bash
 npm install
@@ -42,15 +44,16 @@ npm start
 2. Add a child. Timezone is required on the profile. If you leave the default selected, the server stores your timezone, or `America/Los_Angeles` when yours is unset.
 3. Grant, pause, or revoke consent from the parent home. Only `granted` allows practice.
 4. Open the child home. The Start practice button stays disabled until consent is granted. Missing, paused, and revoked consent do not start a session.
-5. With consent granted, start practice. Answer a problem from the operations or fractions pack. The response names what went well, one focus, what to try next, and a lock-in. It does not show a score or a confidence number.
-6. If the connection drops, the answer stays in a device queue and syncs with the same idempotency key when the connection returns. A replay returns the original attempt and the original event ids.
+5. With consent granted, start practice. Answer a problem from the operations or fractions pack. The response names what went well, one focus, what to try next, and a lock-in. One focus is the server string from that item's misconception tag, shown as sent. A queued try does not move the skill band until the server commits it. The response does not show a score or a confidence number.
+6. If the connection drops while consent is still granted, the answer stays in a device queue and syncs with the same idempotency key when the connection returns. A replay returns the original attempt, the original `ClientView`, and the original event ids. That response is the saved try, not an empty 409. The unsynced queue holds at most 3 tries. At that cap the child stays on the same problem, and the parent home shows a sync-limit note. That note does not say practice is paused. Pause holds a pending queue for a parent-visible wait and a quiet resume. Pause does not drop the queue. Revoke drops the queue and does not sync it. This offline queue is not claimed as a kid-reachable ship. One focus is the server string assembled from that item's misconception tag, shown as sent.
 7. End the session to pick the next lane. Recommended is the usual choice. Challenge is a step up. Review shows up when a skill is still short of Got it, with how many review sets are left this week. A little harder is offered only after Recommended or Challenge evidence supports it. After the weekly review cap, that choice does not mint a sprout.
+8. On the child home, the sprout shows the flame and the one active build. Open spots fill when the bus mints a badge, a slightly harder step, or a hot-streak piece. Badges are listed on their own screen. If the flame is an ember, practice today is the way to bring it back.
 
 ## Deferred
 
-Revoke sets consent to `revoked` and blocks practice. It does not delete the guardian, the child, or the consent row.
+Revoke sets consent to `revoked` and stops practice immediately. The pending device queue is dropped and is not synced. Ending that session does not run: the phase stays `practicing`, and LevelUpSlight is not minted. Revoke does not delete the guardian, the child, the consent row, or the attempt ledger. Pause sets consent to `paused` and blocks new practice. Pause holds the pending queue. The parent home shows that waiting state. Granting practice credits the held tries and does not present a celebration for them. There is no drop-on-pause path.
 
-Account, child, and consent delete hooks are not in this slice. A later version should stop any in-flight practice, then cascade or anonymize the attempt ledger. Do not describe this slice as consent-complete, or as a production revoke-and-delete flow.
+Account, child, and consent delete/export cascades are not in this slice. COPPA verification method is not in this slice. Architecture §24's offline guard in this slice is the queue cap of 3. Frozen next-item selection is not this seam. A full cap is a sync limit: the parent home uses the same calm waiting pattern as a pause hold, with copy that does not call it a pause or a revoke. Do not describe this slice as consent-complete, as a production revoke-and-delete flow, or as a cleared kid-reachable mint beyond the replay, queue-disposition, and `rules-v0` fixtures.
 
 ## API
 
@@ -67,9 +70,14 @@ The same Next.js server is the API. All child and consent routes require the par
 | POST | `/api/children/:id/consent` | Body: `{ "action": "grant" \| "pause" \| "revoke" }`. |
 | GET | `/api/children/:id/consent` | Current consent status. |
 | GET | `/api/children/:id/home` | `{ practiceAllowed, reason?, child }`. |
+| GET | `/api/children/:id/companion` | The child companion: one active BuildGoal, badge rows, and the streak surface. Pieces and badges are projections of QualifyingEvent ids. Ember includes a recovery copy key. This payload has no XP total, score, or confidence. |
 | GET | `/api/parent/home` | Guardian plus children and consent. |
 | POST | `/api/children/:id/sessions` | Start or resume a practice session when consent is `granted`. Returns `{ sessionId, item, lane, atBoundary, clientView }`. `clientView` is the stored chip for that problem's skill, when one exists. |
-| POST | `/api/children/:id/attempts` | Submit one try. Body: `idempotencyKey`, `sessionId`, `itemId`, `answer`, `shownAt`, `submittedAt`. The same key returns the original attempt, four-beat copy, `clientView`, and `eventIds`. `eventIds` are the QualifyingEvent ids for that try. XP credits point at those ids. |
+| POST | `/api/children/:id/pause-hold` | Record one paused try on the parent-visible hold. Body matches an attempt. Allowed only while consent is `paused`. The stored receipt is the idempotency key and session id. |
+| GET | `/api/children/:id/pause-hold` | `{ visible, waiting }` for a paused child, or for a granted child who still has uncredited holds. Otherwise `{ visible: false, waiting: 0 }`. |
+| POST | `/api/children/:id/offline-cap` | Record or clear the parent-visible offline cap. Body: `{ waiting }`. A count at the cap of 3 stores that count and nothing else. A smaller count clears it. Allowed only while consent is `granted`. |
+| GET | `/api/children/:id/offline-cap` | `{ visible, waiting }` while practice is granted and the cap is full. Otherwise `{ visible: false, waiting: 0 }`. |
+| POST | `/api/children/:id/attempts` | Submit one try. Body: `idempotencyKey`, `sessionId`, `itemId`, `answer`, `shownAt`, `submittedAt`. The same key returns HTTP 200 with the original attempt, four-beat copy, `clientView`, and `eventIds`. It does not return an empty 409. A new try while consent is paused returns 403 with `queueDisposition: "hold"`. Revoked or missing consent returns 403 with `queueDisposition: "drop"`. A held try that was visible to a parent is credited on resume with `resumePresentation: "quiet"`. The mint still stands. `eventIds` are the QualifyingEvent ids for that try. XP credits point at those ids. |
 | POST | `/api/children/:id/sessions/:sessionId/end` | Reach the session boundary after at least one try. Returns lane options, including `reviewSessionsRemaining`. A second call does not fire LevelUpSlight again. |
 | GET | `/api/children/:id/sessions/:sessionId/boundary-options` | Lane menu. Only while the session is at that boundary. Recommended is the default. Review shows skills still going and review sets left this week. |
 | POST | `/api/children/:id/sessions/:sessionId/lane` | Body: `{ "lane": "recommended" \| "challenge" \| "review" }`. Closes the session and stores the lane for the next one. |
@@ -108,7 +116,11 @@ The image listens on `43123` and stores the database at `/data/math-sprout.sqlit
 - practice is allowed only when consent is `granted`
 - pause and revoke block practice again
 - a blocked practice click does not start a session
-- the same idempotency key replays the original attempt and event ids
+- the same idempotency key replays the original attempt, `ClientView`, and event ids, including after the session has ended, and that HTTP response is 200 rather than an empty 409
+- pause is hold only: a parent-visible receipt, a quiet resume, and no drop if that receipt is late or the receipt POST fails (the client retries until the receipt is visible, then keeps the try held)
+- an unsynced queue stops at 3 tries; the parent home shows that as a sync limit, not a pause; a queued try does not promote a skill band or mint Got it until the server commits it
+- `oneFocus` on a scored try is the server string from that item's misconception tag, rendered as sent
+- revoke drops that queue, clears any pause receipt, and does not mint, including if the same key is enqueued again
 - an empty answer, a too-fast answer, and a spam window stay in the review lane (`quietXp` or `none`)
 - the celebration tier and the XP mint commit together
 - an offline queue reconciles through that same key
@@ -131,3 +143,11 @@ Slice 4 adds:
 - QualifyingPracticeDay heats Warm on the first qualifying day, and Hot on the next calendar day while the flame is still alive, using `child.timezone`
 - attempts and sessions store `policy_version` `rules-v0`, and the server attempt log includes it
 - empty, too-fast, duplicate-key, and identical-spam responses keep `ClientView` free of score, confidence, and judgment copy, and do not mint full XP, a badge, or a build piece
+
+Slice 5 adds:
+
+- one active BuildGoal, filled only by bus `BadgeMilestone`, `BuildPieceUnlock`, and `LevelUpSlight` rows
+- a hot-streak piece is the existing `streak_hot` unlock, and a replay does not add another piece
+- the badge screen lists bus `BadgeMilestone` rows
+- Ember is the only streak state with a recovery affordance, and Warm, Hot, and Dormant are not
+- the child home and parent home payloads stay free of a second progress ledger

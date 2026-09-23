@@ -1,4 +1,5 @@
 import type { FourBeat, IntegrityFlag, PublicItem } from "@/lib/attempt-contract";
+import { oneFocusForItem, tryNextForItem } from "@/lib/item-bank";
 
 export function buildFourBeat(input: {
   correct: boolean;
@@ -32,18 +33,19 @@ export function buildFourBeat(input: {
       lockIn: "This one stays a quiet sprout.",
     };
   }
+  const oneFocus = oneFocusForItem(input.item.id);
   if (input.correct) {
     return {
       whatWentWell: `You worked out ${input.item.skill}.`,
-      oneFocus: "Keep reading the question all the way through.",
+      oneFocus,
       tryNext: `Try another grade ${input.item.grade} ${input.item.pack} problem.`,
       lockIn: "That is the answer we were looking for.",
     };
   }
   return {
     whatWentWell: "You committed to an answer.",
-    oneFocus: `Look again at ${input.item.skill}.`,
-    tryNext: "Try one more like this, a little slower.",
+    oneFocus,
+    tryNext: tryNextForItem(input.item.id),
     lockIn: `The answer we were looking for is ${input.canonicalAnswer}.`,
   };
 }
