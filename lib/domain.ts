@@ -55,7 +55,7 @@ export type ParentHome = {
 };
 
 export const PARENT_HOME_NARRATIVE =
-  "This home shows who is set up and whether consent is granted. Practice rewards stay on each attempt. This home does not show a score, a streak, or a progress story.";
+  "This home shows who is set up, whether consent is granted, and one line about today's practice: minutes, the focus concept, and whether the band moved. It does not list each answer or a score.";
 
 type GuardianRow = {
   id: string;
