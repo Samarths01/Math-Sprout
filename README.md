@@ -18,7 +18,7 @@ Architecture §21 supersedes treating those integrity fixtures as a Slice 2 exit
 
 ## Run locally
 
-Requirements: Node.js 22 and npm.
+Requirements: Node.js 22 or newer (`package.json` `engines.node` is `>=22`) and npm. GitHub Checks runs `npm test` on Node 22.
 
 ```bash
 npm install
@@ -117,7 +117,7 @@ The image listens on `43123` and stores the database at `/data/math-sprout.sqlit
 - pause and revoke block practice again
 - a blocked practice click does not start a session
 - the same idempotency key replays the original attempt, `ClientView`, and event ids, including after the session has ended, and that HTTP response is 200 rather than an empty 409
-- pause is hold only: a parent-visible receipt, a quiet resume, and no drop if that receipt is late
+- pause is hold only: a parent-visible receipt, a quiet resume, and no drop if that receipt is late or the receipt POST fails (the client retries until the receipt is visible, then keeps the try held)
 - an unsynced queue stops at 3 tries; the parent home shows that as a sync limit, not a pause; a queued try does not promote a skill band or mint Got it until the server commits it
 - `oneFocus` on a scored try is the server string from that item's misconception tag, rendered as sent
 - revoke drops that queue, clears any pause receipt, and does not mint, including if the same key is enqueued again

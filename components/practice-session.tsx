@@ -16,6 +16,7 @@ import {
   type SyncPost,
 } from "@/lib/offline-queue";
 import { showResumeCelebration } from "@/lib/pause-hold";
+import { postPauseHoldUntilVisible } from "@/lib/pause-hold-receipt";
 import { Button } from "@/components/ui/button";
 import {
   Card,
@@ -70,6 +71,7 @@ async function postAttempt(childId: string, attempt: QueuedAttempt): Promise<Syn
       | null;
     if (response.status === 403) {
       if (body?.queueDisposition === "hold") {
+        // Receipt retries stay on hold. A failed POST never becomes a drop.
         await registerVisibleHold(childId, attempt);
       }
       return {
@@ -92,7 +94,7 @@ async function postAttempt(childId: string, attempt: QueuedAttempt): Promise<Syn
 }
 
 async function registerVisibleHold(childId: string, attempt: QueuedAttempt): Promise<boolean> {
-  try {
+  return postPauseHoldUntilVisible(async () => {
     const response = await fetch(`/api/children/${childId}/pause-hold`, {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -100,9 +102,7 @@ async function registerVisibleHold(childId: string, attempt: QueuedAttempt): Pro
     });
     const body = (await response.json().catch(() => null)) as { visible?: boolean } | null;
     return response.ok && body?.visible === true;
-  } catch {
-    return false;
-  }
+  });
 }
 
 export function PracticeSession({

@@ -36,6 +36,7 @@ import {
   type SyncPost,
 } from "@/lib/offline-queue";
 import { readPauseHold, registerPauseHold, showResumeCelebration } from "@/lib/pause-hold";
+import { postPauseHoldUntilVisible } from "@/lib/pause-hold-receipt";
 import { readOfflineCap, registerOfflineCap } from "@/lib/offline-cap";
 import { queueDisposition } from "@/lib/practice-gate";
 import { interfaceCopy } from "@/lib/interface-copy";
@@ -515,6 +516,33 @@ describe("offline queue reconcile", () => {
     expect(synced.synced[0]?.eventIds).toContain(credit.qualifying_event_id);
     expect(synced.synced[0]?.eventIds).not.toContain(credit.id);
     expect(count(db, "xp_events")).toBe(1);
+  });
+
+  it("retries a pause-hold receipt and keeps hold when every post fails", async () => {
+    const wait = async () => {};
+    let calls = 0;
+    const visible = await postPauseHoldUntilVisible(
+      async () => {
+        calls += 1;
+        if (calls < 3) throw new Error("receipt missed");
+        return true;
+      },
+      { tries: 4, wait },
+    );
+    expect(visible).toBe(true);
+    expect(calls).toBe(3);
+
+    let misses = 0;
+    const stillHeld = await postPauseHoldUntilVisible(
+      async () => {
+        misses += 1;
+        return false;
+      },
+      { tries: 4, wait },
+    );
+    expect(stillHeld).toBe(false);
+    expect(misses).toBe(4);
+    expect(consentQueueReason({ queueDisposition: "hold" })).toBe("hold");
   });
 
   it("holds a paused queue where a parent can see it and credits it quietly", async () => {
