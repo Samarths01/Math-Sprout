@@ -2,7 +2,9 @@
 
 Math Sprout is a parent-managed math practice app for grades 2–4. A guardian account owns each child profile. Practice starts only when that guardian's consent is `granted`.
 
-This slice records practice attempts. Each attempt is idempotent, can be queued offline, and returns a four-beat response with a soft client view. XP is a mint-only ledger: a sprout or a quiet sprout is written in the same transaction as the attempt, and nothing subtracts it later. There is no shop, streak, tutor chat, or score.
+This slice records practice attempts. Each attempt is idempotent, can be queued offline, and returns `correct`, four beats, and a `ClientView` (`bandLabel`, `showConceptChip`, `celebrationTier` of `none`, `quietXp`, or `full`). There is no score and no confidence value.
+
+Slice 2 was planned as “no economy yet.” That exit is superseded: this slice keeps a quiet-mint stub only. `xp_events` writes a `quietXp` or `full` mint in the same transaction as the attempt (`full` is the earlier sprout amount). It is not a shop, a streak, a BuildGoal, or a second ledger. Those stay later slices. Nothing subtracts XP.
 
 ## Run locally
 

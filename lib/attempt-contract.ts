@@ -13,13 +13,17 @@ export type IntegrityFlag = "empty_answer" | "too_fast" | "spam_window";
 
 export type ReviewLane = "celebrate" | "review";
 
-export type CelebrationTier = "sprout" | "quietXp" | "none";
+/** Plan §2.3. `full` is the former sprout mint, not a BuildGoal. */
+export type CelebrationTier = "none" | "quietXp" | "full";
 
-export type SoftState = "sprouting" | "steady" | "needs-review";
+export const BAND_LABELS = ["Still learning", "Getting it", "Got it"] as const;
+
+export type BandLabel = (typeof BAND_LABELS)[number];
 
 export type ClientView = {
-  softState: SoftState;
-  line: string;
+  bandLabel: BandLabel;
+  showConceptChip: boolean;
+  celebrationTier: CelebrationTier;
 };
 
 export type ItemPack = "operations" | "fractions";
@@ -52,9 +56,9 @@ export const SPAM_WINDOW_MS = 10_000;
 export const SPAM_MAX_IN_WINDOW = 8;
 
 export const XP_AMOUNT: Record<CelebrationTier, number> = {
-  sprout: 5,
-  quietXp: 1,
   none: 0,
+  quietXp: 1,
+  full: 5,
 };
 
 export function integrityFlags(input: {
@@ -72,8 +76,8 @@ export function integrityFlags(input: {
 }
 
 /**
- * Review lane can mint only quietXp or none.
- * A clean correct try mints sprout. A clean miss mints quietXp.
+ * Quiet-mint stub. Review lane is quietXp or none. A clean correct try is full.
+ * Slice 2 keeps this ledger only; it is not the BuildGoal economy.
  */
 export function resolveCelebration(input: {
   correct: boolean;
@@ -88,7 +92,7 @@ export function resolveCelebration(input: {
       xpAmount: XP_AMOUNT[celebrationTier],
     };
   }
-  const celebrationTier: CelebrationTier = input.correct ? "sprout" : "quietXp";
+  const celebrationTier: CelebrationTier = input.correct ? "full" : "quietXp";
   return {
     lane: "celebrate",
     celebrationTier,

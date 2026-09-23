@@ -1,26 +1,29 @@
-import type { ClientView, ReviewLane } from "@/lib/attempt-contract";
+import type {
+  BandLabel,
+  CelebrationTier,
+  ClientView,
+  ReviewLane,
+} from "@/lib/attempt-contract";
 
 /**
- * Rules stub for the child-facing soft state.
- * It does not emit a score, a percent, or a confidence value.
+ * Rules stub. One clean try is "Getting it", not "Got it".
+ * The celebration tier is the one committed with the mint. This stub does not invent another.
  */
 export class MasteryEstimator {
-  view(input: { correct: boolean; lane: ReviewLane }): ClientView {
-    if (input.lane === "review") {
-      return {
-        softState: "needs-review",
-        line: "We'll keep this try quiet and practice another.",
-      };
+  toClientView(input: {
+    correct: boolean;
+    lane: ReviewLane;
+    celebrationTier: CelebrationTier;
+  }): ClientView {
+    if (input.lane === "review" && input.celebrationTier === "full") {
+      throw new Error("Review lane cannot celebrate full.");
     }
-    if (input.correct) {
-      return {
-        softState: "steady",
-        line: "This skill looks steady for now.",
-      };
-    }
+    const bandLabel: BandLabel =
+      input.lane === "celebrate" && input.correct ? "Getting it" : "Still learning";
     return {
-      softState: "sprouting",
-      line: "This skill is still sprouting. One focus is enough.",
+      bandLabel,
+      showConceptChip: input.lane === "celebrate",
+      celebrationTier: input.celebrationTier,
     };
   }
 }

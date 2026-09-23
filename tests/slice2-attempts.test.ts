@@ -135,7 +135,7 @@ describe("idempotent attempt replay", () => {
     expect(replay).toMatchObject({
       attemptId: first.attemptId,
       eventIds: first.eventIds,
-      xpAmount: XP_AMOUNT.sprout,
+      xpAmount: XP_AMOUNT.full,
       replayed: true,
     });
     expect(replay.eventIds.length).toBeGreaterThan(0);
@@ -180,12 +180,17 @@ describe("integrity gates", () => {
     expect(result.flags).toContain("empty_answer");
     expect(result.lane).toBe("review");
     expect(result.celebrationTier).toBe("none");
+    expect(result.clientView).toEqual({
+      bandLabel: "Still learning",
+      showConceptChip: false,
+      celebrationTier: "none",
+    });
     expect(result.eventIds).toEqual([]);
     expect(result.xpAmount).toBe(0);
     expect(count(db, "xp_events")).toBe(0);
   });
 
-  it("keeps a too-fast answer in the review lane with no sprout", () => {
+  it("keeps a too-fast answer in the review lane with no full mint", () => {
     const db = tempDb();
     const { guardian, child, session } = grantedChild(db);
     const result = submitAttempt(
@@ -229,13 +234,13 @@ describe("integrity gates", () => {
 
     const paced = results.slice(0, SPAM_MAX_IN_WINDOW);
     const spam = results[SPAM_MAX_IN_WINDOW];
-    expect(paced.every((result) => result.celebrationTier === "sprout")).toBe(true);
+    expect(paced.every((result) => result.celebrationTier === "full")).toBe(true);
     expect(spam?.flags).toContain("spam_window");
     expect(spam?.lane).toBe("review");
     expect(spam?.celebrationTier).toBe("quietXp");
     expect(spam?.xpAmount).toBe(XP_AMOUNT.quietXp);
     expect(["quietXp", "none"]).toContain(spam?.celebrationTier);
-    expect(spam?.celebrationTier).not.toBe("sprout");
+    expect(spam?.celebrationTier).not.toBe("full");
   });
 
   it("limits every review lane to quietXp or none", () => {
@@ -253,8 +258,8 @@ describe("integrity gates", () => {
     }
     expect(resolveCelebration({ correct: true, flags: [] })).toMatchObject({
       lane: "celebrate",
-      celebrationTier: "sprout",
-      xpAmount: XP_AMOUNT.sprout,
+      celebrationTier: "full",
+      xpAmount: XP_AMOUNT.full,
     });
   });
 });
@@ -277,9 +282,9 @@ describe("celebration mint", () => {
       id: string;
     };
 
-    expect(row.attempt_tier).toBe("sprout");
-    expect(row.event_tier).toBe("sprout");
-    expect(row.amount).toBe(XP_AMOUNT.sprout);
+    expect(row.attempt_tier).toBe("full");
+    expect(row.event_tier).toBe("full");
+    expect(row.amount).toBe(XP_AMOUNT.full);
     expect(result.eventIds).toEqual([row.id]);
   });
 
@@ -328,6 +333,11 @@ describe("celebration mint", () => {
 
     expect(missed.lane).toBe("celebrate");
     expect(missed.celebrationTier).toBe("quietXp");
+    expect(missed.clientView).toEqual({
+      bandLabel: "Still learning",
+      showConceptChip: true,
+      celebrationTier: "quietXp",
+    });
     expect(missed.xpAmount).toBe(1);
     expect(blank.celebrationTier).toBe("none");
     expect(xpRows(db).map((row) => row.amount)).toEqual([1]);
@@ -511,8 +521,19 @@ describe("attempt response shape", () => {
     for (const key of FOUR_BEAT_KEYS) {
       expect(result[key].length).toBeGreaterThan(0);
     }
-    expect(Object.keys(result.clientView).sort()).toEqual(["line", "softState"]);
-    expect(["sprouting", "steady", "needs-review"]).toContain(result.clientView.softState);
+    expect(Object.keys(result.clientView).sort()).toEqual([
+      "bandLabel",
+      "celebrationTier",
+      "showConceptChip",
+    ]);
+    expect(result.clientView).toEqual({
+      bandLabel: "Getting it",
+      showConceptChip: true,
+      celebrationTier: "full",
+    });
+    expect(result.celebrationTier).toBe(result.clientView.celebrationTier);
+    expect(result.clientView).not.toHaveProperty("softState");
+    expect(result.clientView).not.toHaveProperty("line");
     const dumped = JSON.stringify(result);
     expect(dumped).not.toMatch(/scorePercent|confidence|rawConfidence|percentCorrect/i);
     expect(result).not.toHaveProperty("score");
@@ -523,14 +544,28 @@ describe("attempt response shape", () => {
 
   it("uses the mastery estimator stub without a numeric score", () => {
     const estimator = new MasteryEstimator();
-    const steady = estimator.view({ correct: true, lane: "celebrate" });
-    const review = estimator.view({ correct: true, lane: "review" });
-    expect(steady).toEqual({
-      softState: "steady",
-      line: "This skill looks steady for now.",
+    const getting = estimator.toClientView({
+      correct: true,
+      lane: "celebrate",
+      celebrationTier: "full",
     });
-    expect(review.softState).toBe("needs-review");
-    expect(Object.keys(steady).sort()).toEqual(["line", "softState"]);
+    const review = estimator.toClientView({
+      correct: true,
+      lane: "review",
+      celebrationTier: "none",
+    });
+    expect(getting).toEqual({
+      bandLabel: "Getting it",
+      showConceptChip: true,
+      celebrationTier: "full",
+    });
+    expect(review).toEqual({
+      bandLabel: "Still learning",
+      showConceptChip: false,
+      celebrationTier: "none",
+    });
+    expect(["Still learning", "Getting it", "Got it"]).toContain(getting.bandLabel);
+    expect(["none", "quietXp", "full"]).toContain(review.celebrationTier);
     expect(JSON.stringify(review)).not.toMatch(/score|confidence|percent/i);
   });
 });

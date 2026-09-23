@@ -7,6 +7,7 @@ import {
   type AttemptResult,
   type FourBeat,
   type IntegrityFlag,
+  type BandLabel,
   type ClientView,
   SPAM_WINDOW_MS,
 } from "@/lib/attempt-contract";
@@ -153,6 +154,24 @@ function readBeats(raw: string): FourBeat {
   return beats;
 }
 
+function readClientView(
+  raw: string,
+  celebrationTier: AttemptResult["celebrationTier"],
+): ClientView {
+  const parsed = JSON.parse(raw) as Partial<ClientView> & { softState?: string };
+  const locked = ["Still learning", "Getting it", "Got it"] as const;
+  const bandLabel: BandLabel = locked.includes(parsed.bandLabel as BandLabel)
+    ? (parsed.bandLabel as BandLabel)
+    : parsed.softState === "steady"
+      ? "Getting it"
+      : "Still learning";
+  const showConceptChip =
+    typeof parsed.showConceptChip === "boolean"
+      ? parsed.showConceptChip
+      : parsed.softState !== "needs-review";
+  return { bandLabel, showConceptChip, celebrationTier };
+}
+
 function resultFromRow(
   db: Database.Database,
   row: AttemptRow,
@@ -168,7 +187,10 @@ function resultFromRow(
     .get(row.session_id) as { item_index: number } | undefined;
   if (!session) throw new DomainError("Practice session not found.", 404);
   const beats = readBeats(row.beats_json);
-  const clientView = JSON.parse(row.client_view_json) as ClientView;
+  if (row.celebration_tier === "full" && events.length === 0) {
+    throw new DomainError("full celebration requires a mint.", 500);
+  }
+  const clientView = readClientView(row.client_view_json, row.celebration_tier);
   const flags = JSON.parse(row.flags_json) as IntegrityFlag[];
   return {
     attemptId: row.id,
@@ -279,8 +301,11 @@ export function submitAttempt(
     });
     const correct = gradeAnswer(itemId, input.answer);
     const celebration = resolveCelebration({ correct, flags });
-    if (celebration.lane === "review" && celebration.celebrationTier === "sprout") {
-      throw new Error("Review lane cannot mint a sprout.");
+    if (celebration.lane === "review" && celebration.celebrationTier === "full") {
+      throw new Error("Review lane cannot mint full.");
+    }
+    if (celebration.celebrationTier === "full" && celebration.xpAmount <= 0) {
+      throw new Error("full celebration requires a mint.");
     }
     const beats = buildFourBeat({
       correct,
@@ -288,9 +313,10 @@ export function submitAttempt(
       item,
       canonicalAnswer: canonicalAnswer(itemId),
     });
-    const clientView = new MasteryEstimator().view({
+    const clientView = new MasteryEstimator().toClientView({
       correct,
       lane: celebration.lane,
+      celebrationTier: celebration.celebrationTier,
     });
     const attemptId = randomUUID();
     const createdAt = nowIso();

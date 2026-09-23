@@ -29,8 +29,8 @@ const BEAT_LABELS: Record<(typeof FOUR_BEAT_KEYS)[number], string> = {
   lockIn: "Lock in",
 };
 
-function tierLine(tier: AttemptResult["celebrationTier"]): string {
-  if (tier === "sprout") return "A sprout for that try.";
+function tierLine(tier: AttemptResult["clientView"]["celebrationTier"]): string {
+  if (tier === "full") return "A sprout for that try.";
   if (tier === "quietXp") return "A quiet sprout. This one stays small.";
   return "No sprout this time.";
 }
@@ -240,8 +240,11 @@ export function PracticeSession({
         <CardContent>
           {feedback ? (
             <div data-testid="practice-feedback" className="grid gap-4" aria-live="polite">
-              <p className="text-sm text-muted-foreground" data-celebration-tier={feedback.celebrationTier}>
-                {tierLine(feedback.celebrationTier)}
+              <p
+                className="text-sm text-muted-foreground"
+                data-celebration-tier={feedback.clientView.celebrationTier}
+              >
+                {tierLine(feedback.clientView.celebrationTier)}
                 {feedback.replayed ? " This try was already saved." : ""}
               </p>
               <dl className="grid gap-3">
@@ -254,9 +257,16 @@ export function PracticeSession({
                   </div>
                 ))}
               </dl>
-              <p data-testid="client-view" data-soft-state={feedback.clientView.softState}>
-                {feedback.clientView.line}
-              </p>
+              <div data-testid="client-view" className="grid gap-2">
+                <p data-band-label={feedback.clientView.bandLabel}>
+                  {feedback.clientView.bandLabel}
+                </p>
+                {feedback.clientView.showConceptChip ? (
+                  <p data-testid="concept-chip" className="text-sm text-muted-foreground">
+                    {item.skill}
+                  </p>
+                ) : null}
+              </div>
               <Button
                 type="button"
                 className="h-12 text-base"

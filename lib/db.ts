@@ -55,7 +55,7 @@ CREATE TABLE IF NOT EXISTS attempts (
   submitted_at TEXT NOT NULL,
   correct INTEGER NOT NULL CHECK (correct IN (0, 1)),
   lane TEXT NOT NULL CHECK (lane IN ('celebrate', 'review')),
-  celebration_tier TEXT NOT NULL CHECK (celebration_tier IN ('sprout', 'quietXp', 'none')),
+  celebration_tier TEXT NOT NULL CHECK (celebration_tier IN ('none', 'quietXp', 'full')),
   flags_json TEXT NOT NULL,
   beats_json TEXT NOT NULL,
   client_view_json TEXT NOT NULL,
@@ -68,7 +68,7 @@ CREATE TABLE IF NOT EXISTS xp_events (
   attempt_id TEXT NOT NULL UNIQUE REFERENCES attempts(id) ON DELETE CASCADE,
   child_id TEXT NOT NULL REFERENCES children(id) ON DELETE CASCADE,
   amount INTEGER NOT NULL CHECK (amount IN (1, 5)),
-  celebration_tier TEXT NOT NULL CHECK (celebration_tier IN ('sprout', 'quietXp')),
+  celebration_tier TEXT NOT NULL CHECK (celebration_tier IN ('quietXp', 'full')),
   minted_at TEXT NOT NULL
 );
 
@@ -86,7 +86,80 @@ export function openDatabase(filename: string): Database.Database {
     db.pragma("journal_mode = WAL");
   }
   db.exec(MIGRATION);
+  migrateSproutTier(db);
   return db;
+}
+
+function migrateSproutTier(db: Database.Database): void {
+  const attempts = db
+    .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'attempts'")
+    .get() as { sql: string } | undefined;
+  if (!attempts?.sql.includes("'sprout'")) return;
+
+  const previous = db.pragma("foreign_keys", { simple: true });
+  db.pragma("foreign_keys = OFF");
+  const run = db.transaction(() => {
+    db.exec(`
+      CREATE TABLE attempts__next (
+        id TEXT PRIMARY KEY,
+        child_id TEXT NOT NULL REFERENCES children(id) ON DELETE CASCADE,
+        session_id TEXT NOT NULL REFERENCES practice_sessions(id) ON DELETE CASCADE,
+        idempotency_key TEXT NOT NULL,
+        item_id TEXT NOT NULL,
+        answer TEXT NOT NULL,
+        shown_at TEXT NOT NULL,
+        submitted_at TEXT NOT NULL,
+        correct INTEGER NOT NULL CHECK (correct IN (0, 1)),
+        lane TEXT NOT NULL CHECK (lane IN ('celebrate', 'review')),
+        celebration_tier TEXT NOT NULL CHECK (celebration_tier IN ('none', 'quietXp', 'full')),
+        flags_json TEXT NOT NULL,
+        beats_json TEXT NOT NULL,
+        client_view_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE (child_id, idempotency_key)
+      );
+      INSERT INTO attempts__next (
+        id, child_id, session_id, idempotency_key, item_id, answer, shown_at,
+        submitted_at, correct, lane, celebration_tier, flags_json, beats_json,
+        client_view_json, created_at
+      )
+      SELECT
+        id, child_id, session_id, idempotency_key, item_id, answer, shown_at,
+        submitted_at, correct, lane,
+        CASE celebration_tier WHEN 'sprout' THEN 'full' ELSE celebration_tier END,
+        flags_json, beats_json, client_view_json, created_at
+      FROM attempts;
+      DROP TABLE attempts;
+      ALTER TABLE attempts__next RENAME TO attempts;
+
+      CREATE TABLE xp_events__next (
+        id TEXT PRIMARY KEY,
+        attempt_id TEXT NOT NULL UNIQUE REFERENCES attempts(id) ON DELETE CASCADE,
+        child_id TEXT NOT NULL REFERENCES children(id) ON DELETE CASCADE,
+        amount INTEGER NOT NULL CHECK (amount IN (1, 5)),
+        celebration_tier TEXT NOT NULL CHECK (celebration_tier IN ('quietXp', 'full')),
+        minted_at TEXT NOT NULL
+      );
+      INSERT INTO xp_events__next (
+        id, attempt_id, child_id, amount, celebration_tier, minted_at
+      )
+      SELECT
+        id, attempt_id, child_id, amount,
+        CASE celebration_tier WHEN 'sprout' THEN 'full' ELSE celebration_tier END,
+        minted_at
+      FROM xp_events;
+      DROP TABLE xp_events;
+      ALTER TABLE xp_events__next RENAME TO xp_events;
+
+      CREATE INDEX IF NOT EXISTS practice_sessions_child_id ON practice_sessions(child_id);
+      CREATE INDEX IF NOT EXISTS attempts_child_submitted ON attempts(child_id, submitted_at);
+    `);
+  });
+  try {
+    run();
+  } finally {
+    db.pragma(`foreign_keys = ${previous === 0 ? "OFF" : "ON"}`);
+  }
 }
 
 export function databasePath(): string {
