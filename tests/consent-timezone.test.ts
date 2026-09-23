@@ -206,6 +206,7 @@ describe("consent gating", () => {
       "learner_progress",
       "learner_skill_state",
       "practice_sessions",
+      "qualifying_events",
       "sessions",
       "xp_events",
     ]);

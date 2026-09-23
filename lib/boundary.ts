@@ -1,9 +1,7 @@
-import { randomUUID } from "node:crypto";
 import type Database from "better-sqlite3";
 import { DomainError, getChild } from "@/lib/domain";
 import { catalogItem } from "@/lib/item-catalog";
 import {
-  bumpDifficulty,
   evidenceForSkill,
   readPracticeSession,
   readSkillClientView,
@@ -11,6 +9,12 @@ import {
   skillsShortOfGotIt,
   type PracticeSessionRow,
 } from "@/lib/learner-state";
+import {
+  mintLevelUpSlight,
+  observeStreak,
+  readChildTimeZone,
+  reviewSessionsRemaining,
+} from "@/lib/qualifying-bus";
 import {
   MasteryEstimator,
   practiceLaneOrRecommended,
@@ -79,6 +83,12 @@ function boundaryOptions(
     throw new DomainError("Learner state for this session is missing.", 500);
   }
   const remaining = skillsShortOfGotIt(db, childId);
+  const sessionsRemaining = reviewSessionsRemaining(
+    db,
+    childId,
+    readChildTimeZone(db, childId),
+    nowIso(),
+  );
   const options: BoundaryLaneOption[] = [
     {
       lane: "recommended",
@@ -98,8 +108,9 @@ function boundaryOptions(
       lane: "review",
       label: LANE_LABEL.review,
       isDefault: false,
-      available: true,
+      available: sessionsRemaining > 0,
       remaining: remaining.length,
+      sessionsRemaining,
     });
   }
   return {
@@ -111,6 +122,7 @@ function boundaryOptions(
     levelUpSlight: session.progression === "levelUpSlight",
     focusSkill: skill,
     clientView,
+    reviewSessionsRemaining: sessionsRemaining,
     options,
   };
 }
@@ -127,6 +139,7 @@ export function endPracticeSession(
 ): BoundaryOptions {
   assertPracticeAllowed(db, guardianId, childId);
   const commit = db.transaction(() => {
+    observeStreak(db, childId, readChildTimeZone(db, childId), nowIso());
     const session = requireSession(db, childId, sessionId);
     if (session.phase === "closed") {
       throw new DomainError("That session is already closed.", 409);
@@ -137,16 +150,13 @@ export function endPracticeSession(
     const evidence = evidenceForSkill(db, childId, skill);
     const progression = new MasteryEstimator().decideProgression(evidence);
     if (progression === "levelUpSlight") {
-      const existing = db
-        .prepare(`SELECT id FROM boundary_events WHERE session_id = ?`)
-        .get(session.id) as { id: string } | undefined;
-      if (!existing) {
-        db.prepare(
-          `INSERT INTO boundary_events (id, child_id, session_id, kind, created_at)
-           VALUES (?, ?, ?, 'level_up_slight', ?)`,
-        ).run(randomUUID(), childId, session.id, nowIso());
-        bumpDifficulty(db, childId);
-      }
+      mintLevelUpSlight(db, {
+        childId,
+        sessionId: session.id,
+        practiceLane: session.practice_lane,
+        createdAt: nowIso(),
+        timeZone: readChildTimeZone(db, childId),
+      });
     }
     db.prepare(
       `UPDATE practice_sessions SET phase = 'boundary', progression = ? WHERE id = ?`,
@@ -189,6 +199,13 @@ export function choosePracticeLane(
       throw new DomainError("That session is already closed.", 409);
     }
     const options = boundaryOptions(db, session, childId);
+    if (
+      lane === "review" &&
+      options.reviewSessionsRemaining <= 0 &&
+      options.options.some((option) => option.lane === "review")
+    ) {
+      throw new DomainError("Review sets for this week are used up.", 400);
+    }
     const choice = options.options.find((option) => option.lane === lane && option.available);
     if (!choice) {
       throw new DomainError("Review is for skills that are still left.", 400);

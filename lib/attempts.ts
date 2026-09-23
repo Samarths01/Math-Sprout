@@ -3,7 +3,6 @@ import type Database from "better-sqlite3";
 import {
   FOUR_BEAT_KEYS,
   integrityFlags,
-  resolveCelebration,
   type AttemptResult,
   type FourBeat,
   type IntegrityFlag,
@@ -29,7 +28,15 @@ import {
   saveSkillState,
   startIndexForLane,
 } from "@/lib/learner-state";
-import { MasteryEstimator, type PracticeLane } from "@/lib/mastery";
+import type { PracticeLane } from "@/lib/mastery";
+import {
+  commitAttemptEconomy,
+  observeStreak,
+  planAttemptEconomy,
+  readChildTimeZone,
+} from "@/lib/qualifying-bus";
+import { readAttemptLog } from "@/lib/attempt-log";
+import { POLICY_VERSION } from "@/lib/policy";
 import { practiceGate } from "@/lib/practice-gate";
 
 const KEY_PATTERN = /^[A-Za-z0-9_-]{8,80}$/;
@@ -200,18 +207,26 @@ function resultFromRow(
   row: AttemptRow,
   replayed: boolean,
 ): AttemptResult {
-  const events = db
+  const credits = db
     .prepare(
-      `SELECT id, amount FROM xp_events WHERE attempt_id = ? ORDER BY minted_at ASC, id ASC`,
+      `SELECT amount FROM xp_events WHERE attempt_id = ? ORDER BY minted_at ASC, id ASC`,
     )
-    .all(row.id) as Array<{ id: string; amount: number }>;
+    .all(row.id) as Array<{ amount: number }>;
+  const qualifying = db
+    .prepare(
+      `SELECT id FROM qualifying_events WHERE attempt_id = ? ORDER BY rowid ASC`,
+    )
+    .all(row.id) as Array<{ id: string }>;
   const session = db
     .prepare(`SELECT item_index FROM practice_sessions WHERE id = ?`)
     .get(row.session_id) as { item_index: number } | undefined;
   if (!session) throw new DomainError("Practice session not found.", 404);
   const beats = readBeats(row.beats_json);
-  if (row.celebration_tier === "full" && events.length === 0) {
+  if (row.celebration_tier === "full" && credits.length === 0) {
     throw new DomainError("full celebration requires a mint.", 500);
+  }
+  if (row.celebration_tier === "quietXp" && credits.length === 0) {
+    throw new DomainError("quietXp celebration requires a mint.", 500);
   }
   const clientView = readClientView(row.client_view_json, row.celebration_tier);
   const flags = JSON.parse(row.flags_json) as IntegrityFlag[];
@@ -224,8 +239,8 @@ function resultFromRow(
     celebrationTier: row.celebration_tier,
     lane: row.lane,
     flags,
-    eventIds: events.map((event) => event.id),
-    xpAmount: events.reduce((sum, event) => sum + event.amount, 0),
+    eventIds: qualifying.map((event) => event.id),
+    xpAmount: credits.reduce((sum, event) => sum + event.amount, 0),
     clientView,
     nextItem: itemAt(session.item_index),
   };
@@ -245,6 +260,7 @@ export function startPracticeSession(
     );
   }
   const open = db.transaction(() => {
+    observeStreak(db, childId, readChildTimeZone(db, childId), nowIso());
     const practicing = db
       .prepare(
         `SELECT id FROM practice_sessions
@@ -282,9 +298,10 @@ export function startPracticeSession(
     const sessionId = randomUUID();
     db.prepare(
       `INSERT INTO practice_sessions (
-         id, child_id, status, item_index, started_at, practice_lane, phase
-       ) VALUES (?, ?, 'active', ?, ?, ?, 'practicing')`,
-    ).run(sessionId, childId, itemIndex, nowIso(), progress.nextLane);
+         id, child_id, status, item_index, started_at, practice_lane, phase,
+         policy_version
+       ) VALUES (?, ?, 'active', ?, ?, ?, 'practicing', ?)`,
+    ).run(sessionId, childId, itemIndex, nowIso(), progress.nextLane, POLICY_VERSION);
     const created = readPracticeSession(db, childId, sessionId);
     if (!created) throw new DomainError("Practice session was not saved.", 500);
     return created;
@@ -297,6 +314,7 @@ export function submitAttempt(
   guardianId: string,
   childId: string,
   input: SubmitAttemptInput,
+  options?: { now?: string },
 ): AttemptResult {
   const idempotencyKey = input.idempotencyKey.trim();
   if (!KEY_PATTERN.test(idempotencyKey)) {
@@ -356,38 +374,37 @@ export function submitAttempt(
       priorInWindow: prior.count,
     });
     const correct = gradeAnswer(itemId, input.answer);
-    const celebration = resolveCelebration({ correct, flags });
-    if (celebration.lane === "review" && celebration.celebrationTier === "full") {
-      throw new Error("Review lane cannot mint full.");
-    }
-    if (celebration.celebrationTier === "full" && celebration.xpAmount <= 0) {
-      throw new Error("full celebration requires a mint.");
-    }
+    const economy = planAttemptEconomy(db, {
+      childId,
+      sessionId,
+      idempotencyKey,
+      timeZone: child.timezone,
+      submittedAt,
+      skill: item.skill,
+      correct,
+      flags,
+      practiceLane: session.practice_lane,
+      history: evidenceForSkill(db, childId, item.skill),
+      previousBand: readSkillClientView(db, childId, item.skill)?.bandLabel ?? null,
+    });
     const beats = buildFourBeat({
       correct,
       flags,
       item,
       canonicalAnswer: canonicalAnswer(itemId),
     });
-    const clientView = new MasteryEstimator().toClientView({
-      correct,
-      lane: celebration.lane,
-      celebrationTier: celebration.celebrationTier,
-      practiceLane: session.practice_lane,
-      history: evidenceForSkill(db, childId, item.skill),
-    });
-    saveSkillState(db, childId, item.skill, clientView);
+    saveSkillState(db, childId, item.skill, economy.clientView);
     const attemptId = randomUUID();
     const createdAt = nowIso();
     db.prepare(
       `INSERT INTO attempts (
          id, child_id, session_id, idempotency_key, item_id, answer, shown_at,
          submitted_at, correct, lane, celebration_tier, flags_json, beats_json,
-         client_view_json, created_at
+         client_view_json, created_at, policy_version
        ) VALUES (
          @id, @child_id, @session_id, @idempotency_key, @item_id, @answer, @shown_at,
          @submitted_at, @correct, @lane, @celebration_tier, @flags_json, @beats_json,
-         @client_view_json, @created_at
+         @client_view_json, @created_at, @policy_version
        )`,
     ).run({
       id: attemptId,
@@ -399,31 +416,36 @@ export function submitAttempt(
       shown_at: shownAt,
       submitted_at: submittedAt,
       correct: correct ? 1 : 0,
-      lane: celebration.lane,
-      celebration_tier: celebration.celebrationTier,
+      lane: economy.lane,
+      celebration_tier: economy.celebrationTier,
       flags_json: JSON.stringify(flags),
       beats_json: JSON.stringify(beats),
-      client_view_json: JSON.stringify(clientView),
+      client_view_json: JSON.stringify(economy.clientView),
       created_at: createdAt,
+      policy_version: POLICY_VERSION,
     });
-    if (celebration.xpAmount > 0) {
-      db.prepare(
-        `INSERT INTO xp_events (id, attempt_id, child_id, amount, celebration_tier, minted_at)
-         VALUES (?, ?, ?, ?, ?, ?)`,
-      ).run(
-        randomUUID(),
-        attemptId,
-        childId,
-        celebration.xpAmount,
-        celebration.celebrationTier,
-        createdAt,
-      );
-    }
+    commitAttemptEconomy(db, {
+      childId,
+      attemptId,
+      sessionId,
+      timeZone: child.timezone,
+      submittedAt,
+      observedAt: options?.now ?? createdAt,
+      createdAt,
+      practiceLane: session.practice_lane,
+      integrityLane: economy.lane,
+      celebrationTier: economy.celebrationTier,
+      mints: economy.mints,
+    });
     db.prepare(
       `UPDATE practice_sessions SET item_index = ? WHERE id = ?`,
     ).run((session.item_index + 1) % ITEM_CATALOG.length, session.id);
     const stored = findAttempt(db, childId, idempotencyKey);
     if (!stored) throw new DomainError("Attempt was not saved.", 500);
+    const log = readAttemptLog(db, stored.id);
+    if (log.policyVersion !== POLICY_VERSION) {
+      throw new DomainError("Attempt log is missing policy_version.", 500);
+    }
     return resultFromRow(db, stored, false);
   });
 

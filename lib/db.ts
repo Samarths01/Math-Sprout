@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import Database from "better-sqlite3";
+import { POLICY_VERSION } from "./policy";
 
 const MIGRATION = `
 CREATE TABLE IF NOT EXISTS guardians (
@@ -44,7 +45,8 @@ CREATE TABLE IF NOT EXISTS practice_sessions (
   started_at TEXT NOT NULL,
   practice_lane TEXT NOT NULL DEFAULT 'recommended' CHECK (practice_lane IN ('recommended', 'challenge', 'review')),
   phase TEXT NOT NULL DEFAULT 'practicing' CHECK (phase IN ('practicing', 'boundary', 'closed')),
-  progression TEXT CHECK (progression IN ('stay', 'remediate', 'levelUpSlight'))
+  progression TEXT CHECK (progression IN ('stay', 'remediate', 'levelUpSlight')),
+  policy_version TEXT NOT NULL DEFAULT '${POLICY_VERSION}'
 );
 
 CREATE TABLE IF NOT EXISTS learner_skill_state (
@@ -61,6 +63,9 @@ CREATE TABLE IF NOT EXISTS learner_progress (
   child_id TEXT PRIMARY KEY REFERENCES children(id) ON DELETE CASCADE,
   next_lane TEXT NOT NULL DEFAULT 'recommended' CHECK (next_lane IN ('recommended', 'challenge', 'review')),
   difficulty_step INTEGER NOT NULL DEFAULT 0 CHECK (difficulty_step >= 0),
+  streak_state TEXT NOT NULL DEFAULT 'dormant' CHECK (streak_state IN ('hot', 'warm', 'ember', 'dormant')),
+  ember_expires_at TEXT,
+  last_qualifying_day TEXT,
   updated_at TEXT NOT NULL
 );
 
@@ -88,6 +93,30 @@ CREATE TABLE IF NOT EXISTS attempts (
   beats_json TEXT NOT NULL,
   client_view_json TEXT NOT NULL,
   created_at TEXT NOT NULL,
+  policy_version TEXT NOT NULL DEFAULT '${POLICY_VERSION}',
+  UNIQUE (child_id, idempotency_key)
+);
+
+CREATE TABLE IF NOT EXISTS qualifying_events (
+  id TEXT PRIMARY KEY,
+  child_id TEXT NOT NULL REFERENCES children(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL CHECK (kind IN (
+    'HonestAttempt',
+    'ConceptProgressTick',
+    'MasteryBandTransition',
+    'LevelUpSlight',
+    'QualifyingPracticeDay',
+    'BadgeMilestone',
+    'BuildPieceUnlock'
+  )),
+  idempotency_key TEXT NOT NULL,
+  attempt_id TEXT REFERENCES attempts(id) ON DELETE CASCADE,
+  session_id TEXT REFERENCES practice_sessions(id) ON DELETE CASCADE,
+  skill TEXT,
+  local_day TEXT,
+  qualifies INTEGER NOT NULL DEFAULT 0 CHECK (qualifies IN (0, 1)),
+  payload_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
   UNIQUE (child_id, idempotency_key)
 );
 
@@ -97,11 +126,13 @@ CREATE TABLE IF NOT EXISTS xp_events (
   child_id TEXT NOT NULL REFERENCES children(id) ON DELETE CASCADE,
   amount INTEGER NOT NULL CHECK (amount IN (1, 5)),
   celebration_tier TEXT NOT NULL CHECK (celebration_tier IN ('quietXp', 'full')),
-  minted_at TEXT NOT NULL
+  minted_at TEXT NOT NULL,
+  qualifying_event_id TEXT NOT NULL REFERENCES qualifying_events(id) ON DELETE CASCADE
 );
 
 CREATE INDEX IF NOT EXISTS practice_sessions_child_id ON practice_sessions(child_id);
 CREATE INDEX IF NOT EXISTS attempts_child_submitted ON attempts(child_id, submitted_at);
+CREATE INDEX IF NOT EXISTS qualifying_events_child_day ON qualifying_events(child_id, kind, local_day);
 `;
 
 export function openDatabase(filename: string): Database.Database {
@@ -116,10 +147,11 @@ export function openDatabase(filename: string): Database.Database {
   db.exec(MIGRATION);
   migrateSproutTier(db);
   migrateLearnerProgression(db);
+  migrateEconomy(db);
   return db;
 }
 
-function tableColumns(db: Database.Database, table: "practice_sessions"): Set<string> {
+function tableColumns(db: Database.Database, table: string): Set<string> {
   const rows = db.pragma(`table_info(${table})`) as Array<{ name: string }>;
   return new Set(rows.map((row) => row.name));
 }
@@ -239,6 +271,84 @@ function migrateSproutTier(db: Database.Database): void {
   } finally {
     db.pragma(`foreign_keys = ${previous === 0 ? "OFF" : "ON"}`);
   }
+}
+
+/** Slice 4: QualifyingEvent bus, XP credits that point at it, and streak columns. */
+export function migrateEconomy(db: Database.Database): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS qualifying_events (
+      id TEXT PRIMARY KEY,
+      child_id TEXT NOT NULL REFERENCES children(id) ON DELETE CASCADE,
+      kind TEXT NOT NULL CHECK (kind IN (
+        'HonestAttempt',
+        'ConceptProgressTick',
+        'MasteryBandTransition',
+        'LevelUpSlight',
+        'QualifyingPracticeDay',
+        'BadgeMilestone',
+        'BuildPieceUnlock'
+      )),
+      idempotency_key TEXT NOT NULL,
+      attempt_id TEXT REFERENCES attempts(id) ON DELETE CASCADE,
+      session_id TEXT REFERENCES practice_sessions(id) ON DELETE CASCADE,
+      skill TEXT,
+      local_day TEXT,
+      qualifies INTEGER NOT NULL DEFAULT 0 CHECK (qualifies IN (0, 1)),
+      payload_json TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      UNIQUE (child_id, idempotency_key)
+    );
+    CREATE INDEX IF NOT EXISTS qualifying_events_child_day
+      ON qualifying_events(child_id, kind, local_day);
+  `);
+  const xp = tableColumns(db, "xp_events");
+  if (xp.size > 0 && !xp.has("qualifying_event_id")) {
+    db.exec(
+      `ALTER TABLE xp_events ADD COLUMN qualifying_event_id TEXT REFERENCES qualifying_events(id) ON DELETE CASCADE`,
+    );
+  }
+  const progress = tableColumns(db, "learner_progress");
+  if (progress.size > 0 && !progress.has("streak_state")) {
+    db.exec(
+      `ALTER TABLE learner_progress ADD COLUMN streak_state TEXT NOT NULL DEFAULT 'dormant' CHECK (streak_state IN ('hot', 'warm', 'ember', 'dormant'))`,
+    );
+  }
+  if (progress.size > 0 && !progress.has("ember_expires_at")) {
+    db.exec(`ALTER TABLE learner_progress ADD COLUMN ember_expires_at TEXT`);
+  }
+  if (progress.size > 0 && !progress.has("last_qualifying_day")) {
+    db.exec(`ALTER TABLE learner_progress ADD COLUMN last_qualifying_day TEXT`);
+  }
+  const sessions = tableColumns(db, "practice_sessions");
+  if (sessions.size > 0 && !sessions.has("policy_version")) {
+    db.exec(
+      `ALTER TABLE practice_sessions ADD COLUMN policy_version TEXT NOT NULL DEFAULT '${POLICY_VERSION}'`,
+    );
+  }
+  const attempts = tableColumns(db, "attempts");
+  if (attempts.size > 0 && !attempts.has("policy_version")) {
+    db.exec(
+      `ALTER TABLE attempts ADD COLUMN policy_version TEXT NOT NULL DEFAULT '${POLICY_VERSION}'`,
+    );
+  }
+  db.exec(`
+    CREATE TRIGGER IF NOT EXISTS xp_events_no_update
+    BEFORE UPDATE ON xp_events
+    BEGIN
+      SELECT RAISE(ABORT, 'xp credits are append-only');
+    END;
+    CREATE TRIGGER IF NOT EXISTS xp_events_require_bus
+    BEFORE INSERT ON xp_events
+    WHEN NEW.qualifying_event_id IS NULL OR length(NEW.qualifying_event_id) = 0
+    BEGIN
+      SELECT RAISE(ABORT, 'XP requires a qualifying event');
+    END;
+    CREATE TRIGGER IF NOT EXISTS qualifying_events_no_update
+    BEFORE UPDATE ON qualifying_events
+    BEGIN
+      SELECT RAISE(ABORT, 'qualifying events are append-only');
+    END;
+  `);
 }
 
 export function databasePath(): string {

@@ -462,8 +462,8 @@ describe("session boundary", () => {
         tryInput(review.sessionId, index),
       );
       bands.push(result.clientView.bandLabel);
-      expect(result.celebrationTier).toBe("full");
-      expect(result.xpAmount).toBe(XP_AMOUNT.full);
+      expect(result.celebrationTier).toBe("quietXp");
+      expect(result.xpAmount).toBe(XP_AMOUNT.quietXp);
     }
     expect(bands.every((band) => band !== "Got it")).toBe(true);
     expect(bands[2]).toBe("Getting it");

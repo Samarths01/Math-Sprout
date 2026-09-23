@@ -44,6 +44,7 @@ export type AttemptResult = FourBeat & {
   celebrationTier: CelebrationTier;
   lane: ReviewLane;
   flags: IntegrityFlag[];
+  /** QualifyingEvent ids for this attempt. XP credits point at these ids. */
   eventIds: string[];
   xpAmount: number;
   clientView: ClientView;
@@ -76,8 +77,9 @@ export function integrityFlags(input: {
 }
 
 /**
- * Quiet-mint stub. Review lane is quietXp or none. A clean correct try is full.
- * Slice 2 keeps this ledger only; it is not the BuildGoal economy.
+ * Integrity classification only. The QualifyingEvent bus is the only XP mint.
+ * This review lane is the integrity lane (empty, too-fast, spam): quietXp or none.
+ * A clean correct try is a full candidate; the bus may still reduce it.
  */
 export function resolveCelebration(input: {
   correct: boolean;
