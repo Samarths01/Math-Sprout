@@ -55,6 +55,8 @@ export type BoundaryLaneOption = {
   available: boolean;
   /** Skills still short of Got it. Present on the Review option. */
   remaining?: number;
+  /** Review sessions still allowed this local week. Present on the Review option. */
+  sessionsRemaining?: number;
 };
 
 /** Lane menu at SessionBoundary. SetBoundary is not part of this slice. */
@@ -67,6 +69,8 @@ export type BoundaryOptions = {
   levelUpSlight: boolean;
   focusSkill: string;
   clientView: ClientView;
+  /** Review sessions still allowed this local week. Enforced again at the mint gate. */
+  reviewSessionsRemaining: number;
   options: BoundaryLaneOption[];
 };
 

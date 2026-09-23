@@ -321,7 +321,10 @@ export function PracticeSession({
         </p>
       ) : null}
       {boundary ? (
-        <Card data-testid="boundary-options">
+        <Card
+          data-testid="boundary-options"
+          data-review-sessions-remaining={boundary.reviewSessionsRemaining}
+        >
           <CardHeader>
             <CardTitle className="font-heading text-2xl">Pick the next set</CardTitle>
             <CardDescription data-testid="boundary-progression">
@@ -347,6 +350,9 @@ export function PracticeSession({
                 {option.label}
                 {option.lane === "review" && option.remaining
                   ? ` · ${option.remaining} still going`
+                  : ""}
+                {option.lane === "review" && typeof option.sessionsRemaining === "number"
+                  ? ` · ${option.sessionsRemaining} left this week`
                   : ""}
                 {option.isDefault ? " · usual" : ""}
               </Button>

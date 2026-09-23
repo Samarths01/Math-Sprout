@@ -4,9 +4,11 @@ Math Sprout is a parent-managed math practice app for grades 2–4. A guardian a
 
 Practice attempts are idempotent, can be queued offline, and return `correct`, four beats, and a `ClientView` (`bandLabel`, `showConceptChip`, `celebrationTier` of `none`, `quietXp`, or `full`). There is no score and no confidence value.
 
-Slice 3 adds learner state and progression only. A rules `MasteryEstimator` maps attempt evidence to the soft-state bands. Got it and a slightly-harder step need Recommended or Challenge evidence in the recent window, so a Review lane cannot pretend a skill is finished. Lane choice (Recommended, Challenge, or Review with skills still going) happens at the end of a session. Recommended is the default. Chips are stored per skill and come back on the next session.
+Slice 3 adds learner state and progression. A rules `MasteryEstimator` maps attempt evidence to the soft-state bands. Got it and a slightly-harder step need Recommended or Challenge evidence in the recent window, so a Review lane cannot pretend a skill is finished. Lane choice (Recommended, Challenge, or Review with skills still going) happens at the end of a session. Recommended is the default. Chips are stored per skill and come back on the next session.
 
-The quiet-mint stub is unchanged. `xp_events` still writes a `quietXp` or `full` mint in the same transaction as the attempt (`full` is the earlier sprout amount). Slice 3 is not the economy: no QualifyingEvent bus, XP ledger gate, BuildGoal, badge, streak, parent narrative, shop, or tutor chat. Those stay Slice 4 and later. Nothing subtracts XP.
+Slice 4 replaces the quiet-mint stub. XP is an append-only credit on the QualifyingEvent bus, written in the same transaction as the attempt. `celebrationTier` is derived from those mints: `full` is not stored without a credit, and review stays `quietXp` or `none`. A review week is capped (`review_sessions_per_week`, stub 3). The boundary shows how many review sets are left, and the server drops the mint when the week is used up. Review never mints LevelUpSlight, a badge, or a build piece.
+
+A qualifying practice day is an honest Recommended or Challenge try on the child's local calendar day. That event is the only heat for the streak: Hot, then Warm, then Ember, then Dormant. The server stores `streak_state`, `ember_expires_at`, and `last_qualifying_day` using `child.timezone`. Badge screens, BuildGoal, and ember recovery chrome are Slice 5. Nothing subtracts XP.
 
 ## Run locally
 
@@ -38,7 +40,7 @@ npm start
 4. Open the child home. The Start practice button stays disabled until consent is granted. Missing, paused, and revoked consent do not start a session.
 5. With consent granted, start practice. Answer a problem from the operations or fractions pack. The response names what went well, one focus, what to try next, and a lock-in. It does not show a score or a confidence number.
 6. If the connection drops, the answer stays in a device queue and syncs with the same idempotency key when the connection returns. A replay returns the original attempt and the original event ids.
-7. End the session to pick the next lane. Recommended is the usual choice. Challenge is a step up. Review shows up when a skill is still short of Got it. A little harder is offered only after Recommended or Challenge evidence supports it.
+7. End the session to pick the next lane. Recommended is the usual choice. Challenge is a step up. Review shows up when a skill is still short of Got it, with how many review sets are left this week. A little harder is offered only after Recommended or Challenge evidence supports it. After the weekly review cap, that choice does not mint a sprout.
 
 ## Deferred
 
@@ -64,8 +66,8 @@ The same Next.js server is the API. All child and consent routes require the par
 | GET | `/api/parent/home` | Guardian plus children and consent. |
 | POST | `/api/children/:id/sessions` | Start or resume a practice session when consent is `granted`. Returns `{ sessionId, item, lane, atBoundary, clientView }`. `clientView` is the stored chip for that problem's skill, when one exists. |
 | POST | `/api/children/:id/attempts` | Submit one try. Body: `idempotencyKey`, `sessionId`, `itemId`, `answer`, `shownAt`, `submittedAt`. The same key returns the original attempt, four-beat copy, `clientView`, and `eventIds`. |
-| POST | `/api/children/:id/sessions/:sessionId/end` | Reach the session boundary after at least one try. Returns lane options. A second call does not fire LevelUpSlight again. |
-| GET | `/api/children/:id/sessions/:sessionId/boundary-options` | Lane menu. Only while the session is at that boundary. Recommended is the default. |
+| POST | `/api/children/:id/sessions/:sessionId/end` | Reach the session boundary after at least one try. Returns lane options, including `reviewSessionsRemaining`. A second call does not fire LevelUpSlight again. |
+| GET | `/api/children/:id/sessions/:sessionId/boundary-options` | Lane menu. Only while the session is at that boundary. Recommended is the default. Review shows skills still going and review sets left this week. |
 | POST | `/api/children/:id/sessions/:sessionId/lane` | Body: `{ "lane": "recommended" \| "challenge" \| "review" }`. Closes the session and stores the lane for the next one. |
 
 Passwords are hashed with scrypt. The session cookie is `HttpOnly` and `SameSite=Lax`. Set `COOKIE_SECURE=true` when the site is served over HTTPS.
@@ -116,3 +118,10 @@ Slice 3 adds:
 - a slightly-harder boundary event fires when that policy says so, once per session
 - lane options exist only at the session boundary, and Recommended is the default
 - skill chips are still there on the next session
+
+Slice 4 adds:
+
+- XP credits reference a QualifyingEvent; a replay does not mint a second credit
+- `celebrationTier` matches the mints in that transaction, and `full` without a credit fails closed
+- review sessions per week are capped at the mint, and review cannot mint LevelUpSlight, a badge, or a build piece
+- QualifyingPracticeDay heats the streak from the child timezone: Hot, Warm, Ember, Dormant

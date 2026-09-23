@@ -3,7 +3,6 @@ import type Database from "better-sqlite3";
 import {
   FOUR_BEAT_KEYS,
   integrityFlags,
-  resolveCelebration,
   type AttemptResult,
   type FourBeat,
   type IntegrityFlag,
@@ -29,7 +28,13 @@ import {
   saveSkillState,
   startIndexForLane,
 } from "@/lib/learner-state";
-import { MasteryEstimator, type PracticeLane } from "@/lib/mastery";
+import type { PracticeLane } from "@/lib/mastery";
+import {
+  commitAttemptEconomy,
+  observeStreak,
+  planAttemptEconomy,
+  readChildTimeZone,
+} from "@/lib/qualifying-bus";
 import { practiceGate } from "@/lib/practice-gate";
 
 const KEY_PATTERN = /^[A-Za-z0-9_-]{8,80}$/;
@@ -213,6 +218,9 @@ function resultFromRow(
   if (row.celebration_tier === "full" && events.length === 0) {
     throw new DomainError("full celebration requires a mint.", 500);
   }
+  if (row.celebration_tier === "quietXp" && events.length === 0) {
+    throw new DomainError("quietXp celebration requires a mint.", 500);
+  }
   const clientView = readClientView(row.client_view_json, row.celebration_tier);
   const flags = JSON.parse(row.flags_json) as IntegrityFlag[];
   return {
@@ -245,6 +253,7 @@ export function startPracticeSession(
     );
   }
   const open = db.transaction(() => {
+    observeStreak(db, childId, readChildTimeZone(db, childId), nowIso());
     const practicing = db
       .prepare(
         `SELECT id FROM practice_sessions
@@ -297,6 +306,7 @@ export function submitAttempt(
   guardianId: string,
   childId: string,
   input: SubmitAttemptInput,
+  options?: { now?: string },
 ): AttemptResult {
   const idempotencyKey = input.idempotencyKey.trim();
   if (!KEY_PATTERN.test(idempotencyKey)) {
@@ -356,27 +366,26 @@ export function submitAttempt(
       priorInWindow: prior.count,
     });
     const correct = gradeAnswer(itemId, input.answer);
-    const celebration = resolveCelebration({ correct, flags });
-    if (celebration.lane === "review" && celebration.celebrationTier === "full") {
-      throw new Error("Review lane cannot mint full.");
-    }
-    if (celebration.celebrationTier === "full" && celebration.xpAmount <= 0) {
-      throw new Error("full celebration requires a mint.");
-    }
+    const economy = planAttemptEconomy(db, {
+      childId,
+      sessionId,
+      idempotencyKey,
+      timeZone: child.timezone,
+      submittedAt,
+      skill: item.skill,
+      correct,
+      flags,
+      practiceLane: session.practice_lane,
+      history: evidenceForSkill(db, childId, item.skill),
+      previousBand: readSkillClientView(db, childId, item.skill)?.bandLabel ?? null,
+    });
     const beats = buildFourBeat({
       correct,
       flags,
       item,
       canonicalAnswer: canonicalAnswer(itemId),
     });
-    const clientView = new MasteryEstimator().toClientView({
-      correct,
-      lane: celebration.lane,
-      celebrationTier: celebration.celebrationTier,
-      practiceLane: session.practice_lane,
-      history: evidenceForSkill(db, childId, item.skill),
-    });
-    saveSkillState(db, childId, item.skill, clientView);
+    saveSkillState(db, childId, item.skill, economy.clientView);
     const attemptId = randomUUID();
     const createdAt = nowIso();
     db.prepare(
@@ -399,26 +408,26 @@ export function submitAttempt(
       shown_at: shownAt,
       submitted_at: submittedAt,
       correct: correct ? 1 : 0,
-      lane: celebration.lane,
-      celebration_tier: celebration.celebrationTier,
+      lane: economy.lane,
+      celebration_tier: economy.celebrationTier,
       flags_json: JSON.stringify(flags),
       beats_json: JSON.stringify(beats),
-      client_view_json: JSON.stringify(clientView),
+      client_view_json: JSON.stringify(economy.clientView),
       created_at: createdAt,
     });
-    if (celebration.xpAmount > 0) {
-      db.prepare(
-        `INSERT INTO xp_events (id, attempt_id, child_id, amount, celebration_tier, minted_at)
-         VALUES (?, ?, ?, ?, ?, ?)`,
-      ).run(
-        randomUUID(),
-        attemptId,
-        childId,
-        celebration.xpAmount,
-        celebration.celebrationTier,
-        createdAt,
-      );
-    }
+    commitAttemptEconomy(db, {
+      childId,
+      attemptId,
+      sessionId,
+      timeZone: child.timezone,
+      submittedAt,
+      observedAt: options?.now ?? createdAt,
+      createdAt,
+      practiceLane: session.practice_lane,
+      integrityLane: economy.lane,
+      celebrationTier: economy.celebrationTier,
+      mints: economy.mints,
+    });
     db.prepare(
       `UPDATE practice_sessions SET item_index = ? WHERE id = ?`,
     ).run((session.item_index + 1) % ITEM_CATALOG.length, session.id);
