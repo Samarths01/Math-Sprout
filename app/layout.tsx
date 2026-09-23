@@ -19,7 +19,7 @@ export const metadata: Metadata = {
     template: "%s · Math Sprout",
   },
   description:
-    "Parent accounts, child profiles, and consent for grades 2–4 math practice.",
+    "Parent accounts, consent, and grades 2–4 math practice.",
 };
 
 export default function RootLayout({
