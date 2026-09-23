@@ -16,6 +16,7 @@ import { getDb } from "@/lib/db";
 import { getParentHome } from "@/lib/domain";
 import { currentGuardian } from "@/lib/http";
 import { interfaceCopy } from "@/lib/interface-copy";
+import { readOfflineCap } from "@/lib/offline-cap";
 import { readPauseHold } from "@/lib/pause-hold";
 import { formatTimeZone } from "@/lib/timezones";
 import { cn } from "@/lib/utils";
@@ -41,6 +42,27 @@ function PauseHoldNotice({
     >
       {hold.waiting > 0 ? `${hold.waiting} waiting. ` : ""}
       {interfaceCopy(hold.copyKey)} {interfaceCopy(hold.detailKey)}
+    </p>
+  );
+}
+
+function OfflineCapNotice({
+  guardianId,
+  childId,
+}: {
+  guardianId: string;
+  childId: string;
+}) {
+  const cap = readOfflineCap(getDb(), guardianId, childId);
+  if (!cap) return null;
+  return (
+    <p
+      data-testid="offline-cap-hold"
+      data-visible="true"
+      data-waiting={cap.waiting}
+      className="text-sm leading-6"
+    >
+      {interfaceCopy(cap.copyKey)} {interfaceCopy(cap.detailKey)}
     </p>
   );
 }
@@ -106,6 +128,7 @@ export default async function ParentHomePage() {
                         : child.reason}
                     </p>
                     <PauseHoldNotice guardianId={guardian.id} childId={child.id} />
+                    <OfflineCapNotice guardianId={guardian.id} childId={child.id} />
                     <ConsentControls
                       childId={child.id}
                       status={child.consentStatus}

@@ -36,7 +36,9 @@ import {
   type SyncPost,
 } from "@/lib/offline-queue";
 import { readPauseHold, registerPauseHold, showResumeCelebration } from "@/lib/pause-hold";
+import { readOfflineCap, registerOfflineCap } from "@/lib/offline-cap";
 import { queueDisposition } from "@/lib/practice-gate";
+import { interfaceCopy } from "@/lib/interface-copy";
 
 const cleanups: Array<() => void> = [];
 const T0 = Date.parse("2026-01-01T00:00:00.000Z");
@@ -748,6 +750,59 @@ describe("offline queue reconcile", () => {
     expect(again.pending).toHaveLength(OFFLINE_QUEUE_CAP);
   });
 
+  it("shows a full offline cap as a sync limit a parent can see", () => {
+    const db = tempDb();
+    const { guardian, child } = grantedChild(db);
+    expect(readOfflineCap(db, guardian.id, child.id)).toBeNull();
+
+    const view = registerOfflineCap(db, guardian.id, child.id, OFFLINE_QUEUE_CAP);
+    expect(view).toEqual({
+      visible: true,
+      waiting: OFFLINE_QUEUE_CAP,
+      copyKey: "offline.cap.waiting",
+      detailKey: "offline.cap.detail",
+    });
+    if (!("copyKey" in view)) throw new Error("expected a visible cap");
+    const lines = [
+      interfaceCopy(view.copyKey),
+      interfaceCopy(view.detailKey),
+      interfaceCopy("offline.cap.kid"),
+    ];
+    for (const line of lines) {
+      expect(line.toLowerCase()).not.toContain("paused");
+      expect(line.toLowerCase()).not.toContain("revoked");
+    }
+    const stored = db
+      .prepare(`SELECT offline_cap_json FROM consents WHERE child_id = ?`)
+      .get(child.id) as { offline_cap_json: string };
+    expect(JSON.parse(stored.offline_cap_json)).toEqual({ waiting: OFFLINE_QUEUE_CAP });
+    expect(stored.offline_cap_json).not.toContain("answer");
+
+    setConsent(db, guardian.id, child.id, "pause");
+    expect(readOfflineCap(db, guardian.id, child.id)).toBeNull();
+    expect(() => registerOfflineCap(db, guardian.id, child.id, OFFLINE_QUEUE_CAP)).toThrow(
+      DomainError,
+    );
+
+    setConsent(db, guardian.id, child.id, "grant");
+    expect(readOfflineCap(db, guardian.id, child.id)?.waiting).toBe(OFFLINE_QUEUE_CAP);
+    expect(registerOfflineCap(db, guardian.id, child.id, 0)).toEqual({
+      visible: false,
+      waiting: 0,
+    });
+    const cleared = db
+      .prepare(`SELECT offline_cap_json FROM consents WHERE child_id = ?`)
+      .get(child.id) as { offline_cap_json: string | null };
+    expect(cleared.offline_cap_json).toBeNull();
+
+    registerOfflineCap(db, guardian.id, child.id, 9);
+    setConsent(db, guardian.id, child.id, "revoke");
+    const revoked = db
+      .prepare(`SELECT offline_cap_json FROM consents WHERE child_id = ?`)
+      .get(child.id) as { offline_cap_json: string | null };
+    expect(revoked.offline_cap_json).toBeNull();
+  });
+
   it("does not promote a band while the attempt is only queued", async () => {
     const db = tempDb();
     const { guardian, child, session } = grantedChild(db);
@@ -761,6 +816,7 @@ describe("offline queue reconcile", () => {
     expect(offline.pending).toHaveLength(1);
     expect(count(db, "attempts")).toBe(0);
     expect(count(db, "xp_events")).toBe(0);
+    expect(count(db, "qualifying_events")).toBe(0);
     const bands = db.prepare(`SELECT COUNT(*) AS count FROM learner_skill_state`).get() as {
       count: number;
     };
@@ -773,6 +829,8 @@ describe("offline queue reconcile", () => {
     expect(synced.pending).toEqual([]);
     expect(synced.synced[0]?.clientView.bandLabel).toBe("Getting it");
     expect(synced.synced[0]?.celebrationTier).toBe(synced.synced[0]?.clientView.celebrationTier);
+    expect(synced.synced[0]?.oneFocus).toBe(oneFocusForItem(attempt.itemId));
+    expect(displayedOneFocus(synced.synced[0]!)).toBe(synced.synced[0]?.oneFocus);
     const stored = db
       .prepare(`SELECT band_label FROM learner_skill_state WHERE child_id = ?`)
       .get(child.id) as { band_label: string };

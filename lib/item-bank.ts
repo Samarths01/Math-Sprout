@@ -52,7 +52,10 @@ export function gradeAnswer(itemId: string, answer: string): boolean {
   return accepted.some((candidate) => normalizeAnswer(candidate) === normalized);
 }
 
-/** Server-assembled from the item's misconception tag. Not a free-form praise line. */
+/**
+ * Server cue from the item's misconception tag.
+ * Production does not ask a model to write this line. Practice renders it as sent.
+ */
 export function oneFocusForItem(itemId: string): string {
   const tag = ITEM_TAGS[itemId];
   if (!tag) throw new Error(`Item ${itemId} is missing a misconception tag.`);

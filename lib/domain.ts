@@ -387,7 +387,9 @@ export function setConsent(
        updated_by = excluded.updated_by`,
   ).run(childId, status, updatedAt, guardianId);
   if (action === "revoke") {
-    db.prepare(`UPDATE consents SET hold_json = NULL WHERE child_id = ?`).run(childId);
+    db.prepare(
+      `UPDATE consents SET hold_json = NULL, offline_cap_json = NULL WHERE child_id = ?`,
+    ).run(childId);
   }
   const gate = practiceGate(status);
   return {

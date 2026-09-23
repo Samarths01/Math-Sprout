@@ -9,7 +9,7 @@ export type FourBeatKey = (typeof FOUR_BEAT_KEYS)[number];
 
 export type FourBeat = Record<FourBeatKey, string>;
 
-/** Practice renders this server string as sent. Do not substitute local praise. */
+/** Practice renders this server string as sent. No local rewrite and no model line. */
 export function displayedOneFocus(beat: Pick<FourBeat, "oneFocus">): string {
   return beat.oneFocus;
 }

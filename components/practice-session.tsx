@@ -161,7 +161,20 @@ export function PracticeSession({
       }
     }
     if (snapshot.lastError) setError(snapshot.lastError);
+    await publishOfflineCap(snapshot.pending.length);
     return snapshot;
+  }
+
+  async function publishOfflineCap(waiting: number): Promise<void> {
+    try {
+      await fetch(`/api/children/${childId}/offline-cap`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ waiting }),
+      });
+    } catch {
+      // The try stays on this focus. A later flush retries the parent receipt.
+    }
   }
 
   useEffect(() => {
@@ -295,6 +308,7 @@ export function PracticeSession({
     setError(null);
     if (queue().snapshot().pending.length >= OFFLINE_QUEUE_CAP) {
       setPending(OFFLINE_QUEUE_CAP);
+      await publishOfflineCap(OFFLINE_QUEUE_CAP);
       setBusy(false);
       return;
     }
@@ -354,6 +368,17 @@ export function PracticeSession({
               {interfaceCopy("pause.resume.quiet")}
             </p>
           ) : null}
+          {pending >= OFFLINE_QUEUE_CAP ? (
+            <p
+              data-testid="offline-queue-cap"
+              data-cap={OFFLINE_QUEUE_CAP}
+              data-pattern="calm-wait"
+              role="status"
+              className="text-sm leading-6"
+            >
+              {interfaceCopy("offline.cap.kid")}
+            </p>
+          ) : null}
         </CardContent>
       </Card>
     );
@@ -391,6 +416,17 @@ export function PracticeSession({
       {heldNotice && !quietResume ? (
         <p data-testid="pause-hold-kid" role="status" className="text-sm leading-6">
           {interfaceCopy("pause.hold.kid")}
+        </p>
+      ) : null}
+      {offlineCapped ? (
+        <p
+          data-testid="offline-queue-cap"
+          data-cap={OFFLINE_QUEUE_CAP}
+          data-pattern="calm-wait"
+          role="status"
+          className="text-sm leading-6"
+        >
+          {interfaceCopy("offline.cap.kid")}
         </p>
       ) : null}
       {persistedView && !boundary && !feedback ? (
@@ -493,24 +529,21 @@ export function PracticeSession({
                   </p>
                 ) : null}
               </div>
-              <Button
-                type="button"
-                className="h-12 text-base"
-                onClick={() => showNext(nextFromFeedback ?? localNext)}
-              >
-                Next problem
-              </Button>
+              {offlineCapped ? null : (
+                <Button
+                  type="button"
+                  className="h-12 text-base"
+                  onClick={() => showNext(nextFromFeedback ?? localNext)}
+                >
+                  Next problem
+                </Button>
+              )}
             </div>
           ) : (
             <form className="grid gap-3" onSubmit={onSubmit}>
-              {savedOffline ? (
+              {savedOffline && !offlineCapped ? (
                 <p role="status" className="text-sm leading-6">
                   Saved on this device. It will check in when you reconnect.
-                </p>
-              ) : null}
-              {offlineCapped ? (
-                <p data-testid="offline-queue-cap" data-cap={OFFLINE_QUEUE_CAP} role="status" className="text-sm leading-6">
-                  {interfaceCopy("offline.cap")}
                 </p>
               ) : null}
               <div className="grid gap-2">

@@ -151,6 +151,7 @@ export function openDatabase(filename: string): Database.Database {
   migrateLearnerProgression(db);
   migrateEconomy(db);
   migratePauseHold(db);
+  migrateOfflineCap(db);
   return db;
 }
 
@@ -365,6 +366,14 @@ function migratePauseHold(db: Database.Database): void {
     db.exec(
       `ALTER TABLE attempts ADD COLUMN resume_presentation TEXT NOT NULL DEFAULT 'live' CHECK (resume_presentation IN ('live', 'quiet'))`,
     );
+  }
+}
+
+/** Parent-visible offline cap. A sync limit, not a consent change. */
+function migrateOfflineCap(db: Database.Database): void {
+  const consents = tableColumns(db, "consents");
+  if (consents.size > 0 && !consents.has("offline_cap_json")) {
+    db.exec(`ALTER TABLE consents ADD COLUMN offline_cap_json TEXT`);
   }
 }
 
