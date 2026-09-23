@@ -35,6 +35,45 @@ CREATE TABLE IF NOT EXISTS consents (
 
 CREATE INDEX IF NOT EXISTS children_guardian_id ON children(guardian_id);
 CREATE INDEX IF NOT EXISTS sessions_guardian_id ON sessions(guardian_id);
+
+CREATE TABLE IF NOT EXISTS practice_sessions (
+  id TEXT PRIMARY KEY,
+  child_id TEXT NOT NULL REFERENCES children(id) ON DELETE CASCADE,
+  status TEXT NOT NULL CHECK (status IN ('active')),
+  item_index INTEGER NOT NULL CHECK (item_index >= 0),
+  started_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS attempts (
+  id TEXT PRIMARY KEY,
+  child_id TEXT NOT NULL REFERENCES children(id) ON DELETE CASCADE,
+  session_id TEXT NOT NULL REFERENCES practice_sessions(id) ON DELETE CASCADE,
+  idempotency_key TEXT NOT NULL,
+  item_id TEXT NOT NULL,
+  answer TEXT NOT NULL,
+  shown_at TEXT NOT NULL,
+  submitted_at TEXT NOT NULL,
+  correct INTEGER NOT NULL CHECK (correct IN (0, 1)),
+  lane TEXT NOT NULL CHECK (lane IN ('celebrate', 'review')),
+  celebration_tier TEXT NOT NULL CHECK (celebration_tier IN ('sprout', 'quietXp', 'none')),
+  flags_json TEXT NOT NULL,
+  beats_json TEXT NOT NULL,
+  client_view_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  UNIQUE (child_id, idempotency_key)
+);
+
+CREATE TABLE IF NOT EXISTS xp_events (
+  id TEXT PRIMARY KEY,
+  attempt_id TEXT NOT NULL UNIQUE REFERENCES attempts(id) ON DELETE CASCADE,
+  child_id TEXT NOT NULL REFERENCES children(id) ON DELETE CASCADE,
+  amount INTEGER NOT NULL CHECK (amount IN (1, 5)),
+  celebration_tier TEXT NOT NULL CHECK (celebration_tier IN ('sprout', 'quietXp')),
+  minted_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS practice_sessions_child_id ON practice_sessions(child_id);
+CREATE INDEX IF NOT EXISTS attempts_child_submitted ON attempts(child_id, submitted_at);
 `;
 
 export function openDatabase(filename: string): Database.Database {

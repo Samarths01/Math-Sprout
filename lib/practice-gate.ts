@@ -35,11 +35,11 @@ export function practiceGate(status: ConsentViewStatus): {
 
 /**
  * Click outcome for the practice control.
- * Neither result starts a practice session. Sessions are out of scope for this slice.
+ * Granted consent can start a practice session. Every other status stays blocked.
  */
 export function practiceClickOutcome(
   practiceAllowed: boolean,
-): "blocked" | "no-session" {
+): "blocked" | "start-session" {
   if (!practiceAllowed) return "blocked";
-  return "no-session";
+  return "start-session";
 }

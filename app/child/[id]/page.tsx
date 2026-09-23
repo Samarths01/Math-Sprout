@@ -56,12 +56,13 @@ export default async function ChildHomePage({
           <CardHeader>
             <CardTitle className="font-heading text-2xl">Practice</CardTitle>
             <CardDescription>
-              Only a parent can allow practice. This button never starts a
-              session while consent is missing, paused, or revoked.
+              Only a parent can allow practice. Missing, paused, or revoked
+              consent does not start a session.
             </CardDescription>
           </CardHeader>
           <CardContent>
             <PracticeCta
+              childId={home.child.id}
               practiceAllowed={home.practiceAllowed}
               reason={home.reason}
             />

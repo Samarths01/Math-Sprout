@@ -78,7 +78,7 @@ export default async function ParentHomePage() {
                   <CardContent className="grid gap-4">
                     <p className="text-sm leading-6">
                       {child.practiceAllowed
-                        ? "Practice is allowed. Lessons are not in this version, so opening the child home still does not start a session."
+                        ? "Practice is allowed. The child home can start a session."
                         : child.reason}
                     </p>
                     <ConsentControls

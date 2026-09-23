@@ -1,48 +1,50 @@
 "use client";
 
-import { useState } from "react";
+import Link from "next/link";
 import { practiceClickOutcome } from "@/lib/practice-gate";
-import { Button } from "@/components/ui/button";
+import { buttonVariants } from "@/components/ui/button";
+import { cn } from "@/lib/utils";
 
 export function PracticeCta({
+  childId,
   practiceAllowed,
   reason,
 }: {
+  childId: string;
   practiceAllowed: boolean;
   reason?: string;
 }) {
-  const [note, setNote] = useState<string | null>(null);
+  const outcome = practiceClickOutcome(practiceAllowed);
 
   return (
     <div className="grid gap-3">
-      <Button
-        type="button"
-        data-testid="practice-cta"
-        data-practice-allowed={practiceAllowed ? "true" : "false"}
-        disabled={!practiceAllowed}
-        aria-disabled={!practiceAllowed}
-        aria-describedby="practice-gate-copy"
-        className="h-14 w-full text-base"
-        onClick={() => {
-          const outcome = practiceClickOutcome(practiceAllowed);
-          if (outcome === "blocked") return;
-          setNote(
-            "Practice is allowed, and no session was started. Lessons are not part of this version.",
-          );
-        }}
-      >
-        Start practice
-      </Button>
+      {outcome === "start-session" ? (
+        <Link
+          href={`/child/${childId}/practice`}
+          data-testid="practice-cta"
+          data-practice-allowed="true"
+          className={cn(buttonVariants(), "h-14 w-full text-base")}
+        >
+          Start practice
+        </Link>
+      ) : (
+        <button
+          type="button"
+          data-testid="practice-cta"
+          data-practice-allowed="false"
+          disabled
+          aria-disabled="true"
+          aria-describedby="practice-gate-copy"
+          className={cn(buttonVariants(), "h-14 w-full text-base")}
+        >
+          Start practice
+        </button>
+      )}
       <p id="practice-gate-copy" className="text-sm leading-6 text-muted-foreground">
-        {practiceAllowed
-          ? "A parent has granted consent. This version still does not open a practice session."
+        {outcome === "start-session"
+          ? "A parent has granted consent. Start practice when you are ready."
           : reason}
       </p>
-      {note ? (
-        <p role="status" className="text-sm text-foreground">
-          {note}
-        </p>
-      ) : null}
     </div>
   );
 }

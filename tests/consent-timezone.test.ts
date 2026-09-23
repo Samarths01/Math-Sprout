@@ -152,7 +152,7 @@ describe("consent gating", () => {
     expect(allowed.practiceAllowed).toBe(true);
     expect(allowed.reason).toBeUndefined();
     expect(allowed.child.timezone).toBe("America/Los_Angeles");
-    expect(practiceClickOutcome(allowed.practiceAllowed)).toBe("no-session");
+    expect(practiceClickOutcome(allowed.practiceAllowed)).toBe("start-session");
 
     const paused = setConsent(db, guardian.id, child.id, "pause");
     expect(paused.practiceAllowed).toBe(false);
@@ -190,7 +190,7 @@ describe("consent gating", () => {
     expect(practiceGate("granted")).toEqual({ practiceAllowed: true });
   });
 
-  it("does not create economy tables", () => {
+  it("keeps the ledger to attempt mints and the consent shell", () => {
     const db = tempDb();
     const tables = db
       .prepare(
@@ -198,10 +198,13 @@ describe("consent gating", () => {
       )
       .all() as Array<{ name: string }>;
     expect(tables.map((table) => table.name).sort()).toEqual([
+      "attempts",
       "children",
       "consents",
       "guardians",
+      "practice_sessions",
       "sessions",
+      "xp_events",
     ]);
   });
 });

@@ -53,7 +53,7 @@ export type ParentHome = {
 };
 
 export const PARENT_HOME_NARRATIVE =
-  "Nothing has been practiced yet. This home shows who is set up and whether consent is granted. Math Sprout does not track points, streaks, or progress in this version.";
+  "This home shows who is set up and whether consent is granted. Practice rewards stay on each attempt. This home does not show a score, a streak, or a progress story.";
 
 type GuardianRow = {
   id: string;

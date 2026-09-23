@@ -1,0 +1,317 @@
+"use client";
+
+import { useEffect, useRef, useState, type FormEvent } from "react";
+import Link from "next/link";
+import type { AttemptResult, PublicItem } from "@/lib/attempt-contract";
+import { FOUR_BEAT_KEYS } from "@/lib/attempt-contract";
+import { itemAt, ITEM_CATALOG } from "@/lib/item-catalog";
+import {
+  createAttemptQueue,
+  storageQueueStore,
+  type QueuedAttempt,
+  type SyncPost,
+} from "@/lib/offline-queue";
+import { Button } from "@/components/ui/button";
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+
+const BEAT_LABELS: Record<(typeof FOUR_BEAT_KEYS)[number], string> = {
+  whatWentWell: "What went well",
+  oneFocus: "One focus",
+  tryNext: "Try next",
+  lockIn: "Lock in",
+};
+
+function tierLine(tier: AttemptResult["celebrationTier"]): string {
+  if (tier === "sprout") return "A sprout for that try.";
+  if (tier === "quietXp") return "A quiet sprout. This one stays small.";
+  return "No sprout this time.";
+}
+
+async function postAttempt(childId: string, attempt: QueuedAttempt): Promise<SyncPost> {
+  if (typeof navigator !== "undefined" && navigator.onLine === false) {
+    return { ok: false, reason: "offline" };
+  }
+  try {
+    const response = await fetch(`/api/children/${childId}/attempts`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(attempt),
+    });
+    const body = (await response.json().catch(() => null)) as
+      | (AttemptResult & { error?: string })
+      | null;
+    if (response.status === 403) {
+      return {
+        ok: false,
+        reason: "blocked",
+        message: body?.error ?? "Practice is blocked.",
+      };
+    }
+    if (!response.ok || !body || typeof body.attemptId !== "string") {
+      return {
+        ok: false,
+        reason: "error",
+        message: body?.error ?? "Could not save that try.",
+      };
+    }
+    return { ok: true, result: body };
+  } catch {
+    return { ok: false, reason: "offline" };
+  }
+}
+
+export function PracticeSession({
+  childId,
+  displayName,
+}: {
+  childId: string;
+  displayName: string;
+}) {
+  const queueRef = useRef<ReturnType<typeof createAttemptQueue> | null>(null);
+  const waitingKey = useRef<string | null>(null);
+  const [sessionId, setSessionId] = useState<string | null>(null);
+  const [item, setItem] = useState<PublicItem | null>(null);
+  const [shownAt, setShownAt] = useState<string | null>(null);
+  const [answer, setAnswer] = useState("");
+  const [feedback, setFeedback] = useState<AttemptResult | null>(null);
+  const [savedOffline, setSavedOffline] = useState(false);
+  const [pending, setPending] = useState(0);
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [ready, setReady] = useState(false);
+
+  function queue() {
+    if (!queueRef.current) {
+      queueRef.current = createAttemptQueue(
+        storageQueueStore(window.localStorage, `math-sprout-attempt-queue:${childId}`),
+      );
+    }
+    return queueRef.current;
+  }
+
+  async function flush() {
+    const snapshot = await queue().reconcile((attempt) => postAttempt(childId, attempt));
+    setPending(snapshot.pending.length);
+    if (waitingKey.current) {
+      const synced = snapshot.synced.find(
+        (result) => result.idempotencyKey === waitingKey.current,
+      );
+      if (synced) {
+        setFeedback(synced);
+        setSavedOffline(false);
+        waitingKey.current = null;
+      }
+    }
+    if (snapshot.lastError) setError(snapshot.lastError);
+    return snapshot;
+  }
+
+  useEffect(() => {
+    let cancelled = false;
+    async function start() {
+      try {
+        const response = await fetch(`/api/children/${childId}/sessions`, {
+          method: "POST",
+        });
+        const body = (await response.json().catch(() => null)) as {
+          sessionId?: string;
+          item?: PublicItem;
+          error?: string;
+        } | null;
+        if (!response.ok || !body?.sessionId || !body.item) {
+          if (!cancelled) setError(body?.error ?? "Practice could not start.");
+          return;
+        }
+        if (cancelled) return;
+        setSessionId(body.sessionId);
+        setItem(body.item);
+        setShownAt(new Date().toISOString());
+        setReady(true);
+        const snapshot = queue().snapshot();
+        setPending(snapshot.pending.length);
+        if (snapshot.pending.length > 0) await flush();
+      } catch {
+        if (!cancelled) setError("Practice could not start.");
+      }
+    }
+    void start();
+    const onOnline = () => {
+      void flush();
+    };
+    window.addEventListener("online", onOnline);
+    return () => {
+      cancelled = true;
+      window.removeEventListener("online", onOnline);
+    };
+    // flush closes over the latest waiting key via a ref.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [childId]);
+
+  function showNext(next: PublicItem) {
+    waitingKey.current = null;
+    setItem(next);
+    setShownAt(new Date().toISOString());
+    setAnswer("");
+    setFeedback(null);
+    setSavedOffline(false);
+    setError(null);
+  }
+
+  async function onSubmit(event: FormEvent) {
+    event.preventDefault();
+    if (!sessionId || !item || !shownAt || busy) return;
+    setBusy(true);
+    setError(null);
+    const idempotencyKey = crypto.randomUUID();
+    const queued: QueuedAttempt = {
+      idempotencyKey,
+      childId,
+      sessionId,
+      itemId: item.id,
+      answer,
+      shownAt,
+      submittedAt: new Date().toISOString(),
+    };
+    waitingKey.current = idempotencyKey;
+    queue().enqueue(queued);
+    const snapshot = await flush();
+    const synced = snapshot.synced.find((result) => result.idempotencyKey === idempotencyKey);
+    if (synced) {
+      setFeedback(synced);
+      setSavedOffline(false);
+    } else if (snapshot.pending.some((entry) => entry.idempotencyKey === idempotencyKey)) {
+      setSavedOffline(true);
+      setFeedback(null);
+    }
+    setBusy(false);
+  }
+
+  if (error && !ready) {
+    return (
+      <Card>
+        <CardHeader>
+          <CardTitle className="font-heading text-2xl">Practice is closed</CardTitle>
+        </CardHeader>
+        <CardContent>
+          <p className="text-sm leading-6">{error}</p>
+        </CardContent>
+      </Card>
+    );
+  }
+
+  if (!item) {
+    return <p className="text-sm text-muted-foreground">Getting a problem ready…</p>;
+  }
+
+  const nextFromFeedback = feedback?.nextItem;
+  const localNext = itemAt(ITEM_CATALOG.findIndex((entry) => entry.id === item.id) + 1);
+
+  return (
+    <div className="grid gap-4">
+      <div className="grid gap-1">
+        <p className="text-sm text-muted-foreground">Hi, {displayName}</p>
+        <h1 className="font-heading text-4xl tracking-tight">Practice</h1>
+      </div>
+      <p data-testid="sync-status" className="text-sm text-muted-foreground">
+        {pending > 0
+          ? `${pending} ${pending === 1 ? "answer is" : "answers are"} waiting to sync.`
+          : "Saved answers sync with the practice record."}
+      </p>
+      <Card>
+        <CardHeader>
+          <CardDescription>
+            Grade {item.grade} · {item.pack === "fractions" ? "Fractions" : "Operations"}
+          </CardDescription>
+          <CardTitle
+            data-testid="practice-prompt"
+            className="font-heading text-3xl leading-tight"
+          >
+            {item.prompt}
+          </CardTitle>
+        </CardHeader>
+        <CardContent>
+          {feedback ? (
+            <div data-testid="practice-feedback" className="grid gap-4" aria-live="polite">
+              <p className="text-sm text-muted-foreground" data-celebration-tier={feedback.celebrationTier}>
+                {tierLine(feedback.celebrationTier)}
+                {feedback.replayed ? " This try was already saved." : ""}
+              </p>
+              <dl className="grid gap-3">
+                {FOUR_BEAT_KEYS.map((key) => (
+                  <div key={key} className="grid gap-1">
+                    <dt className="text-sm font-medium">{BEAT_LABELS[key]}</dt>
+                    <dd data-testid={`beat-${key}`} className="text-sm leading-6">
+                      {feedback[key]}
+                    </dd>
+                  </div>
+                ))}
+              </dl>
+              <p data-testid="client-view" data-soft-state={feedback.clientView.softState}>
+                {feedback.clientView.line}
+              </p>
+              <Button
+                type="button"
+                className="h-12 text-base"
+                onClick={() => showNext(nextFromFeedback ?? localNext)}
+              >
+                Next problem
+              </Button>
+            </div>
+          ) : (
+            <form className="grid gap-3" onSubmit={onSubmit}>
+              {savedOffline ? (
+                <p role="status" className="text-sm leading-6">
+                  Saved on this device. It will check in when you reconnect.
+                </p>
+              ) : null}
+              <div className="grid gap-2">
+                <Label htmlFor="practice-answer">Your answer</Label>
+                <Input
+                  id="practice-answer"
+                  data-testid="practice-answer"
+                  value={answer}
+                  onChange={(event) => setAnswer(event.target.value)}
+                  autoComplete="off"
+                  className="h-12 text-lg"
+                />
+              </div>
+              {error ? <p className="text-sm text-destructive">{error}</p> : null}
+              <Button
+                type="submit"
+                data-testid="practice-submit"
+                disabled={busy}
+                className="h-12 text-base"
+              >
+                {busy ? "Checking…" : "Check answer"}
+              </Button>
+              {savedOffline ? (
+                <Button
+                  type="button"
+                  variant="outline"
+                  className="h-12 text-base"
+                  onClick={() => showNext(localNext)}
+                >
+                  Next problem
+                </Button>
+              ) : null}
+            </form>
+          )}
+        </CardContent>
+      </Card>
+      <Link
+        href={`/child/${childId}`}
+        className="text-sm text-primary underline-offset-4 hover:underline"
+      >
+        Back to child home
+      </Link>
+    </div>
+  );
+}
