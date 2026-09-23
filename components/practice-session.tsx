@@ -2,8 +2,9 @@
 
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import Link from "next/link";
-import type { AttemptResult, PublicItem } from "@/lib/attempt-contract";
+import type { AttemptResult, ClientView, PublicItem } from "@/lib/attempt-contract";
 import { FOUR_BEAT_KEYS } from "@/lib/attempt-contract";
+import type { BoundaryOptions, PracticeLane } from "@/lib/mastery";
 import { itemAt, ITEM_CATALOG } from "@/lib/item-catalog";
 import {
   createAttemptQueue,
@@ -34,6 +35,21 @@ function tierLine(tier: AttemptResult["clientView"]["celebrationTier"]): string 
   if (tier === "quietXp") return "A quiet sprout. This one stays small.";
   return "No sprout this time.";
 }
+
+const PROGRESS_COPY: Record<BoundaryOptions["progression"], string> = {
+  stay: "Recommended stays the usual next step.",
+  remediate: "The next set can stay with what is still shaky.",
+  levelUpSlight: "A little harder is ready for next time.",
+};
+
+type SessionStart = {
+  sessionId?: string;
+  item?: PublicItem;
+  lane?: PracticeLane;
+  atBoundary?: boolean;
+  clientView?: ClientView | null;
+  error?: string;
+};
 
 async function postAttempt(childId: string, attempt: QueuedAttempt): Promise<SyncPost> {
   if (typeof navigator !== "undefined" && navigator.onLine === false) {
@@ -87,6 +103,8 @@ export function PracticeSession({
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [ready, setReady] = useState(false);
+  const [boundary, setBoundary] = useState<BoundaryOptions | null>(null);
+  const [persistedView, setPersistedView] = useState<ClientView | null>(null);
 
   function queue() {
     if (!queueRef.current) {
@@ -121,11 +139,7 @@ export function PracticeSession({
         const response = await fetch(`/api/children/${childId}/sessions`, {
           method: "POST",
         });
-        const body = (await response.json().catch(() => null)) as {
-          sessionId?: string;
-          item?: PublicItem;
-          error?: string;
-        } | null;
+        const body = (await response.json().catch(() => null)) as SessionStart | null;
         if (!response.ok || !body?.sessionId || !body.item) {
           if (!cancelled) setError(body?.error ?? "Practice could not start.");
           return;
@@ -133,8 +147,20 @@ export function PracticeSession({
         if (cancelled) return;
         setSessionId(body.sessionId);
         setItem(body.item);
+        setPersistedView(body.clientView ?? null);
         setShownAt(new Date().toISOString());
         setReady(true);
+        if (body.atBoundary) {
+          const options = await fetch(
+            `/api/children/${childId}/sessions/${body.sessionId}/boundary-options`,
+          );
+          const menu = (await options.json().catch(() => null)) as
+            | (BoundaryOptions & { error?: string })
+            | null;
+          if (!cancelled && options.ok && menu && menu.atBoundary) setBoundary(menu);
+        } else if (!cancelled) {
+          setBoundary(null);
+        }
         const snapshot = queue().snapshot();
         setPending(snapshot.pending.length);
         if (snapshot.pending.length > 0) await flush();
@@ -165,6 +191,68 @@ export function PracticeSession({
     setError(null);
   }
 
+  async function onEndSession() {
+    if (!sessionId || busy) return;
+    setBusy(true);
+    setError(null);
+    await flush();
+    try {
+      const response = await fetch(`/api/children/${childId}/sessions/${sessionId}/end`, {
+        method: "POST",
+      });
+      const body = (await response.json().catch(() => null)) as
+        | (BoundaryOptions & { error?: string })
+        | null;
+      if (!response.ok || !body?.atBoundary) {
+        setError(body?.error ?? "This session is not ready to end.");
+        setBusy(false);
+        return;
+      }
+      setBoundary(body);
+      setPersistedView(body.clientView);
+    } catch {
+      setError("This session is not ready to end.");
+    }
+    setBusy(false);
+  }
+
+  async function onChooseLane(lane: PracticeLane) {
+    if (!sessionId || busy) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const choice = await fetch(`/api/children/${childId}/sessions/${sessionId}/lane`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ lane }),
+      });
+      const chosen = (await choice.json().catch(() => null)) as { error?: string } | null;
+      if (!choice.ok) {
+        setError(chosen?.error ?? "That lane is not available.");
+        setBusy(false);
+        return;
+      }
+      const response = await fetch(`/api/children/${childId}/sessions`, { method: "POST" });
+      const body = (await response.json().catch(() => null)) as SessionStart | null;
+      if (!response.ok || !body?.sessionId || !body.item) {
+        setError(body?.error ?? "Practice could not start.");
+        setBusy(false);
+        return;
+      }
+      setSessionId(body.sessionId);
+      setItem(body.item);
+      setPersistedView(body.clientView ?? null);
+      setBoundary(null);
+      setFeedback(null);
+      setAnswer("");
+      setShownAt(new Date().toISOString());
+      setSavedOffline(false);
+    } catch {
+      setError("That lane is not available.");
+    }
+    setBusy(false);
+  }
+
   async function onSubmit(event: FormEvent) {
     event.preventDefault();
     if (!sessionId || !item || !shownAt || busy) return;
@@ -186,6 +274,7 @@ export function PracticeSession({
     const synced = snapshot.synced.find((result) => result.idempotencyKey === idempotencyKey);
     if (synced) {
       setFeedback(synced);
+      setPersistedView(synced.clientView);
       setSavedOffline(false);
     } else if (snapshot.pending.some((entry) => entry.idempotencyKey === idempotencyKey)) {
       setSavedOffline(true);
@@ -225,6 +314,47 @@ export function PracticeSession({
           ? `${pending} ${pending === 1 ? "answer is" : "answers are"} waiting to sync.`
           : "Saved answers sync with the practice record."}
       </p>
+      {persistedView && !boundary && !feedback ? (
+        <p data-testid="persisted-band" data-band-label={persistedView.bandLabel}>
+          {persistedView.bandLabel}
+          {persistedView.showConceptChip ? ` · ${item.skill}` : ""}
+        </p>
+      ) : null}
+      {boundary ? (
+        <Card data-testid="boundary-options">
+          <CardHeader>
+            <CardTitle className="font-heading text-2xl">Pick the next set</CardTitle>
+            <CardDescription data-testid="boundary-progression">
+              {PROGRESS_COPY[boundary.progression]}
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="grid gap-3">
+            <p data-testid="boundary-band" data-band-label={boundary.clientView.bandLabel}>
+              {boundary.clientView.bandLabel}
+              {boundary.clientView.showConceptChip ? ` · ${boundary.focusSkill}` : ""}
+            </p>
+            {boundary.options.map((option) => (
+              <Button
+                key={option.lane}
+                type="button"
+                variant={option.isDefault ? "default" : "outline"}
+                className="h-12 text-base"
+                data-testid={`lane-${option.lane}`}
+                data-default-lane={option.isDefault ? "true" : "false"}
+                disabled={busy || !option.available}
+                onClick={() => void onChooseLane(option.lane)}
+              >
+                {option.label}
+                {option.lane === "review" && option.remaining
+                  ? ` · ${option.remaining} still going`
+                  : ""}
+                {option.isDefault ? " · usual" : ""}
+              </Button>
+            ))}
+            {error ? <p className="text-sm text-destructive">{error}</p> : null}
+          </CardContent>
+        </Card>
+      ) : (
       <Card>
         <CardHeader>
           <CardDescription>
@@ -314,8 +444,19 @@ export function PracticeSession({
               ) : null}
             </form>
           )}
+          <Button
+            type="button"
+            variant="outline"
+            className="mt-4 h-12 text-base"
+            data-testid="end-session"
+            disabled={busy}
+            onClick={() => void onEndSession()}
+          >
+            End session
+          </Button>
         </CardContent>
       </Card>
+      )}
       <Link
         href={`/child/${childId}`}
         className="text-sm text-primary underline-offset-4 hover:underline"

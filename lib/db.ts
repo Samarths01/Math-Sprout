@@ -41,7 +41,35 @@ CREATE TABLE IF NOT EXISTS practice_sessions (
   child_id TEXT NOT NULL REFERENCES children(id) ON DELETE CASCADE,
   status TEXT NOT NULL CHECK (status IN ('active')),
   item_index INTEGER NOT NULL CHECK (item_index >= 0),
-  started_at TEXT NOT NULL
+  started_at TEXT NOT NULL,
+  practice_lane TEXT NOT NULL DEFAULT 'recommended' CHECK (practice_lane IN ('recommended', 'challenge', 'review')),
+  phase TEXT NOT NULL DEFAULT 'practicing' CHECK (phase IN ('practicing', 'boundary', 'closed')),
+  progression TEXT CHECK (progression IN ('stay', 'remediate', 'levelUpSlight'))
+);
+
+CREATE TABLE IF NOT EXISTS learner_skill_state (
+  child_id TEXT NOT NULL REFERENCES children(id) ON DELETE CASCADE,
+  skill TEXT NOT NULL,
+  band_label TEXT NOT NULL CHECK (band_label IN ('Still learning', 'Getting it', 'Got it')),
+  show_concept_chip INTEGER NOT NULL CHECK (show_concept_chip IN (0, 1)),
+  celebration_tier TEXT NOT NULL CHECK (celebration_tier IN ('none', 'quietXp', 'full')),
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (child_id, skill)
+);
+
+CREATE TABLE IF NOT EXISTS learner_progress (
+  child_id TEXT PRIMARY KEY REFERENCES children(id) ON DELETE CASCADE,
+  next_lane TEXT NOT NULL DEFAULT 'recommended' CHECK (next_lane IN ('recommended', 'challenge', 'review')),
+  difficulty_step INTEGER NOT NULL DEFAULT 0 CHECK (difficulty_step >= 0),
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS boundary_events (
+  id TEXT PRIMARY KEY,
+  child_id TEXT NOT NULL REFERENCES children(id) ON DELETE CASCADE,
+  session_id TEXT NOT NULL UNIQUE REFERENCES practice_sessions(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL CHECK (kind IN ('level_up_slight')),
+  created_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS attempts (
@@ -87,7 +115,58 @@ export function openDatabase(filename: string): Database.Database {
   }
   db.exec(MIGRATION);
   migrateSproutTier(db);
+  migrateLearnerProgression(db);
   return db;
+}
+
+function tableColumns(db: Database.Database, table: "practice_sessions"): Set<string> {
+  const rows = db.pragma(`table_info(${table})`) as Array<{ name: string }>;
+  return new Set(rows.map((row) => row.name));
+}
+
+/** Slice 2 databases predate practice lanes and persisted skill chips. */
+export function migrateLearnerProgression(db: Database.Database): void {
+  const sessions = tableColumns(db, "practice_sessions");
+  if (sessions.size === 0) return;
+  if (!sessions.has("practice_lane")) {
+    db.exec(
+      `ALTER TABLE practice_sessions ADD COLUMN practice_lane TEXT NOT NULL DEFAULT 'recommended' CHECK (practice_lane IN ('recommended', 'challenge', 'review'))`,
+    );
+  }
+  if (!sessions.has("phase")) {
+    db.exec(
+      `ALTER TABLE practice_sessions ADD COLUMN phase TEXT NOT NULL DEFAULT 'practicing' CHECK (phase IN ('practicing', 'boundary', 'closed'))`,
+    );
+  }
+  if (!sessions.has("progression")) {
+    db.exec(
+      `ALTER TABLE practice_sessions ADD COLUMN progression TEXT CHECK (progression IN ('stay', 'remediate', 'levelUpSlight'))`,
+    );
+  }
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS learner_skill_state (
+      child_id TEXT NOT NULL REFERENCES children(id) ON DELETE CASCADE,
+      skill TEXT NOT NULL,
+      band_label TEXT NOT NULL CHECK (band_label IN ('Still learning', 'Getting it', 'Got it')),
+      show_concept_chip INTEGER NOT NULL CHECK (show_concept_chip IN (0, 1)),
+      celebration_tier TEXT NOT NULL CHECK (celebration_tier IN ('none', 'quietXp', 'full')),
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY (child_id, skill)
+    );
+    CREATE TABLE IF NOT EXISTS learner_progress (
+      child_id TEXT PRIMARY KEY REFERENCES children(id) ON DELETE CASCADE,
+      next_lane TEXT NOT NULL DEFAULT 'recommended' CHECK (next_lane IN ('recommended', 'challenge', 'review')),
+      difficulty_step INTEGER NOT NULL DEFAULT 0 CHECK (difficulty_step >= 0),
+      updated_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS boundary_events (
+      id TEXT PRIMARY KEY,
+      child_id TEXT NOT NULL REFERENCES children(id) ON DELETE CASCADE,
+      session_id TEXT NOT NULL UNIQUE REFERENCES practice_sessions(id) ON DELETE CASCADE,
+      kind TEXT NOT NULL CHECK (kind IN ('level_up_slight')),
+      created_at TEXT NOT NULL
+    );
+  `);
 }
 
 function migrateSproutTier(db: Database.Database): void {

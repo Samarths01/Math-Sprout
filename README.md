@@ -2,9 +2,11 @@
 
 Math Sprout is a parent-managed math practice app for grades 2–4. A guardian account owns each child profile. Practice starts only when that guardian's consent is `granted`.
 
-This slice records practice attempts. Each attempt is idempotent, can be queued offline, and returns `correct`, four beats, and a `ClientView` (`bandLabel`, `showConceptChip`, `celebrationTier` of `none`, `quietXp`, or `full`). There is no score and no confidence value.
+Practice attempts are idempotent, can be queued offline, and return `correct`, four beats, and a `ClientView` (`bandLabel`, `showConceptChip`, `celebrationTier` of `none`, `quietXp`, or `full`). There is no score and no confidence value.
 
-Slice 2 was planned as “no economy yet.” That exit is superseded: this slice keeps a quiet-mint stub only. `xp_events` writes a `quietXp` or `full` mint in the same transaction as the attempt (`full` is the earlier sprout amount). It is not a shop, a streak, a BuildGoal, or a second ledger. Those stay later slices. Nothing subtracts XP.
+Slice 3 adds learner state and progression only. A rules `MasteryEstimator` maps attempt evidence to the soft-state bands. Got it and a slightly-harder step need Recommended or Challenge evidence in the recent window, so a Review lane cannot pretend a skill is finished. Lane choice (Recommended, Challenge, or Review with skills still going) happens at the end of a session. Recommended is the default. Chips are stored per skill and come back on the next session.
+
+The quiet-mint stub is unchanged. `xp_events` still writes a `quietXp` or `full` mint in the same transaction as the attempt (`full` is the earlier sprout amount). Slice 3 is not the economy: no QualifyingEvent bus, XP ledger gate, BuildGoal, badge, streak, parent narrative, shop, or tutor chat. Those stay Slice 4 and later. Nothing subtracts XP.
 
 ## Run locally
 
@@ -36,6 +38,7 @@ npm start
 4. Open the child home. The Start practice button stays disabled until consent is granted. Missing, paused, and revoked consent do not start a session.
 5. With consent granted, start practice. Answer a problem from the operations or fractions pack. The response names what went well, one focus, what to try next, and a lock-in. It does not show a score or a confidence number.
 6. If the connection drops, the answer stays in a device queue and syncs with the same idempotency key when the connection returns. A replay returns the original attempt and the original event ids.
+7. End the session to pick the next lane. Recommended is the usual choice. Challenge is a step up. Review shows up when a skill is still short of Got it. A little harder is offered only after Recommended or Challenge evidence supports it.
 
 ## Deferred
 
@@ -59,8 +62,11 @@ The same Next.js server is the API. All child and consent routes require the par
 | GET | `/api/children/:id/consent` | Current consent status. |
 | GET | `/api/children/:id/home` | `{ practiceAllowed, reason?, child }`. |
 | GET | `/api/parent/home` | Guardian plus children and consent. |
-| POST | `/api/children/:id/sessions` | Start a practice session when consent is `granted`. Returns `{ sessionId, item }`. |
+| POST | `/api/children/:id/sessions` | Start or resume a practice session when consent is `granted`. Returns `{ sessionId, item, lane, atBoundary, clientView }`. `clientView` is the stored chip for that problem's skill, when one exists. |
 | POST | `/api/children/:id/attempts` | Submit one try. Body: `idempotencyKey`, `sessionId`, `itemId`, `answer`, `shownAt`, `submittedAt`. The same key returns the original attempt, four-beat copy, `clientView`, and `eventIds`. |
+| POST | `/api/children/:id/sessions/:sessionId/end` | Reach the session boundary after at least one try. Returns lane options. A second call does not fire LevelUpSlight again. |
+| GET | `/api/children/:id/sessions/:sessionId/boundary-options` | Lane menu. Only while the session is at that boundary. Recommended is the default. |
+| POST | `/api/children/:id/sessions/:sessionId/lane` | Body: `{ "lane": "recommended" \| "challenge" \| "review" }`. Closes the session and stores the lane for the next one. |
 
 Passwords are hashed with scrypt. The session cookie is `HttpOnly` and `SameSite=Lax`. Set `COOKIE_SECURE=true` when the site is served over HTTPS.
 
@@ -102,3 +108,11 @@ The image listens on `43123` and stores the database at `/data/math-sprout.sqlit
 - an offline queue reconciles through that same key
 - the attempt response has `correct`, four beats, and a soft-state `clientView` with no score or confidence
 - the item stub covers grades 2–4 operations and fractions
+
+Slice 3 adds:
+
+- soft-state chips follow attempt history, and one clean try stays "Getting it"
+- Got it and LevelUpSlight need Recommended or Challenge evidence; Review cannot supply it
+- a slightly-harder boundary event fires when that policy says so, once per session
+- lane options exist only at the session boundary, and Recommended is the default
+- skill chips are still there on the next session
