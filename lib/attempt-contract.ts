@@ -41,6 +41,16 @@ export type PublicItem = {
   prompt: string;
 };
 
+/**
+ * Fuel this attempt minted. Every id is a QualifyingEvent on the bus.
+ * `credit` is accrue-only: it is never negative, and a replay repeats it.
+ */
+export type AttemptFuel = {
+  credit: number;
+  heatEventId: string | null;
+  pieceEventIds: string[];
+};
+
 export type AttemptResult = FourBeat & {
   attemptId: string;
   idempotencyKey: string;
@@ -52,6 +62,8 @@ export type AttemptResult = FourBeat & {
   /** QualifyingEvent ids for this attempt. XP credits point at these ids. */
   eventIds: string[];
   xpAmount: number;
+  /** Heat, XP, and build pieces from this attempt's qualifying events. */
+  fuel: AttemptFuel;
   clientView: ClientView;
   nextItem: PublicItem;
   /**

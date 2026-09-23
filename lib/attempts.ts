@@ -36,6 +36,7 @@ import {
   readChildTimeZone,
 } from "@/lib/qualifying-bus";
 import { readAttemptLog } from "@/lib/attempt-log";
+import { fuelFromEvents } from "@/lib/fuel";
 import { POLICY_VERSION } from "@/lib/policy";
 import { takePendingPauseHold } from "@/lib/pause-hold";
 import { practiceGate } from "@/lib/practice-gate";
@@ -217,9 +218,10 @@ function resultFromRow(
     .all(row.id) as Array<{ amount: number }>;
   const qualifying = db
     .prepare(
-      `SELECT id FROM qualifying_events WHERE attempt_id = ? ORDER BY rowid ASC`,
+      `SELECT id, kind FROM qualifying_events WHERE attempt_id = ? ORDER BY rowid ASC`,
     )
-    .all(row.id) as Array<{ id: string }>;
+    .all(row.id) as Array<{ id: string; kind: string }>;
+  const credit = credits.reduce((sum, event) => sum + event.amount, 0);
   const session = db
     .prepare(`SELECT item_index FROM practice_sessions WHERE id = ?`)
     .get(row.session_id) as { item_index: number } | undefined;
@@ -243,7 +245,8 @@ function resultFromRow(
     lane: row.lane,
     flags,
     eventIds: qualifying.map((event) => event.id),
-    xpAmount: credits.reduce((sum, event) => sum + event.amount, 0),
+    xpAmount: credit,
+    fuel: fuelFromEvents(qualifying, credit),
     clientView,
     nextItem: itemAt(session.item_index),
     ...(row.resume_presentation === "quiet" ? { resumePresentation: "quiet" as const } : {}),

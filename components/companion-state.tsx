@@ -45,7 +45,10 @@ function CompanionFigure({
       viewBox="0 0 120 88"
       className={cn("h-24 w-full", TONE[state])}
       data-testid="companion-figure"
+      data-fuel="heat"
+      data-fuel-source="qualifying-event"
       data-streak-state={state}
+      data-waning={state === "ember" ? "true" : "false"}
       data-growth={grown.toFixed(2)}
       aria-hidden="true"
     >
@@ -98,7 +101,13 @@ export function CompanionState({
   const recovery = companion.streak.recovery;
 
   return (
-    <Card data-testid="companion" data-streak-state={companion.streak.state}>
+    <Card
+      data-testid="companion"
+      data-streak-state={companion.streak.state}
+      data-fuel-source="qualifying-event"
+      data-heat-event-id={companion.streak.sourceEventId ?? ""}
+      data-waning={companion.streak.state === "ember" ? "true" : "false"}
+    >
       <CardHeader>
         <CardTitle id="companion-heading" className="font-heading text-2xl">
           The sprout
@@ -145,6 +154,8 @@ export function CompanionState({
         <div
           className="grid gap-2"
           data-testid="build-goal"
+          data-fuel="pieces"
+          data-fuel-source="qualifying-event"
           data-goal-id={active.id}
           data-goal-active="true"
           data-piece-count={active.pieces.length}

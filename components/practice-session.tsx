@@ -4,9 +4,12 @@ import { useEffect, useRef, useState, type FormEvent } from "react";
 import Link from "next/link";
 import type { AttemptResult, ClientView, PublicItem } from "@/lib/attempt-contract";
 import { displayedOneFocus, FOUR_BEAT_KEYS } from "@/lib/attempt-contract";
+import { fuelMotion, type FuelMotionKind } from "@/lib/fuel-motion";
 import type { BoundaryOptions, PracticeLane } from "@/lib/mastery";
 import { itemAt, ITEM_CATALOG } from "@/lib/item-catalog";
-import { interfaceCopy } from "@/lib/interface-copy";
+import { interfaceCopy, INTERFACE_COPY, type InterfaceCopyKey } from "@/lib/interface-copy";
+import type { StreakState } from "@/lib/streak";
+import { FuelMoment } from "@/components/fuel-moment";
 import {
   consentQueueReason,
   createAttemptQueue,
@@ -35,17 +38,69 @@ const BEAT_LABELS: Record<(typeof FOUR_BEAT_KEYS)[number], string> = {
   lockIn: "Lock in",
 };
 
-function tierLine(tier: AttemptResult["clientView"]["celebrationTier"]): string {
-  if (tier === "full") return "A sprout for that try.";
-  if (tier === "quietXp") return "A quiet sprout. This one stays small.";
-  return "No sprout this time.";
-}
-
 const PROGRESS_COPY: Record<BoundaryOptions["progression"], string> = {
   stay: "Recommended stays the usual next step.",
   remediate: "The next set can stay with what is still shaky.",
   levelUpSlight: "A little harder is ready for next time.",
 };
+
+const STEADY_MOTION: { heat: FuelMotionKind; pieces: FuelMotionKind; xp: FuelMotionKind } = {
+  heat: "steady",
+  pieces: "steady",
+  xp: "steady",
+};
+
+type ShownFuel = {
+  streakState: StreakState;
+  copyKey: InterfaceCopyKey;
+  sourceEventId: string | null;
+  pieceEventIds: string[];
+};
+
+function isStreakState(value: unknown): value is StreakState {
+  return value === "hot" || value === "warm" || value === "ember" || value === "dormant";
+}
+
+function isCopyKey(value: unknown): value is InterfaceCopyKey {
+  return typeof value === "string" && Object.prototype.hasOwnProperty.call(INTERFACE_COPY, value);
+}
+
+function pieceIdsFrom(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  const ids: string[] = [];
+  for (const piece of value) {
+    if (!piece || typeof piece !== "object") continue;
+    const eventId = (piece as { eventId?: unknown }).eventId;
+    if (typeof eventId === "string" && eventId.length > 0) ids.push(eventId);
+  }
+  return ids;
+}
+
+/** Companion payload only. A failed read does not invent fuel from the try. */
+function readFuelSurface(value: unknown): ShownFuel | null {
+  if (!value || typeof value !== "object") return null;
+  const record = value as {
+    streak?: { state?: unknown; copyKey?: unknown; sourceEventId?: unknown };
+    build?: {
+      active?: { pieces?: unknown };
+      completed?: Array<{ pieces?: unknown }>;
+    };
+  };
+  if (!isStreakState(record.streak?.state) || !isCopyKey(record.streak?.copyKey)) return null;
+  const completed = Array.isArray(record.build?.completed) ? record.build.completed : [];
+  const pieceEventIds = [
+    ...completed.flatMap((goal) => pieceIdsFrom(goal?.pieces)),
+    ...pieceIdsFrom(record.build?.active?.pieces),
+  ];
+  const sourceEventId =
+    typeof record.streak.sourceEventId === "string" ? record.streak.sourceEventId : null;
+  return {
+    streakState: record.streak.state,
+    copyKey: record.streak.copyKey,
+    sourceEventId,
+    pieceEventIds,
+  };
+}
 
 type SessionStart = {
   sessionId?: string;
@@ -128,6 +183,9 @@ export function PracticeSession({
   const [ready, setReady] = useState(false);
   const [boundary, setBoundary] = useState<BoundaryOptions | null>(null);
   const [persistedView, setPersistedView] = useState<ClientView | null>(null);
+  const [shownFuel, setShownFuel] = useState<ShownFuel | null>(null);
+  const shownFuelRef = useRef<ShownFuel | null>(null);
+  const [fuelMotionState, setFuelMotionState] = useState(STEADY_MOTION);
 
   function queue() {
     if (!queueRef.current) {
@@ -138,11 +196,38 @@ export function PracticeSession({
     return queueRef.current;
   }
 
+  async function pullFuel(attempt: AttemptResult | null) {
+    try {
+      const response = await fetch(`/api/children/${childId}/companion`);
+      const body = await response.json().catch(() => null);
+      const next = response.ok ? readFuelSurface(body) : null;
+      if (!next) return;
+      const previous = shownFuelRef.current;
+      const celebrate = attempt && showResumeCelebration(attempt) ? attempt : null;
+      setFuelMotionState(
+        fuelMotion({
+          previousHeat: previous?.streakState ?? null,
+          nextHeat: next.streakState,
+          previousPieceIds: previous ? previous.pieceEventIds : null,
+          nextPieceIds: next.pieceEventIds,
+          credit: celebrate?.fuel.credit ?? 0,
+          heatEventId: celebrate?.fuel.heatEventId ?? null,
+          replayed: celebrate?.replayed ?? false,
+        }),
+      );
+      shownFuelRef.current = next;
+      setShownFuel(next);
+    } catch {
+      // Keep the last qualifying projection. Do not invent fuel from the try count.
+    }
+  }
+
   async function flush() {
     const snapshot = await queue().reconcile((attempt) => postAttempt(childId, attempt));
     setPending(snapshot.pending.length);
     if (snapshot.quietCredits) setQuietResume(true);
     if (snapshot.held) setHeldNotice(true);
+    let fuelAttempt: AttemptResult | null = null;
     if (waitingKey.current) {
       const synced = snapshot.synced.find(
         (result) => result.idempotencyKey === waitingKey.current,
@@ -151,6 +236,7 @@ export function PracticeSession({
         setFeedback(synced);
         setSavedOffline(false);
         setHeldNotice(false);
+        fuelAttempt = synced;
         waitingKey.current = null;
       } else if (synced) {
         setFeedback(null);
@@ -162,6 +248,7 @@ export function PracticeSession({
     }
     if (snapshot.lastError) setError(snapshot.lastError);
     await publishOfflineCap(snapshot.pending.length);
+    await pullFuel(fuelAttempt);
     return snapshot;
   }
 
@@ -212,6 +299,7 @@ export function PracticeSession({
         const snapshot = queue().snapshot();
         setPending(snapshot.pending.length);
         if (snapshot.pending.length > 0) await flush();
+        else await pullFuel(null);
       } catch {
         if (!cancelled) setError("Practice could not start.");
       }
@@ -258,6 +346,7 @@ export function PracticeSession({
       }
       setBoundary(body);
       setPersistedView(body.clientView);
+      await pullFuel(null);
     } catch {
       setError("This session is not ready to end.");
     }
@@ -398,6 +487,32 @@ export function PracticeSession({
         <p className="text-sm text-muted-foreground">Hi, {displayName}</p>
         <h1 className="font-heading text-4xl tracking-tight">Practice</h1>
       </div>
+      {shownFuel || (feedback && showResumeCelebration(feedback)) ? (
+        <FuelMoment
+          heat={
+            shownFuel
+              ? {
+                  streakState: shownFuel.streakState,
+                  copyKey: shownFuel.copyKey,
+                  sourceEventId: shownFuel.sourceEventId,
+                  motion: fuelMotionState.heat,
+                }
+              : null
+          }
+          pieceEventIds={shownFuel?.pieceEventIds ?? []}
+          pieceMotion={shownFuel ? fuelMotionState.pieces : "steady"}
+          xp={
+            feedback && showResumeCelebration(feedback)
+              ? {
+                  credit: feedback.fuel.credit,
+                  eventCount: feedback.eventIds.length,
+                  tier: feedback.clientView.celebrationTier,
+                  replayed: feedback.replayed,
+                }
+              : null
+          }
+        />
+      ) : null}
       <p data-testid="sync-status" className="text-sm text-muted-foreground">
         {pending > 0
           ? `${pending} ${pending === 1 ? "answer is" : "answers are"} waiting to sync.`
@@ -491,15 +606,7 @@ export function PracticeSession({
         <CardContent>
           {feedback ? (
             <div data-testid="practice-feedback" className="grid gap-4" aria-live="polite">
-              {showResumeCelebration(feedback) ? (
-                <p
-                  className="text-sm text-muted-foreground"
-                  data-celebration-tier={feedback.clientView.celebrationTier}
-                >
-                  {tierLine(feedback.clientView.celebrationTier)}
-                  {feedback.replayed ? " This try was already saved." : ""}
-                </p>
-              ) : (
+              {showResumeCelebration(feedback) ? null : (
                 <p
                   data-testid="quiet-resume"
                   data-presentation="quiet"

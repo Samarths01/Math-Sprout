@@ -14,21 +14,12 @@ import {
   REVIEW_SESSIONS_PER_WEEK,
 } from "@/lib/economy-config";
 import { DomainError } from "@/lib/domain";
+import { loadQualifyingDays, projectHeat } from "@/lib/fuel";
 import { bumpDifficulty, ensureLearnerProgress } from "@/lib/learner-state";
-import {
-  calendarDaysBetween,
-  emberExpiryForQualifyingDay,
-  localDate,
-  localWeekRange,
-} from "@/lib/local-time";
+import { calendarDaysBetween, localDate, localWeekRange } from "@/lib/local-time";
 import { MasteryEstimator, type PracticeLane, type SkillEvidence } from "@/lib/mastery";
-import {
-  coolStreak,
-  emptyStreak,
-  heatStreak,
-  type StreakRecord,
-  type StreakState,
-} from "@/lib/streak";
+import { POLICY_VERSION } from "@/lib/policy";
+import { emptyStreak, type StreakRecord, type StreakState } from "@/lib/streak";
 
 export const QUALIFYING_EVENT_KINDS = [
   "HonestAttempt",
@@ -300,6 +291,10 @@ export function planAttemptEconomy(
     }
   }
 
+  const estimator = new MasteryEstimator();
+  if (estimator.policyVersion !== POLICY_VERSION) {
+    throw new DomainError("Estimator policy_version is missing.", 500);
+  }
   const gated = applyMintGate(mints, gate);
   const celebrationTier = deriveCelebration(gated, integrity.lane);
   assertCelebrationBacked({
@@ -308,7 +303,7 @@ export function planAttemptEconomy(
     integrityLane: integrity.lane,
     practiceLane: input.practiceLane,
   });
-  const clientView = new MasteryEstimator().toClientView({
+  const clientView = estimator.toClientView({
     correct: input.correct,
     lane: integrity.lane,
     celebrationTier,
@@ -455,14 +450,16 @@ function persistStreak(
   input: { eventAt: string; observedAt: string; qualify: boolean },
 ): { record: StreakRecord; becameHot: boolean; qualifyingDay: string } {
   const eventDay = localDate(input.eventAt, timeZone);
-  const observedDay = localDate(input.observedAt, timeZone);
-  const before = readStreak(db, childId);
-  const atEvent = coolStreak(before, eventDay, input.eventAt);
-  const heated = input.qualify
-    ? heatStreak(atEvent, eventDay, emberExpiryForQualifyingDay(eventDay, timeZone))
-    : atEvent;
-  const becameHot = input.qualify && heated.state === "hot" && before.state !== "hot";
-  const record = coolStreak(heated, observedDay, input.observedAt);
+  const days = loadQualifyingDays(db, childId);
+  const projected = projectHeat(days, timeZone, input.observedAt);
+  const priorDays = input.qualify ? days.filter((day) => day.localDay !== eventDay) : days;
+  const prior = projectHeat(priorDays, timeZone, input.observedAt);
+  const becameHot = input.qualify && projected.state === "hot" && prior.state !== "hot";
+  const record: StreakRecord = {
+    state: projected.state,
+    emberExpiresAt: projected.emberExpiresAt,
+    lastQualifyingDay: projected.lastQualifyingDay,
+  };
   writeStreak(db, childId, record);
   return { record, becameHot, qualifyingDay: eventDay };
 }
@@ -484,6 +481,7 @@ function mintHotPiece(
   db: Database.Database,
   input: {
     childId: string;
+    attemptId: string;
     sessionId: string;
     qualifyingDay: string;
     becameHot: boolean;
@@ -505,7 +503,7 @@ function mintHotPiece(
   }
   appendEvent(db, {
     childId: input.childId,
-    attemptId: null,
+    attemptId: input.attemptId,
     sessionId: input.sessionId,
     createdAt: input.createdAt,
     mint: {
@@ -594,6 +592,7 @@ export function commitAttemptEconomy(
   });
   mintHotPiece(db, {
     childId: input.childId,
+    attemptId: input.attemptId,
     sessionId: input.sessionId,
     qualifyingDay: streak.qualifyingDay,
     becameHot: streak.becameHot,

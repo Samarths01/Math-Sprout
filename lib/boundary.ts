@@ -22,6 +22,7 @@ import {
   type BoundaryOptions,
   type PracticeLane,
 } from "@/lib/mastery";
+import { POLICY_VERSION } from "@/lib/policy";
 import { practiceGate } from "@/lib/practice-gate";
 
 const LANE_LABEL: Record<PracticeLane, BoundaryLaneOption["label"]> = {
@@ -147,7 +148,11 @@ export function endPracticeSession(
 
     const skill = focusSkill(db, session.id);
     const evidence = evidenceForSkill(db, childId, skill);
-    const progression = new MasteryEstimator().decideProgression(evidence);
+    const estimator = new MasteryEstimator();
+    if (estimator.policyVersion !== POLICY_VERSION) {
+      throw new DomainError("Estimator policy_version is missing.", 500);
+    }
+    const progression = estimator.decideProgression(evidence);
     if (progression === "levelUpSlight") {
       mintLevelUpSlight(db, {
         childId,

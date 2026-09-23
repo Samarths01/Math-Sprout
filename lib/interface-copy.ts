@@ -19,6 +19,10 @@ export const INTERFACE_COPY = {
   "piece.level": "A little harder",
   "piece.build": "Build piece",
   "piece.streak": "Streak",
+  "fuel.xp.full": "A sprout for that try.",
+  "fuel.xp.quiet": "A quiet sprout. This one stays small.",
+  "fuel.xp.none": "No sprout this time.",
+  "fuel.piece": "A piece of the build is in place.",
   "pause.hold.waiting": "Answers are waiting while practice is paused.",
   "pause.hold.resuming": "Answers are still waiting to save.",
   "pause.hold.waiting.detail":

@@ -4,6 +4,7 @@ import type {
   ClientView,
   ReviewLane,
 } from "@/lib/attempt-contract";
+import { POLICY_VERSION } from "@/lib/policy";
 
 /**
  * Practice lane chosen at a session boundary. This is not the Slice 2
@@ -140,11 +141,15 @@ export function assessWindow(evidence: readonly SkillEvidence[]): WindowAssessme
  * need Recommended or Challenge evidence inside the window.
  */
 export interface MasteryEstimator {
+  /** Rules baseline stamped on the estimator. Production scoring stays this policy. */
+  readonly policyVersion: typeof POLICY_VERSION;
   toClientView(input: ClientViewInput): ClientView;
   decideProgression(evidence: readonly SkillEvidence[]): ProgressionDecision;
 }
 
 class RulesMasteryEstimator implements MasteryEstimator {
+  readonly policyVersion = POLICY_VERSION;
+
   toClientView(input: ClientViewInput): ClientView {
     if (input.lane === "review" && input.celebrationTier === "full") {
       throw new Error("Review lane cannot celebrate full.");
