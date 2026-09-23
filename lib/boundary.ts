@@ -126,6 +126,10 @@ function boundaryOptions(
  * SessionBoundary. SetBoundary is deferred. Calling this again does not
  * mint a second LevelUpSlight.
  */
+/**
+ * Consent is checked before the boundary write.
+ * Revoke does not finish the session: the phase stays put and LevelUpSlight is not minted.
+ */
 export function endPracticeSession(
   db: Database.Database,
   guardianId: string,

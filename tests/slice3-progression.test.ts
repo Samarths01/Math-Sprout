@@ -515,6 +515,50 @@ describe("session boundary", () => {
     );
     expect(levelUpCount(db)).toBe(0);
   });
+
+  it("does not finish the session after consent is revoked", () => {
+    const db = tempDb();
+    const { guardian, child, session } = grantedChild(db);
+    for (let index = 0; index < 3; index += 1) {
+      submitAttempt(db, guardian.id, child.id, tryInput(session.sessionId, index));
+    }
+    const busBefore = (
+      db.prepare(`SELECT COUNT(*) AS count FROM qualifying_events`).get() as { count: number }
+    ).count;
+    setConsent(db, guardian.id, child.id, "revoke");
+
+    let denied: unknown;
+    try {
+      endPracticeSession(db, guardian.id, child.id, session.sessionId);
+    } catch (error) {
+      denied = error;
+    }
+    expect(denied).toBeInstanceOf(DomainError);
+    expect((denied as DomainError).status).toBe(403);
+    expect((denied as DomainError).queueDisposition).toBe("drop");
+    expect(() =>
+      choosePracticeLane(db, guardian.id, child.id, session.sessionId, "recommended"),
+    ).toThrow(DomainError);
+    expect(() =>
+      getBoundaryOptions(db, guardian.id, child.id, session.sessionId),
+    ).toThrow(DomainError);
+    expect(() =>
+      submitAttempt(db, guardian.id, child.id, tryInput(session.sessionId, 4)),
+    ).toThrow(DomainError);
+
+    const stored = readPracticeSession(db, child.id, session.sessionId);
+    expect(stored?.phase).toBe("practicing");
+    expect(levelUpCount(db)).toBe(0);
+    expect(
+      (db.prepare(`SELECT COUNT(*) AS count FROM qualifying_events WHERE kind = 'LevelUpSlight'`).get() as {
+        count: number;
+      }).count,
+    ).toBe(0);
+    expect(
+      (db.prepare(`SELECT COUNT(*) AS count FROM qualifying_events`).get() as { count: number })
+        .count,
+    ).toBe(busBefore);
+  });
 });
 
 describe("slice 2 database upgrade", () => {

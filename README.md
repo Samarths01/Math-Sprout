@@ -51,7 +51,7 @@ npm start
 
 ## Deferred
 
-Revoke sets consent to `revoked` and blocks practice. A pending device queue is dropped and the stored answer is removed. It does not delete the guardian, the child, the consent row, or the attempt ledger. Pause sets consent to `paused`, blocks new practice, and leaves the device queue in place until a parent grants consent again.
+Revoke sets consent to `revoked` and stops practice immediately. A pending device queue is dropped and the stored answer is removed. Ending that session does not run: the phase stays `practicing`, and LevelUpSlight is not minted. Revoke does not delete the guardian, the child, the consent row, or the attempt ledger. Pause sets consent to `paused`, blocks new practice, and may hold the device queue until a parent grants consent again.
 
 Account, child, and consent delete/export cascades are not in this slice. COPPA verification method is not in this slice. Do not describe this slice as consent-complete, as a production revoke-and-delete flow, or as a cleared kid-reachable mint beyond the replay, queue-disposition, and `rules-v0` fixtures.
 
