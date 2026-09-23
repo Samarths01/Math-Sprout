@@ -49,6 +49,11 @@ export type AttemptResult = FourBeat & {
   xpAmount: number;
   clientView: ClientView;
   nextItem: PublicItem;
+  /**
+   * Set when this try was held across pause. The mint still stands.
+   * Callers must not present a celebration for a quiet resume.
+   */
+  resumePresentation?: "quiet";
 };
 
 export const TOO_FAST_MS = 500;

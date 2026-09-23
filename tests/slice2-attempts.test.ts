@@ -33,6 +33,7 @@ import {
   type QueuedAttempt,
   type SyncPost,
 } from "@/lib/offline-queue";
+import { readPauseHold, registerPauseHold, showResumeCelebration } from "@/lib/pause-hold";
 import { queueDisposition } from "@/lib/practice-gate";
 
 const cleanups: Array<() => void> = [];
@@ -512,7 +513,7 @@ describe("offline queue reconcile", () => {
     expect(count(db, "xp_events")).toBe(1);
   });
 
-  it("drops a paused queue and does not celebrate it after grant", async () => {
+  it("holds a paused queue where a parent can see it and credits it quietly", async () => {
     const db = tempDb();
     const { guardian, child, session } = grantedChild(db);
     const queue = createAttemptQueue(memoryQueueStore());
@@ -525,27 +526,55 @@ describe("offline queue reconcile", () => {
       shownAt: at(0),
       submittedAt: at(2_000),
     };
+    const second = {
+      ...attempt,
+      idempotencyKey: "paused-key-0002",
+      submittedAt: at(4_000),
+    };
     queue.enqueue(attempt);
+    queue.enqueue(second);
     setConsent(db, guardian.id, child.id, "pause");
-    expect(queueDisposition("paused")).toBe("drop");
+    expect(queueDisposition("paused")).toBe("hold");
+    expect(queueDisposition("revoked")).toBe("drop");
+    expect(queueDisposition("none")).toBe("drop");
     expect(
       consentQueueReason({
         queueDisposition: "hold",
         error: "Practice is paused. A parent can grant consent again from the parent home.",
       }),
     ).toBe("drop");
+    expect(
+      consentQueueReason({ queueDisposition: "hold" }, true),
+    ).toBe("hold");
+    expect(consentQueueReason({ queueDisposition: "drop" }, true)).toBe("drop");
+
+    const silent = createAttemptQueue(memoryQueueStore());
+    silent.enqueue(attempt);
+    const droppedSilent = await silent.reconcile(async () => ({
+      ok: false as const,
+      reason: consentQueueReason({ queueDisposition: "hold" }, false),
+      message: "Practice is paused.",
+    }));
+    expect(droppedSilent.pending).toEqual([]);
+    expect(droppedSilent.dropped).toHaveLength(1);
+    expect(count(db, "attempts")).toBe(0);
 
     const post = async (queued: QueuedAttempt): Promise<SyncPost> => {
       try {
         return { ok: true, result: submitAttempt(db, guardian.id, child.id, queued) };
       } catch (error) {
         if (error instanceof DomainError && error.status === 403) {
+          let parentVisible = false;
+          if (error.queueDisposition === "hold") {
+            const view = registerPauseHold(db, guardian.id, child.id, queued);
+            parentVisible = view.visible === true;
+          }
           return {
             ok: false,
-            reason: consentQueueReason({
-              error: error.message,
-              queueDisposition: error.queueDisposition,
-            }),
+            reason: consentQueueReason(
+              { error: error.message, queueDisposition: error.queueDisposition },
+              parentVisible,
+            ),
             message: error.message,
           };
         }
@@ -553,27 +582,76 @@ describe("offline queue reconcile", () => {
       }
     };
 
-    const dropped = await queue.reconcile(post);
-    expect(dropped.pending).toEqual([]);
-    expect(dropped.synced).toEqual([]);
-    expect(dropped.dropped).toEqual([
-      {
-        idempotencyKey: "paused-key-0001",
-        childId: child.id,
-        sessionId: session.sessionId,
-      },
+    const held = await queue.reconcile(post);
+    expect(held.pending.map((item) => item.idempotencyKey)).toEqual([
+      "paused-key-0001",
+      "paused-key-0002",
     ]);
+    expect(held.synced).toEqual([]);
+    expect(held.dropped).toEqual([]);
+    expect(held.held).toBe(2);
     expect(count(db, "attempts")).toBe(0);
     expect(count(db, "xp_events")).toBe(0);
     expect(count(db, "qualifying_events")).toBe(0);
+    const waiting = readPauseHold(db, guardian.id, child.id);
+    expect(waiting).toEqual({
+      visible: true,
+      waiting: 2,
+      copyKey: "pause.hold.waiting",
+      detailKey: "pause.hold.waiting.detail",
+    });
+    expect(waiting).not.toHaveProperty("answer");
+    const storedHold = db
+      .prepare(`SELECT hold_json FROM consents WHERE child_id = ?`)
+      .get(child.id) as { hold_json: string };
+    const stored = JSON.parse(storedHold.hold_json) as {
+      pending: Array<Record<string, string>>;
+    };
+    expect(stored.pending).toEqual([
+      { idempotencyKey: "paused-key-0001", sessionId: session.sessionId },
+      { idempotencyKey: "paused-key-0002", sessionId: session.sessionId },
+    ]);
+    expect(stored.pending.every((item) => !("answer" in item))).toBe(true);
 
+    expect(() => registerPauseHold(db, guardian.id, child.id, attempt)).not.toThrow();
     setConsent(db, guardian.id, child.id, "grant");
-    queue.enqueue(attempt);
+    expect(readPauseHold(db, guardian.id, child.id)).toEqual({
+      visible: true,
+      waiting: 2,
+      copyKey: "pause.hold.resuming",
+      detailKey: "pause.hold.waiting.detail",
+    });
+    expect(() => registerPauseHold(db, guardian.id, child.id, attempt)).toThrow(DomainError);
     const resumed = await queue.reconcile(post);
     expect(resumed.pending).toEqual([]);
-    expect(resumed.synced).toEqual([]);
-    expect(count(db, "attempts")).toBe(0);
-    expect(count(db, "xp_events")).toBe(0);
+    expect(resumed.dropped).toEqual([]);
+    expect(resumed.quietCredits).toBe(2);
+    expect(resumed.synced).toHaveLength(2);
+    for (const result of resumed.synced) {
+      expect(result.resumePresentation).toBe("quiet");
+      expect(result.celebrationTier).toBe("full");
+      expect(result.clientView.celebrationTier).toBe("full");
+      expect(showResumeCelebration(result)).toBe(false);
+      expectClientViewSealed(result);
+    }
+    expect(count(db, "attempts")).toBe(2);
+    expect(count(db, "xp_events")).toBe(2);
+    expect(readPauseHold(db, guardian.id, child.id)).toBeNull();
+    const replay = submitAttempt(db, guardian.id, child.id, attempt);
+    expect(replay.replayed).toBe(true);
+    expect(replay.resumePresentation).toBe("quiet");
+    expect(showResumeCelebration(replay)).toBe(false);
+    expect(count(db, "xp_events")).toBe(2);
+
+    const emptyPause = readPauseHold(db, guardian.id, child.id);
+    expect(emptyPause).toBeNull();
+    setConsent(db, guardian.id, child.id, "pause");
+    expect(readPauseHold(db, guardian.id, child.id)).toEqual({
+      visible: true,
+      waiting: 0,
+      copyKey: "pause.hold.empty",
+      detailKey: "pause.hold.waiting.detail",
+    });
   });
 
   it("drops a revoked queue and never syncs it", async () => {
@@ -590,7 +668,15 @@ describe("offline queue reconcile", () => {
       submittedAt: at(2_000),
     };
     queue.enqueue(attempt);
+    setConsent(db, guardian.id, child.id, "pause");
+    registerPauseHold(db, guardian.id, child.id, attempt);
+    expect(readPauseHold(db, guardian.id, child.id)?.waiting).toBe(1);
     setConsent(db, guardian.id, child.id, "revoke");
+    expect(readPauseHold(db, guardian.id, child.id)).toBeNull();
+    const storedHold = db
+      .prepare(`SELECT hold_json FROM consents WHERE child_id = ?`)
+      .get(child.id) as { hold_json: string | null };
+    expect(storedHold.hold_json).toBeNull();
 
     const snapshot = await queue.reconcile(async (queued) => {
       try {

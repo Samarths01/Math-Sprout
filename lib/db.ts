@@ -31,7 +31,8 @@ CREATE TABLE IF NOT EXISTS consents (
   child_id TEXT PRIMARY KEY REFERENCES children(id) ON DELETE CASCADE,
   status TEXT NOT NULL CHECK (status IN ('granted', 'paused', 'revoked')),
   updated_at TEXT NOT NULL,
-  updated_by TEXT NOT NULL REFERENCES guardians(id)
+  updated_by TEXT NOT NULL REFERENCES guardians(id),
+  hold_json TEXT
 );
 
 CREATE INDEX IF NOT EXISTS children_guardian_id ON children(guardian_id);
@@ -94,6 +95,7 @@ CREATE TABLE IF NOT EXISTS attempts (
   client_view_json TEXT NOT NULL,
   created_at TEXT NOT NULL,
   policy_version TEXT NOT NULL DEFAULT '${POLICY_VERSION}',
+  resume_presentation TEXT NOT NULL DEFAULT 'live' CHECK (resume_presentation IN ('live', 'quiet')),
   UNIQUE (child_id, idempotency_key)
 );
 
@@ -148,6 +150,7 @@ export function openDatabase(filename: string): Database.Database {
   migrateSproutTier(db);
   migrateLearnerProgression(db);
   migrateEconomy(db);
+  migratePauseHold(db);
   return db;
 }
 
@@ -349,6 +352,20 @@ export function migrateEconomy(db: Database.Database): void {
       SELECT RAISE(ABORT, 'qualifying events are append-only');
     END;
   `);
+}
+
+/** Pause receipts live on consents. Quiet resume is a column on the attempt. */
+function migratePauseHold(db: Database.Database): void {
+  const consents = tableColumns(db, "consents");
+  if (consents.size > 0 && !consents.has("hold_json")) {
+    db.exec(`ALTER TABLE consents ADD COLUMN hold_json TEXT`);
+  }
+  const attempts = tableColumns(db, "attempts");
+  if (attempts.size > 0 && !attempts.has("resume_presentation")) {
+    db.exec(
+      `ALTER TABLE attempts ADD COLUMN resume_presentation TEXT NOT NULL DEFAULT 'live' CHECK (resume_presentation IN ('live', 'quiet'))`,
+    );
+  }
 }
 
 export function databasePath(): string {

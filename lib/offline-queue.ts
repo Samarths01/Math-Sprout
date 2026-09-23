@@ -40,7 +40,13 @@ export type SyncPost =
   | { ok: false; reason: "drop"; message: string }
   | { ok: false; reason: "error"; message: string };
 
-export type QueueSnapshot = QueueData & { lastError?: string };
+export type QueueSnapshot = QueueData & {
+  lastError?: string;
+  /** Tries credited on this pass with quiet resume. They must not celebrate. */
+  quietCredits?: number;
+  /** Tries kept on this pass because a parent-visible pause hold was recorded. */
+  held?: number;
+};
 
 const SYNCED_CAP = 40;
 
@@ -49,15 +55,16 @@ export function emptyQueue(): QueueData {
 }
 
 /**
- * Kid-path disposition for a 403. Always drop.
- * Pause-hold is not locked. Honoring hold here would keep a silent queue and
- * celebrate it on resume. Hold needs a later lock: parent-visible waiting and
- * a quiet resume, with no celebration.
+ * Kid-path disposition for a 403.
+ * Pause hold is kept only when `parentVisible` is true — the parent waiting
+ * record was saved. A hold the parent cannot see is forbidden and becomes a drop.
+ * Revoke and any other 403 drop. Resume of a real hold credits the try quietly.
  */
 export function consentQueueReason(
   body: { error?: string; queueDisposition?: unknown } | null,
-): "drop" {
-  void body;
+  parentVisible = false,
+): "hold" | "drop" {
+  if (body?.queueDisposition === "hold" && parentVisible) return "hold";
   return "drop";
 }
 
@@ -159,6 +166,8 @@ export function createAttemptQueue(store: QueueStore) {
       let lastError: string | undefined;
       const stillPending: QueuedAttempt[] = [];
       let stopped = false;
+      let quietCredits = 0;
+      let held = 0;
       for (const attempt of data.pending) {
         if (stopped) {
           stillPending.push(attempt);
@@ -179,10 +188,10 @@ export function createAttemptQueue(store: QueueStore) {
           continue;
         }
         if (!posted.ok && posted.reason === "hold") {
-          // Not used by the kid client. Do not wire pause to hold without a
-          // parent-visible waiting state and a quiet resume.
+          // Visible hold only. Keep walking so every waiting try can be registered.
+          // Resume credits these later and does not dump a celebration.
           stillPending.push(attempt);
-          stopped = true;
+          held += 1;
           continue;
         }
         if (!posted.ok && posted.reason === "drop") {
@@ -201,10 +210,16 @@ export function createAttemptQueue(store: QueueStore) {
             item.idempotencyKey === posted.result.idempotencyKey,
         );
         if (!already) data.synced.push(posted.result);
+        if (posted.result.resumePresentation === "quiet") quietCredits += 1;
       }
       data.pending = stillPending;
       store.save(remember(data));
-      return { ...store.load(), ...(lastError ? { lastError } : {}) };
+      return {
+        ...store.load(),
+        ...(lastError ? { lastError } : {}),
+        ...(quietCredits > 0 ? { quietCredits } : {}),
+        ...(held > 0 ? { held } : {}),
+      };
     },
   };
 }

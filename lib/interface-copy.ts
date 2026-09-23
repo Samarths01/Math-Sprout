@@ -19,6 +19,15 @@ export const INTERFACE_COPY = {
   "piece.level": "A little harder",
   "piece.build": "Build piece",
   "piece.streak": "Streak",
+  "pause.hold.waiting": "Answers are waiting while practice is paused.",
+  "pause.hold.resuming": "Answers are still waiting to save.",
+  "pause.hold.waiting.detail":
+    "Granting practice saves them quietly. There is no celebration for those tries.",
+  "pause.hold.empty":
+    "Practice is paused. Answers that check in wait here until you grant practice again.",
+  "pause.hold.kid":
+    "This try is waiting. A parent can see it. It saves quietly when practice is allowed again.",
+  "pause.resume.quiet": "Saved. The tries that waited did not get a celebration.",
 } as const;
 
 export type InterfaceCopyKey = keyof typeof INTERFACE_COPY;

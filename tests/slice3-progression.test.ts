@@ -510,9 +510,15 @@ describe("session boundary", () => {
     const { guardian, child, session } = grantedChild(db);
     submitAttempt(db, guardian.id, child.id, tryInput(session.sessionId, 0));
     setConsent(db, guardian.id, child.id, "pause");
-    expect(() => endPracticeSession(db, guardian.id, child.id, session.sessionId)).toThrow(
-      DomainError,
-    );
+    let paused: unknown;
+    try {
+      endPracticeSession(db, guardian.id, child.id, session.sessionId);
+    } catch (error) {
+      paused = error;
+    }
+    expect(paused).toBeInstanceOf(DomainError);
+    expect((paused as DomainError).status).toBe(403);
+    expect((paused as DomainError).queueDisposition).toBe("hold");
     expect(levelUpCount(db)).toBe(0);
   });
 

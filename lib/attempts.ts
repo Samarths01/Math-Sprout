@@ -37,6 +37,7 @@ import {
 } from "@/lib/qualifying-bus";
 import { readAttemptLog } from "@/lib/attempt-log";
 import { POLICY_VERSION } from "@/lib/policy";
+import { takePendingPauseHold } from "@/lib/pause-hold";
 import { practiceGate } from "@/lib/practice-gate";
 
 const KEY_PATTERN = /^[A-Za-z0-9_-]{8,80}$/;
@@ -71,6 +72,7 @@ type AttemptRow = {
   flags_json: string;
   beats_json: string;
   client_view_json: string;
+  resume_presentation: "live" | "quiet";
 };
 
 assertBankMatchesCatalog();
@@ -164,7 +166,8 @@ function findAttempt(
   return db
     .prepare(
       `SELECT id, child_id, session_id, idempotency_key, item_id, answer, correct,
-              lane, celebration_tier, flags_json, beats_json, client_view_json
+              lane, celebration_tier, flags_json, beats_json, client_view_json,
+              resume_presentation
        FROM attempts
        WHERE child_id = ? AND idempotency_key = ?`,
     )
@@ -243,6 +246,7 @@ function resultFromRow(
     xpAmount: credits.reduce((sum, event) => sum + event.amount, 0),
     clientView,
     nextItem: itemAt(session.item_index),
+    ...(row.resume_presentation === "quiet" ? { resumePresentation: "quiet" as const } : {}),
   };
 }
 
@@ -384,17 +388,18 @@ export function submitAttempt(
       canonicalAnswer: canonicalAnswer(itemId),
     });
     saveSkillState(db, childId, item.skill, economy.clientView);
+    const quietResume = takePendingPauseHold(db, childId, idempotencyKey);
     const attemptId = randomUUID();
     const createdAt = nowIso();
     db.prepare(
       `INSERT INTO attempts (
          id, child_id, session_id, idempotency_key, item_id, answer, shown_at,
          submitted_at, correct, lane, celebration_tier, flags_json, beats_json,
-         client_view_json, created_at, policy_version
+         client_view_json, created_at, policy_version, resume_presentation
        ) VALUES (
          @id, @child_id, @session_id, @idempotency_key, @item_id, @answer, @shown_at,
          @submitted_at, @correct, @lane, @celebration_tier, @flags_json, @beats_json,
-         @client_view_json, @created_at, @policy_version
+         @client_view_json, @created_at, @policy_version, @resume_presentation
        )`,
     ).run({
       id: attemptId,
@@ -413,6 +418,7 @@ export function submitAttempt(
       client_view_json: JSON.stringify(economy.clientView),
       created_at: createdAt,
       policy_version: POLICY_VERSION,
+      resume_presentation: quietResume ? "quiet" : "live",
     });
     commitAttemptEconomy(db, {
       childId,

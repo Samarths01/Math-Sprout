@@ -6,6 +6,7 @@ import type { AttemptResult, ClientView, PublicItem } from "@/lib/attempt-contra
 import { FOUR_BEAT_KEYS } from "@/lib/attempt-contract";
 import type { BoundaryOptions, PracticeLane } from "@/lib/mastery";
 import { itemAt, ITEM_CATALOG } from "@/lib/item-catalog";
+import { interfaceCopy } from "@/lib/interface-copy";
 import {
   consentQueueReason,
   createAttemptQueue,
@@ -13,6 +14,7 @@ import {
   type QueuedAttempt,
   type SyncPost,
 } from "@/lib/offline-queue";
+import { showResumeCelebration } from "@/lib/pause-hold";
 import { Button } from "@/components/ui/button";
 import {
   Card,
@@ -66,7 +68,9 @@ async function postAttempt(childId: string, attempt: QueuedAttempt): Promise<Syn
       | (AttemptResult & { error?: string; queueDisposition?: unknown })
       | null;
     if (response.status === 403) {
-      const reason = consentQueueReason(body);
+      const parentVisible =
+        body?.queueDisposition === "hold" ? await registerVisibleHold(childId, attempt) : false;
+      const reason = consentQueueReason(body, parentVisible);
       return {
         ok: false,
         reason,
@@ -86,6 +90,20 @@ async function postAttempt(childId: string, attempt: QueuedAttempt): Promise<Syn
   }
 }
 
+async function registerVisibleHold(childId: string, attempt: QueuedAttempt): Promise<boolean> {
+  try {
+    const response = await fetch(`/api/children/${childId}/pause-hold`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(attempt),
+    });
+    const body = (await response.json().catch(() => null)) as { visible?: boolean } | null;
+    return response.ok && body?.visible === true;
+  } catch {
+    return false;
+  }
+}
+
 export function PracticeSession({
   childId,
   displayName,
@@ -101,6 +119,8 @@ export function PracticeSession({
   const [answer, setAnswer] = useState("");
   const [feedback, setFeedback] = useState<AttemptResult | null>(null);
   const [savedOffline, setSavedOffline] = useState(false);
+  const [heldNotice, setHeldNotice] = useState(false);
+  const [quietResume, setQuietResume] = useState(false);
   const [pending, setPending] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -120,13 +140,22 @@ export function PracticeSession({
   async function flush() {
     const snapshot = await queue().reconcile((attempt) => postAttempt(childId, attempt));
     setPending(snapshot.pending.length);
+    if (snapshot.quietCredits) setQuietResume(true);
+    if (snapshot.held) setHeldNotice(true);
     if (waitingKey.current) {
       const synced = snapshot.synced.find(
         (result) => result.idempotencyKey === waitingKey.current,
       );
-      if (synced) {
+      if (synced && showResumeCelebration(synced)) {
         setFeedback(synced);
         setSavedOffline(false);
+        setHeldNotice(false);
+        waitingKey.current = null;
+      } else if (synced) {
+        setFeedback(null);
+        setQuietResume(true);
+        setSavedOffline(false);
+        setHeldNotice(false);
         waitingKey.current = null;
       }
     }
@@ -143,7 +172,10 @@ export function PracticeSession({
         });
         const body = (await response.json().catch(() => null)) as SessionStart | null;
         if (!response.ok || !body?.sessionId || !body.item) {
-          if (!cancelled) setError(body?.error ?? "Practice could not start.");
+          if (!cancelled) {
+            await flush();
+            setError(body?.error ?? "Practice could not start.");
+          }
           return;
         }
         if (cancelled) return;
@@ -274,12 +306,20 @@ export function PracticeSession({
     queue().enqueue(queued);
     const snapshot = await flush();
     const synced = snapshot.synced.find((result) => result.idempotencyKey === idempotencyKey);
-    if (synced) {
+    if (synced && showResumeCelebration(synced)) {
       setFeedback(synced);
       setPersistedView(synced.clientView);
       setSavedOffline(false);
+      setHeldNotice(false);
+    } else if (synced) {
+      setFeedback(null);
+      setPersistedView(synced.clientView);
+      setQuietResume(true);
+      setSavedOffline(false);
+      setHeldNotice(false);
     } else if (snapshot.pending.some((entry) => entry.idempotencyKey === idempotencyKey)) {
-      setSavedOffline(true);
+      setSavedOffline(!snapshot.held);
+      setHeldNotice(Boolean(snapshot.held));
       setFeedback(null);
     }
     setBusy(false);
@@ -291,8 +331,23 @@ export function PracticeSession({
         <CardHeader>
           <CardTitle className="font-heading text-2xl">Practice is closed</CardTitle>
         </CardHeader>
-        <CardContent>
+        <CardContent className="grid gap-3">
           <p className="text-sm leading-6">{error}</p>
+          {heldNotice ? (
+            <p data-testid="pause-hold-kid" role="status" className="text-sm leading-6">
+              {interfaceCopy("pause.hold.kid")}
+            </p>
+          ) : null}
+          {quietResume ? (
+            <p
+              data-testid="quiet-resume"
+              data-presentation="quiet"
+              role="status"
+              className="text-sm leading-6"
+            >
+              {interfaceCopy("pause.resume.quiet")}
+            </p>
+          ) : null}
         </CardContent>
       </Card>
     );
@@ -316,6 +371,21 @@ export function PracticeSession({
           ? `${pending} ${pending === 1 ? "answer is" : "answers are"} waiting to sync.`
           : "Saved answers sync with the practice record."}
       </p>
+      {quietResume ? (
+        <p
+          data-testid="quiet-resume"
+          data-presentation="quiet"
+          role="status"
+          className="text-sm leading-6"
+        >
+          {interfaceCopy("pause.resume.quiet")}
+        </p>
+      ) : null}
+      {heldNotice && !quietResume ? (
+        <p data-testid="pause-hold-kid" role="status" className="text-sm leading-6">
+          {interfaceCopy("pause.hold.kid")}
+        </p>
+      ) : null}
       {persistedView && !boundary && !feedback ? (
         <p data-testid="persisted-band" data-band-label={persistedView.bandLabel}>
           {persistedView.bandLabel}
@@ -378,13 +448,24 @@ export function PracticeSession({
         <CardContent>
           {feedback ? (
             <div data-testid="practice-feedback" className="grid gap-4" aria-live="polite">
-              <p
-                className="text-sm text-muted-foreground"
-                data-celebration-tier={feedback.clientView.celebrationTier}
-              >
-                {tierLine(feedback.clientView.celebrationTier)}
-                {feedback.replayed ? " This try was already saved." : ""}
-              </p>
+              {showResumeCelebration(feedback) ? (
+                <p
+                  className="text-sm text-muted-foreground"
+                  data-celebration-tier={feedback.clientView.celebrationTier}
+                >
+                  {tierLine(feedback.clientView.celebrationTier)}
+                  {feedback.replayed ? " This try was already saved." : ""}
+                </p>
+              ) : (
+                <p
+                  data-testid="quiet-resume"
+                  data-presentation="quiet"
+                  role="status"
+                  className="text-sm leading-6"
+                >
+                  {interfaceCopy("pause.resume.quiet")}
+                </p>
+              )}
               <dl className="grid gap-3">
                 {FOUR_BEAT_KEYS.map((key) => (
                   <div key={key} className="grid gap-1">
