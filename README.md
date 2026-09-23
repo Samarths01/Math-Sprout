@@ -31,7 +31,13 @@ npm start
 1. Create a parent account or log in. Children do not sign up.
 2. Add a child. Timezone is required on the profile. If you leave the default selected, the server stores your timezone, or `America/Los_Angeles` when yours is unset.
 3. Grant, pause, or revoke consent from the parent home. Only `granted` allows practice.
-4. Open the child home. The Start practice button is visible and disabled until consent is granted. Clicking it while blocked does not start a session. This version never starts a session.
+4. Open the child home. The Start practice button is visible and disabled until consent is granted. Clicking it while blocked does not start a session. This version never starts a session. The child home uses the guardian session. Children do not have their own login.
+
+## Deferred
+
+Revoke sets consent to `revoked` and blocks practice. It does not delete the guardian, the child, or the consent row.
+
+Account, child, and consent delete hooks are not in this slice. A later version should stop any in-flight practice, then cascade or anonymize records once practice ledgers exist. Do not describe this slice as consent-complete, or as a production revoke-and-delete flow.
 
 ## API
 
