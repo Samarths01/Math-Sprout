@@ -26,12 +26,14 @@ import { readAttemptLog } from "@/lib/attempt-log";
 import { MasteryEstimator } from "@/lib/mastery";
 import { POLICY_VERSION } from "@/lib/policy";
 import {
+  consentQueueReason,
   createAttemptQueue,
   memoryQueueStore,
   storageQueueStore,
   type QueuedAttempt,
   type SyncPost,
 } from "@/lib/offline-queue";
+import { queueDisposition } from "@/lib/practice-gate";
 
 const cleanups: Array<() => void> = [];
 const T0 = Date.parse("2026-01-01T00:00:00.000Z");
@@ -510,7 +512,7 @@ describe("offline queue reconcile", () => {
     expect(count(db, "xp_events")).toBe(1);
   });
 
-  it("holds a pending flush while consent is paused and syncs after grant", async () => {
+  it("drops a paused queue and does not celebrate it after grant", async () => {
     const db = tempDb();
     const { guardian, child, session } = grantedChild(db);
     const queue = createAttemptQueue(memoryQueueStore());
@@ -525,37 +527,56 @@ describe("offline queue reconcile", () => {
     };
     queue.enqueue(attempt);
     setConsent(db, guardian.id, child.id, "pause");
+    expect(queueDisposition("paused")).toBe("drop");
+    expect(
+      consentQueueReason({
+        queueDisposition: "hold",
+        error: "Practice is paused. A parent can grant consent again from the parent home.",
+      }),
+    ).toBe("drop");
 
     const post = async (queued: QueuedAttempt): Promise<SyncPost> => {
       try {
         return { ok: true, result: submitAttempt(db, guardian.id, child.id, queued) };
       } catch (error) {
-        if (error instanceof DomainError && error.queueDisposition) {
-          return { ok: false, reason: error.queueDisposition, message: error.message };
+        if (error instanceof DomainError && error.status === 403) {
+          return {
+            ok: false,
+            reason: consentQueueReason({
+              error: error.message,
+              queueDisposition: error.queueDisposition,
+            }),
+            message: error.message,
+          };
         }
         throw error;
       }
     };
 
-    const held = await queue.reconcile(post);
-    expect(held.pending.map((item) => item.idempotencyKey)).toEqual(["paused-key-0001"]);
-    expect(held.pending[0]?.answer).toBe("42");
-    expect(held.dropped).toEqual([]);
-    expect(held.synced).toEqual([]);
+    const dropped = await queue.reconcile(post);
+    expect(dropped.pending).toEqual([]);
+    expect(dropped.synced).toEqual([]);
+    expect(dropped.dropped).toEqual([
+      {
+        idempotencyKey: "paused-key-0001",
+        childId: child.id,
+        sessionId: session.sessionId,
+      },
+    ]);
     expect(count(db, "attempts")).toBe(0);
     expect(count(db, "xp_events")).toBe(0);
     expect(count(db, "qualifying_events")).toBe(0);
 
     setConsent(db, guardian.id, child.id, "grant");
-    const flushed = await queue.reconcile(post);
-    expect(flushed.pending).toEqual([]);
-    expect(flushed.synced).toHaveLength(1);
-    expect(flushed.synced[0]?.eventIds.length).toBeGreaterThan(0);
-    expect(count(db, "attempts")).toBe(1);
-    expect(count(db, "qualifying_events")).toBeGreaterThan(0);
+    queue.enqueue(attempt);
+    const resumed = await queue.reconcile(post);
+    expect(resumed.pending).toEqual([]);
+    expect(resumed.synced).toEqual([]);
+    expect(count(db, "attempts")).toBe(0);
+    expect(count(db, "xp_events")).toBe(0);
   });
 
-  it("drops and anonymizes a pending try when consent is revoked", async () => {
+  it("drops a revoked queue and never syncs it", async () => {
     const db = tempDb();
     const { guardian, child, session } = grantedChild(db);
     const queue = createAttemptQueue(memoryQueueStore());

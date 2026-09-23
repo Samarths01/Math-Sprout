@@ -48,16 +48,17 @@ export function emptyQueue(): QueueData {
   return { version: 1, pending: [], blocked: [], dropped: [], synced: [] };
 }
 
-export function consentQueueReason(body: {
-  error?: string;
-  queueDisposition?: unknown;
-} | null): "hold" | "drop" {
-  const message = body?.error ?? "";
-  if (body?.queueDisposition === "hold") return "hold";
-  if (body?.queueDisposition === "drop") return "drop";
-  if (/paused/i.test(message)) return "hold";
-  if (/revoked|blocked until a parent grants/i.test(message)) return "drop";
-  return "hold";
+/**
+ * Kid-path disposition for a 403. Always drop.
+ * Pause-hold is not locked. Honoring hold here would keep a silent queue and
+ * celebrate it on resume. Hold needs a later lock: parent-visible waiting and
+ * a quiet resume, with no celebration.
+ */
+export function consentQueueReason(
+  body: { error?: string; queueDisposition?: unknown } | null,
+): "drop" {
+  void body;
+  return "drop";
 }
 
 function anonymize(attempt: QueuedAttempt): DroppedAttempt {
@@ -178,6 +179,8 @@ export function createAttemptQueue(store: QueueStore) {
           continue;
         }
         if (!posted.ok && posted.reason === "hold") {
+          // Not used by the kid client. Do not wire pause to hold without a
+          // parent-visible waiting state and a quiet resume.
           stillPending.push(attempt);
           stopped = true;
           continue;

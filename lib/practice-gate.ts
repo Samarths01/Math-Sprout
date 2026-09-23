@@ -22,14 +22,14 @@ export const PRACTICE_BLOCK_REASONS = {
 
 /**
  * Device-queue disposition when practice is not allowed.
- * Pause holds the flush. Revoke and missing consent drop it.
- * Granted consent has no disposition because the flush may sync.
+ * Revoke, pause, and missing consent drop the pending queue. Nothing syncs.
+ * Pause-hold is not locked: a hold that celebrates on resume is not shipped.
+ * Granted consent has no disposition because a live try may sync.
  */
 export function queueDisposition(
   status: ConsentViewStatus,
 ): "hold" | "drop" | null {
   if (status === "granted") return null;
-  if (status === "paused") return "hold";
   return "drop";
 }
 
