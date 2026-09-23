@@ -99,10 +99,11 @@ function expectClientViewSealed(result: AttemptResult) {
   expect(["none", "quietXp", "full"]).toContain(result.clientView.celebrationTier);
   expect(typeof result.clientView.showConceptChip).toBe("boolean");
   const view = JSON.stringify(result.clientView);
-  expect(view).not.toMatch(/score|confidence|percent/i);
+  expect(view).not.toMatch(/%|score|confidence|percent|judgment|judgement/i);
   expect(result.clientView).not.toHaveProperty("score");
   expect(result.clientView).not.toHaveProperty("confidence");
   expect(result.clientView).not.toHaveProperty("scorePercent");
+  expect(result.clientView).not.toHaveProperty("judgment");
   expect(result).not.toHaveProperty("score");
   expect(result).not.toHaveProperty("confidence");
   expect(result).not.toHaveProperty("policyVersion");
@@ -240,7 +241,7 @@ describe("integrity gates", () => {
     expect(count(db, "xp_events")).toBe(0);
   });
 
-  it("puts only the spam window into quietXp", () => {
+  it("puts only identical spam into quietXp", () => {
     const db = tempDb();
     const { guardian, child, session } = grantedChild(db);
     const results: AttemptResult[] = [];
@@ -271,6 +272,11 @@ describe("integrity gates", () => {
     expect(["quietXp", "none"]).toContain(spam?.celebrationTier);
     expect(spam?.celebrationTier).not.toBe("full");
     expectClientViewSealed(spam as AttemptResult);
+    const answers = db
+      .prepare(`SELECT answer FROM attempts WHERE child_id = ?`)
+      .all(child.id) as Array<{ answer: string }>;
+    expect(answers.length).toBe(SPAM_MAX_IN_WINDOW + 1);
+    expect(new Set(answers.map((row) => row.answer))).toEqual(new Set(["42"]));
   });
 
   it("limits every review lane to quietXp or none", () => {

@@ -5,7 +5,14 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import Database from "better-sqlite3";
 import type DatabaseT from "better-sqlite3";
-import { XP_AMOUNT, type CelebrationTier } from "@/lib/attempt-contract";
+import {
+  SPAM_MAX_IN_WINDOW,
+  TOO_FAST_MS,
+  XP_AMOUNT,
+  type AttemptResult,
+  type CelebrationTier,
+} from "@/lib/attempt-contract";
+import { readAttemptLog } from "@/lib/attempt-log";
 import { startPracticeSession, submitAttempt, type SubmitAttemptInput } from "@/lib/attempts";
 import { choosePracticeLane, endPracticeSession } from "@/lib/boundary";
 import { openDatabase } from "@/lib/db";
@@ -90,6 +97,50 @@ function countKind(db: DatabaseT.Database, kind: string, childId?: string): numb
 
 function xpCount(db: DatabaseT.Database): number {
   return (db.prepare(`SELECT COUNT(*) AS count FROM xp_events`).get() as { count: number }).count;
+}
+
+function fullXpCount(db: DatabaseT.Database): number {
+  return (
+    db.prepare(`SELECT COUNT(*) AS count FROM xp_events WHERE amount = ?`).get(XP_AMOUNT.full) as {
+      count: number;
+    }
+  ).count;
+}
+
+function expectClientViewSealed(result: AttemptResult) {
+  expect(Object.keys(result.clientView).sort()).toEqual([
+    "bandLabel",
+    "celebrationTier",
+    "showConceptChip",
+  ]);
+  expect(JSON.stringify(result.clientView)).not.toMatch(
+    /%|score|confidence|percent|judgment|judgement/i,
+  );
+  expect(result.clientView).not.toHaveProperty("score");
+  expect(result.clientView).not.toHaveProperty("confidence");
+  expect(result).not.toHaveProperty("policyVersion");
+}
+
+function expectPolicyStamp(
+  db: DatabaseT.Database,
+  attemptId: string,
+  sessionId: string,
+) {
+  const attempt = db
+    .prepare(`SELECT policy_version FROM attempts WHERE id = ?`)
+    .get(attemptId) as { policy_version: string };
+  const session = db
+    .prepare(`SELECT policy_version FROM practice_sessions WHERE id = ?`)
+    .get(sessionId) as { policy_version: string };
+  expect(attempt.policy_version).toBe(POLICY_VERSION);
+  expect(session.policy_version).toBe("rules-v0");
+  const log = readAttemptLog(db, attemptId);
+  expect(log.policyVersion).toBe("rules-v0");
+  expect(JSON.stringify(log.clientView)).not.toMatch(
+    /%|score|confidence|percent|judgment|judgement/i,
+  );
+  expect(log).not.toHaveProperty("score");
+  expect(log).not.toHaveProperty("confidence");
 }
 
 const honest = (tier: "quietXp" | "full"): PlannedMint => ({
@@ -638,5 +689,134 @@ describe("slice 3 economy upgrade", () => {
       .get("attempt-old") as { policy_version: string };
     expect(session.policy_version).toBe(POLICY_VERSION);
     expect(attempt.policy_version).toBe("rules-v0");
+  });
+});
+
+describe("architecture §21 integrity gate", () => {
+  const when = "2026-06-15T18:00:00.000Z";
+
+  function rewardSnapshot(db: DatabaseT.Database, childId: string) {
+    return {
+      fullXp: fullXpCount(db),
+      badge: countKind(db, "BadgeMilestone", childId),
+      piece: countKind(db, "BuildPieceUnlock", childId),
+    };
+  }
+
+  it("does not mint full XP, a badge, or a build piece for an empty answer", () => {
+    const db = tempDb();
+    const { guardian, child, session } = grantedChild(db);
+    const result = submitAttempt(
+      db,
+      guardian.id,
+      child.id,
+      tryInput(session.sessionId, when, { answer: "   " }),
+      { now: when },
+    );
+    expect(result.flags).toContain("empty_answer");
+    expect(result.lane).toBe("review");
+    expect(result.celebrationTier).toBe("none");
+    expect(result.xpAmount).toBe(0);
+    expect(result.eventIds).toEqual([]);
+    expectClientViewSealed(result);
+    expectPolicyStamp(db, result.attemptId, session.sessionId);
+    expect(rewardSnapshot(db, child.id)).toEqual({ fullXp: 0, badge: 0, piece: 0 });
+  });
+
+  it("does not mint full XP, a badge, or a build piece for a too-fast answer", () => {
+    const db = tempDb();
+    const { guardian, child, session } = grantedChild(db);
+    const submittedAt = when;
+    const shownAt = new Date(Date.parse(submittedAt) - (TOO_FAST_MS - 1)).toISOString();
+    const result = submitAttempt(
+      db,
+      guardian.id,
+      child.id,
+      tryInput(session.sessionId, submittedAt, { answer: "42", shownAt, submittedAt }),
+      { now: when },
+    );
+    expect(result.correct).toBe(true);
+    expect(result.flags).toContain("too_fast");
+    expect(result.celebrationTier).toBe("none");
+    expect(result.xpAmount).toBe(0);
+    expectClientViewSealed(result);
+    expectPolicyStamp(db, result.attemptId, session.sessionId);
+    expect(rewardSnapshot(db, child.id)).toEqual({ fullXp: 0, badge: 0, piece: 0 });
+  });
+
+  it("does not mint a second full XP, badge, or build piece for a duplicate key", () => {
+    const db = tempDb();
+    const { guardian, child, session } = grantedChild(db);
+    const firstInput = tryInput(session.sessionId, when, { idempotencyKey: "dup-key-0001" });
+    const first = submitAttempt(db, guardian.id, child.id, firstInput, { now: when });
+    expect(first.celebrationTier).toBe("full");
+    expect(first.xpAmount).toBe(XP_AMOUNT.full);
+    const before = rewardSnapshot(db, child.id);
+    expect(before.fullXp).toBe(1);
+    const replay = submitAttempt(
+      db,
+      guardian.id,
+      child.id,
+      { ...firstInput, answer: "0" },
+      { now: when },
+    );
+    expect(replay.replayed).toBe(true);
+    expect(replay.attemptId).toBe(first.attemptId);
+    expect(replay.eventIds).toEqual(first.eventIds);
+    expect(replay.clientView).toEqual(first.clientView);
+    expectClientViewSealed(replay);
+    expectPolicyStamp(db, replay.attemptId, session.sessionId);
+    expect(rewardSnapshot(db, child.id)).toEqual(before);
+    expect(xpCount(db)).toBe(1);
+  });
+
+  it("keeps identical spam off full XP, badges, and build pieces", () => {
+    const db = tempDb();
+    const { guardian, child, session } = grantedChild(db);
+    const base = Date.parse(when);
+    const answer = "42";
+    for (let index = 0; index < SPAM_MAX_IN_WINDOW; index += 1) {
+      const submittedAt = new Date(base + index * 1_000).toISOString();
+      submitAttempt(
+        db,
+        guardian.id,
+        child.id,
+        tryInput(session.sessionId, submittedAt, {
+          idempotencyKey: `spam-pace-${index}`,
+          answer,
+        }),
+        { now: submittedAt },
+      );
+    }
+    const before = rewardSnapshot(db, child.id);
+    const submittedAt = new Date(base + SPAM_MAX_IN_WINDOW * 1_000).toISOString();
+    const spam = submitAttempt(
+      db,
+      guardian.id,
+      child.id,
+      tryInput(session.sessionId, submittedAt, {
+        idempotencyKey: "spam-identical",
+        answer,
+      }),
+      { now: submittedAt },
+    );
+    expect(spam.flags).toContain("spam_window");
+    expect(spam.lane).toBe("review");
+    expect(spam.celebrationTier).toBe("quietXp");
+    expect(spam.xpAmount).toBe(XP_AMOUNT.quietXp);
+    expect(spam.celebrationTier).not.toBe("full");
+    expectClientViewSealed(spam);
+    expectPolicyStamp(db, spam.attemptId, session.sessionId);
+    expect(rewardSnapshot(db, child.id)).toEqual(before);
+    const kinds = db
+      .prepare(
+        `SELECT kind FROM qualifying_events WHERE attempt_id = ? ORDER BY kind ASC`,
+      )
+      .all(spam.attemptId) as Array<{ kind: string }>;
+    expect(kinds.map((row) => row.kind)).toEqual(["HonestAttempt"]);
+    const answers = db
+      .prepare(`SELECT answer FROM attempts WHERE child_id = ?`)
+      .all(child.id) as Array<{ answer: string }>;
+    expect(new Set(answers.map((row) => row.answer))).toEqual(new Set([answer]));
   });
 });

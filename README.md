@@ -12,6 +12,8 @@ A qualifying practice day is an honest Recommended or Challenge try on the child
 
 Each attempt and practice session stores `policy_version` (`rules-v0`). The server attempt log carries that same string with the concept, item, difficulty, lanes, correctness, latency, integrity flags, session id, and idempotency key. Kids still receive only `ClientView`. Production scoring stays the rules `MasteryEstimator`. The eval harness that baselines later policies against `rules-v0` is Signal-owned and offline. This app does not run a second scorer.
 
+Architecture §21 supersedes treating those integrity fixtures as a Slice 2 exit. Full XP, a badge, and a build piece are not minted for an empty answer, a too-fast answer, a duplicate key, or identical spam. `ClientView` stays free of a score percent, confidence, and judgment copy.
+
 ## Run locally
 
 Requirements: Node.js 22 and npm.
@@ -128,4 +130,4 @@ Slice 4 adds:
 - review sessions per week are capped at the mint, and review cannot mint LevelUpSlight, a badge, or a build piece
 - QualifyingPracticeDay heats the streak from the child timezone: Hot, Warm, Ember, Dormant
 - attempts and sessions store `policy_version` `rules-v0`, and the server attempt log includes it
-- empty, too-fast, duplicate-key, and identical-spam responses keep `ClientView` free of score and confidence
+- empty, too-fast, duplicate-key, and identical-spam responses keep `ClientView` free of score, confidence, and judgment copy, and do not mint full XP, a badge, or a build piece
