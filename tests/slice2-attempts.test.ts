@@ -21,7 +21,7 @@ import {
 import { openDatabase } from "@/lib/db";
 import { DomainError, createChild, createGuardian, setConsent } from "@/lib/domain";
 import { ITEM_CATALOG } from "@/lib/item-catalog";
-import { assertBankMatchesCatalog, gradeAnswer } from "@/lib/item-bank";
+import { assertBankMatchesCatalog, gradeAnswer, oneFocusForItem, tryNextForItem } from "@/lib/item-bank";
 import { readAttemptLog } from "@/lib/attempt-log";
 import { MasteryEstimator } from "@/lib/mastery";
 import { POLICY_VERSION } from "@/lib/policy";
@@ -29,6 +29,7 @@ import {
   consentQueueReason,
   createAttemptQueue,
   memoryQueueStore,
+  OFFLINE_QUEUE_CAP,
   storageQueueStore,
   type QueuedAttempt,
   type SyncPost,
@@ -724,6 +725,62 @@ describe("offline queue reconcile", () => {
     expect(count(db, "attempts")).toBe(0);
   });
 
+  it("caps the unsynced queue so offline tries stay short", () => {
+    const queue = createAttemptQueue(memoryQueueStore());
+    const attempts = Array.from({ length: OFFLINE_QUEUE_CAP }, (_, index) => ({
+      idempotencyKey: `cap-key-${index}0001`,
+      childId: "child",
+      sessionId: "session",
+      itemId: "ops-g2-add",
+      answer: "42",
+      shownAt: at(0),
+      submittedAt: at(2_000 + index),
+    }));
+    for (const attempt of attempts) queue.enqueue(attempt);
+    const overflow = queue.enqueue({
+      ...attempts[0],
+      idempotencyKey: "cap-key-overflow",
+      submittedAt: at(9_000),
+    });
+    expect(overflow.capped).toBe(true);
+    expect(overflow.pending).toHaveLength(OFFLINE_QUEUE_CAP);
+    expect(overflow.pending.map((item) => item.idempotencyKey)).not.toContain("cap-key-overflow");
+    const again = queue.enqueue(attempts[0]);
+    expect(again.capped).toBeUndefined();
+    expect(again.pending).toHaveLength(OFFLINE_QUEUE_CAP);
+  });
+
+  it("does not promote a band while the attempt is only queued", async () => {
+    const db = tempDb();
+    const { guardian, child, session } = grantedChild(db);
+    const queue = createAttemptQueue(memoryQueueStore());
+    const attempt = {
+      ...input(session.sessionId, { idempotencyKey: "offline-band-0001" }),
+      childId: child.id,
+    };
+    queue.enqueue(attempt);
+    const offline = await queue.reconcile(async () => ({ ok: false as const, reason: "offline" }));
+    expect(offline.pending).toHaveLength(1);
+    expect(count(db, "attempts")).toBe(0);
+    expect(count(db, "xp_events")).toBe(0);
+    const bands = db.prepare(`SELECT COUNT(*) AS count FROM learner_skill_state`).get() as {
+      count: number;
+    };
+    expect(bands.count).toBe(0);
+
+    const synced = await queue.reconcile(async (queued) => ({
+      ok: true as const,
+      result: submitAttempt(db, guardian.id, child.id, queued),
+    }));
+    expect(synced.pending).toEqual([]);
+    expect(synced.synced[0]?.clientView.bandLabel).toBe("Getting it");
+    expect(synced.synced[0]?.celebrationTier).toBe(synced.synced[0]?.clientView.celebrationTier);
+    const stored = db
+      .prepare(`SELECT band_label FROM learner_skill_state WHERE child_id = ?`)
+      .get(child.id) as { band_label: string };
+    expect(stored.band_label).toBe("Getting it");
+  });
+
   it("reloads a persisted queue from storage", () => {
     const saved = new Map<string, string>();
     const storage = {
@@ -806,6 +863,28 @@ describe("attempt response shape", () => {
       celebrationTier: "full",
     });
     expect(result.celebrationTier).toBe(result.clientView.celebrationTier);
+    expect(result.oneFocus).toBe(oneFocusForItem("ops-g2-add"));
+    expect(result.oneFocus).toBe("Watch regrouping when the ones pass nine.");
+    expect(result.oneFocus).not.toMatch(/keep reading|look again|great job|awesome/i);
+    const missed = submitAttempt(
+      db,
+      guardian.id,
+      child.id,
+      input(session.sessionId, { idempotencyKey: "focus-miss-0001", answer: "41" }),
+    );
+    expect(missed.oneFocus).toBe(result.oneFocus);
+    expect(missed.tryNext).toBe(tryNextForItem("ops-g2-add"));
+    const blank = submitAttempt(
+      db,
+      guardian.id,
+      child.id,
+      input(session.sessionId, { idempotencyKey: "focus-blank-001", answer: "" }),
+    );
+    expect(blank.oneFocus).toBe("Write an answer before you check.");
+    for (const item of ITEM_CATALOG) {
+      expect(item).not.toHaveProperty("misconception");
+      expect(item).not.toHaveProperty("oneFocus");
+    }
     expect(result.clientView).not.toHaveProperty("softState");
     expect(result.clientView).not.toHaveProperty("line");
     const dumped = JSON.stringify(result);

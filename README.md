@@ -45,7 +45,7 @@ npm start
 3. Grant, pause, or revoke consent from the parent home. Only `granted` allows practice.
 4. Open the child home. The Start practice button stays disabled until consent is granted. Missing, paused, and revoked consent do not start a session.
 5. With consent granted, start practice. Answer a problem from the operations or fractions pack. The response names what went well, one focus, what to try next, and a lock-in. It does not show a score or a confidence number.
-6. If the connection drops while consent is still granted, the answer stays in a device queue and syncs with the same idempotency key when the connection returns. A replay returns the original attempt, the original `ClientView`, and the original event ids. That response is the saved try, not an empty 409. Pause holds that queue where a parent can see it, and a later grant credits the tries without a celebration. A hold the parent cannot see is dropped. Revoke drops the queue and does not sync it. This offline queue is not claimed as a kid-reachable ship.
+6. If the connection drops while consent is still granted, the answer stays in a device queue and syncs with the same idempotency key when the connection returns. A replay returns the original attempt, the original `ClientView`, and the original event ids. That response is the saved try, not an empty 409. The unsynced queue holds at most 3 tries. Another problem waits until those sync. Pause holds that queue where a parent can see it, and a later grant credits the tries without a celebration. A hold the parent cannot see is dropped. Revoke drops the queue and does not sync it. This offline queue is not claimed as a kid-reachable ship. The four beats include a server-assembled `oneFocus` from the item's misconception tag.
 7. End the session to pick the next lane. Recommended is the usual choice. Challenge is a step up. Review shows up when a skill is still short of Got it, with how many review sets are left this week. A little harder is offered only after Recommended or Challenge evidence supports it. After the weekly review cap, that choice does not mint a sprout.
 8. On the child home, the sprout shows the flame and the one active build. Open spots fill when the bus mints a badge, a slightly harder step, or a hot-streak piece. Badges are listed on their own screen. If the flame is an ember, practice today is the way to bring it back.
 
@@ -53,7 +53,7 @@ npm start
 
 Revoke sets consent to `revoked` and stops practice immediately. The pending device queue is dropped and is not synced. Ending that session does not run: the phase stays `practicing`, and LevelUpSlight is not minted. Revoke does not delete the guardian, the child, the consent row, or the attempt ledger. Pause sets consent to `paused` and blocks new practice. Pause holds the pending queue. The parent home shows that waiting state. Granting practice credits the held tries and does not present a celebration for them. A silent hold is dropped. Drop-on-pause is not the disposition, because that visible hold ships.
 
-Account, child, and consent delete/export cascades are not in this slice. COPPA verification method is not in this slice. Signal's additive oneFocus-from-metadata and the offline queue cap are not in this slice. Do not describe this slice as consent-complete, as a production revoke-and-delete flow, or as a cleared kid-reachable mint beyond the replay, queue-disposition, and `rules-v0` fixtures.
+Account, child, and consent delete/export cascades are not in this slice. COPPA verification method is not in this slice. Architecture §24's offline guard in this slice is the queue cap of 3. Frozen next-item selection is not this seam. Do not describe this slice as consent-complete, as a production revoke-and-delete flow, or as a cleared kid-reachable mint beyond the replay, queue-disposition, and `rules-v0` fixtures.
 
 ## API
 
@@ -116,6 +116,8 @@ The image listens on `43123` and stores the database at `/data/math-sprout.sqlit
 - a blocked practice click does not start a session
 - the same idempotency key replays the original attempt, `ClientView`, and event ids, including after the session has ended, and that HTTP response is 200 rather than an empty 409
 - pause holds a pending device queue only after a parent-visible receipt, credits those tries on grant, and marks the resume quiet so it does not celebrate
+- an unsynced queue stops at 3 tries, and a queued try does not promote a skill band until the server commits it
+- `oneFocus` on a scored try is assembled from that item's misconception tag
 - a hold without that visible receipt is dropped
 - revoke drops that queue, clears any pause receipt, and does not mint, including if the same key is enqueued again
 - an empty answer, a too-fast answer, and a spam window stay in the review lane (`quietXp` or `none`)

@@ -28,6 +28,7 @@ export const INTERFACE_COPY = {
   "pause.hold.kid":
     "This try is waiting. A parent can see it. It saves quietly when practice is allowed again.",
   "pause.resume.quiet": "Saved. The tries that waited did not get a celebration.",
+  "offline.cap": "These answers need to sync before the next problem.",
 } as const;
 
 export type InterfaceCopyKey = keyof typeof INTERFACE_COPY;

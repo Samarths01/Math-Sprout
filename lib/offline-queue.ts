@@ -46,9 +46,17 @@ export type QueueSnapshot = QueueData & {
   quietCredits?: number;
   /** Tries kept on this pass because a parent-visible pause hold was recorded. */
   held?: number;
+  /** A new try was refused because the unsynced queue is already at the cap. */
+  capped?: boolean;
 };
 
 const SYNCED_CAP = 40;
+
+/**
+ * Short unsynced queue. Architecture §24 offline guard (a).
+ * Further tries wait until these sync. Frozen next-item is not this seam.
+ */
+export const OFFLINE_QUEUE_CAP = 3;
 
 export function emptyQueue(): QueueData {
   return { version: 1, pending: [], blocked: [], dropped: [], synced: [] };
@@ -155,7 +163,12 @@ export function createAttemptQueue(store: QueueStore) {
         data.synced.some((item) => item.idempotencyKey === attempt.idempotencyKey) ||
         data.blocked.some((item) => item.idempotencyKey === attempt.idempotencyKey) ||
         data.dropped.some((item) => item.idempotencyKey === attempt.idempotencyKey);
-      if (!known) data.pending.push(attempt);
+      if (!known) {
+        if (data.pending.length >= OFFLINE_QUEUE_CAP) {
+          return { ...store.load(), capped: true };
+        }
+        data.pending.push(attempt);
+      }
       store.save(remember(data));
       return store.load();
     },

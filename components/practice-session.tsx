@@ -10,6 +10,7 @@ import { interfaceCopy } from "@/lib/interface-copy";
 import {
   consentQueueReason,
   createAttemptQueue,
+  OFFLINE_QUEUE_CAP,
   storageQueueStore,
   type QueuedAttempt,
   type SyncPost,
@@ -292,6 +293,11 @@ export function PracticeSession({
     if (!sessionId || !item || !shownAt || busy) return;
     setBusy(true);
     setError(null);
+    if (queue().snapshot().pending.length >= OFFLINE_QUEUE_CAP) {
+      setPending(OFFLINE_QUEUE_CAP);
+      setBusy(false);
+      return;
+    }
     const idempotencyKey = crypto.randomUUID();
     const queued: QueuedAttempt = {
       idempotencyKey,
@@ -359,6 +365,7 @@ export function PracticeSession({
 
   const nextFromFeedback = feedback?.nextItem;
   const localNext = itemAt(ITEM_CATALOG.findIndex((entry) => entry.id === item.id) + 1);
+  const offlineCapped = pending >= OFFLINE_QUEUE_CAP;
 
   return (
     <div className="grid gap-4">
@@ -501,6 +508,11 @@ export function PracticeSession({
                   Saved on this device. It will check in when you reconnect.
                 </p>
               ) : null}
+              {offlineCapped ? (
+                <p data-testid="offline-queue-cap" data-cap={OFFLINE_QUEUE_CAP} role="status" className="text-sm leading-6">
+                  {interfaceCopy("offline.cap")}
+                </p>
+              ) : null}
               <div className="grid gap-2">
                 <Label htmlFor="practice-answer">Your answer</Label>
                 <Input
@@ -516,12 +528,12 @@ export function PracticeSession({
               <Button
                 type="submit"
                 data-testid="practice-submit"
-                disabled={busy}
+                disabled={busy || offlineCapped}
                 className="h-12 text-base"
               >
                 {busy ? "Checking…" : "Check answer"}
               </Button>
-              {savedOffline ? (
+              {savedOffline && !offlineCapped ? (
                 <Button
                   type="button"
                   variant="outline"
