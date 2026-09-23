@@ -199,9 +199,12 @@ describe("consent gating", () => {
       .all() as Array<{ name: string }>;
     expect(tables.map((table) => table.name).sort()).toEqual([
       "attempts",
+      "boundary_events",
       "children",
       "consents",
       "guardians",
+      "learner_progress",
+      "learner_skill_state",
       "practice_sessions",
       "sessions",
       "xp_events",

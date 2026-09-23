@@ -20,7 +20,16 @@ import {
   gradeAnswer,
   knownItem,
 } from "@/lib/item-bank";
-import { MasteryEstimator } from "@/lib/mastery";
+import {
+  ensureLearnerProgress,
+  evidenceForSkill,
+  firstReviewSkill,
+  readPracticeSession,
+  readSkillClientView,
+  saveSkillState,
+  startIndexForLane,
+} from "@/lib/learner-state";
+import { MasteryEstimator, type PracticeLane } from "@/lib/mastery";
 import { practiceGate } from "@/lib/practice-gate";
 
 const KEY_PATTERN = /^[A-Za-z0-9_-]{8,80}$/;
@@ -37,6 +46,9 @@ export type SubmitAttemptInput = {
 export type PracticeSessionStart = {
   sessionId: string;
   item: AttemptResult["nextItem"];
+  lane: PracticeLane;
+  atBoundary: boolean;
+  clientView: ClientView | null;
 };
 
 type AttemptRow = {
@@ -111,19 +123,30 @@ export function parseSubmitAttempt(
   };
 }
 
-function requireSession(
-  db: Database.Database,
-  childId: string,
-  sessionId: string,
-): { id: string; item_index: number } {
-  const row = db
-    .prepare(
-      `SELECT id, item_index FROM practice_sessions
-       WHERE id = ? AND child_id = ? AND status = 'active'`,
-    )
-    .get(sessionId, childId) as { id: string; item_index: number } | undefined;
+function requireSession(db: Database.Database, childId: string, sessionId: string) {
+  const row = readPracticeSession(db, childId, sessionId);
   if (!row) throw new DomainError("Practice session not found.", 404);
   return row;
+}
+
+function presentSession(
+  db: Database.Database,
+  childId: string,
+  session: {
+    id: string;
+    item_index: number;
+    practice_lane: PracticeLane;
+    phase: "practicing" | "boundary" | "closed";
+  },
+): PracticeSessionStart {
+  const item = itemAt(session.item_index);
+  return {
+    sessionId: session.id,
+    item,
+    lane: session.practice_lane,
+    atBoundary: session.phase === "boundary",
+    clientView: readSkillClientView(db, childId, item.skill),
+  };
 }
 
 function findAttempt(
@@ -222,24 +245,51 @@ export function startPracticeSession(
     );
   }
   const open = db.transaction(() => {
-    const existing = db
+    const practicing = db
       .prepare(
-        `SELECT id, item_index FROM practice_sessions
-         WHERE child_id = ? AND status = 'active'
+        `SELECT id FROM practice_sessions
+         WHERE child_id = ? AND status = 'active' AND phase = 'practicing'
          ORDER BY started_at ASC
          LIMIT 1`,
       )
-      .get(childId) as { id: string; item_index: number } | undefined;
-    if (existing) return existing;
+      .get(childId) as { id: string } | undefined;
+    if (practicing) {
+      const session = readPracticeSession(db, childId, practicing.id);
+      if (!session) throw new DomainError("Practice session not found.", 404);
+      return session;
+    }
+    const pendingBoundary = db
+      .prepare(
+        `SELECT id FROM practice_sessions
+         WHERE child_id = ? AND status = 'active' AND phase = 'boundary'
+         ORDER BY started_at ASC
+         LIMIT 1`,
+      )
+      .get(childId) as { id: string } | undefined;
+    if (pendingBoundary) {
+      const session = readPracticeSession(db, childId, pendingBoundary.id);
+      if (!session) throw new DomainError("Practice session not found.", 404);
+      return session;
+    }
+    const progress = ensureLearnerProgress(db, childId);
+    const reviewSkill =
+      progress.nextLane === "review" ? firstReviewSkill(db, childId) : null;
+    const itemIndex = startIndexForLane(
+      progress.nextLane,
+      progress.difficultyStep,
+      reviewSkill,
+    );
     const sessionId = randomUUID();
     db.prepare(
-      `INSERT INTO practice_sessions (id, child_id, status, item_index, started_at)
-       VALUES (?, ?, 'active', 0, ?)`,
-    ).run(sessionId, childId, nowIso());
-    return { id: sessionId, item_index: 0 };
+      `INSERT INTO practice_sessions (
+         id, child_id, status, item_index, started_at, practice_lane, phase
+       ) VALUES (?, ?, 'active', ?, ?, ?, 'practicing')`,
+    ).run(sessionId, childId, itemIndex, nowIso(), progress.nextLane);
+    const created = readPracticeSession(db, childId, sessionId);
+    if (!created) throw new DomainError("Practice session was not saved.", 500);
+    return created;
   });
-  const session = open.immediate();
-  return { sessionId: session.id, item: itemAt(session.item_index) };
+  return presentSession(db, childId, open.immediate());
 }
 
 export function submitAttempt(
@@ -281,6 +331,12 @@ export function submitAttempt(
       );
     }
     const session = requireSession(db, childId, sessionId);
+    if (session.phase !== "practicing") {
+      throw new DomainError(
+        "This session has ended. Choose a lane to start the next one.",
+        409,
+      );
+    }
     const item = catalogItem(itemId);
     if (!item) throw new DomainError("That problem is not in this practice pack.", 400);
 
@@ -317,7 +373,10 @@ export function submitAttempt(
       correct,
       lane: celebration.lane,
       celebrationTier: celebration.celebrationTier,
+      practiceLane: session.practice_lane,
+      history: evidenceForSkill(db, childId, item.skill),
     });
+    saveSkillState(db, childId, item.skill, clientView);
     const attemptId = randomUUID();
     const createdAt = nowIso();
     db.prepare(
