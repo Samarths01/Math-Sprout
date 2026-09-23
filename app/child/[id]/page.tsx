@@ -14,6 +14,7 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import { readCompanion } from "@/lib/companion";
+import { accruedXp } from "@/lib/fuel";
 import { getDb } from "@/lib/db";
 import { DomainError, getChildHome } from "@/lib/domain";
 import { currentGuardian } from "@/lib/http";
@@ -38,6 +39,7 @@ export default async function ChildHomePage({
     throw error;
   }
   const companion = readCompanion(getDb(), home.child.id, new Date().toISOString());
+  const sproutGlance = accruedXp(getDb(), home.child.id) > 0;
 
   return (
     <Shell width="narrow">
@@ -59,6 +61,7 @@ export default async function ChildHomePage({
           childId={home.child.id}
           practiceAllowed={home.practiceAllowed}
           companion={companion}
+          sproutGlance={sproutGlance}
         />
         <Card>
           <CardHeader>

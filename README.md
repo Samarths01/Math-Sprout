@@ -14,7 +14,7 @@ Slice 5 projects that bus onto the child companion. One BuildGoal is active. Its
 
 Slice 6 is the parent one-breath card on that home. It reads today's committed practice: minutes, the focus concept, and whether that concept's band moved. It does not list answers or link to them.
 
-Slice 7 keeps kid-visible fuel on that same bus. The flame the child sees is a replay of `QualifyingPracticeDay` rows, so a streak column cannot heat on its own. XP stays an accrue-only credit pointed at a qualifying event: nothing subtracts it, and a try that does not mint an event does not add any. Build pieces stay the Slice 5 projection of `BadgeMilestone`, `BuildPieceUnlock`, and `LevelUpSlight`. Practice can animate a sprout, a hotter flame, or a new piece only from those events. Review still mints a quiet sprout at most. The parent one-breath card stays minutes, focus, and band.
+Slice 7 keeps kid-visible fuel on that same bus, and only the rules estimator mints it. The flame on the child home is a replay of `QualifyingPracticeDay` rows, so a streak column cannot heat on its own. XP stays an accrue-only credit pointed at a qualifying event: time on the app, a soft score, and a try that does not mint an event do not add any, and nothing subtracts it. Build pieces stay the Slice 5 projection. The home shows those three as a glance beside Practice. Practice itself stays the destination: a saved try may show one quiet sprout line, and a full try may add one piece beat. Review shows the quiet line only. Ember copy invites a careful try without scolding a cool-down. A live companion reaction inside practice is deferred so it does not become a second destination. The parent one-breath card stays minutes, focus, and band.
 
 Each attempt and practice session stores `policy_version` (`rules-v0`). The server attempt log carries that same string with the concept, item, difficulty, lanes, correctness, latency, integrity flags, session id, and idempotency key. Kids still receive only `ClientView`. Production scoring stays the rules `MasteryEstimator`. The eval harness that baselines later policies against `rules-v0` is Signal-owned and offline. This app does not run a second scorer.
 
@@ -51,7 +51,7 @@ npm start
 5. With consent granted, start practice. Answer a problem from the operations or fractions pack. The response names what went well, one focus, what to try next, and a lock-in. One focus is the server string from that item's misconception tag, shown as sent. A queued try does not move the skill band until the server commits it. The response does not show a score or a confidence number.
 6. If the connection drops while consent is still granted, the answer stays in a device queue and syncs with the same idempotency key when the connection returns. A replay returns the original attempt, the original `ClientView`, and the original event ids. That response is the saved try, not an empty 409. The unsynced queue holds at most 3 tries. At that cap the child stays on the same problem, and the parent home shows a sync-limit note. That note does not say practice is paused. Pause holds a pending queue for a parent-visible wait and a quiet resume. Pause does not drop the queue. Revoke drops the queue and does not sync it. This offline queue is not claimed as a kid-reachable ship. One focus is the server string assembled from that item's misconception tag, shown as sent.
 7. End the session to pick the next lane. Recommended is the usual choice. Challenge is a step up. Review shows up when a skill is still short of Got it, with how many review sets are left this week. A little harder is offered only after Recommended or Challenge evidence supports it. After the weekly review cap, that choice does not mint a sprout.
-8. On the child home, the sprout shows the flame and the one active build. Open spots fill when the bus mints a badge, a slightly harder step, or a hot-streak piece. Badges are listed on their own screen. If the flame is an ember, practice today is the way to bring it back. During practice, the flame, a sprout, and a new piece update only after a qualifying event is saved. A try that does not qualify leaves them still.
+8. On the child home, the sprout shows the flame and the one active build. Open spots fill when the bus mints a badge, a slightly harder step, or a hot-streak piece. When a careful try has earned a sprout, the home says so in one line, without a count. Practice stays the button under that glance. Badges are listed on their own screen. If the flame is an ember, the copy invites a careful try and does not scold the cool-down. During practice, a saved try shows one quiet line. A blank try says there is no sprout. A review try stays on that quiet line.
 
 ## Deferred
 
@@ -168,7 +168,9 @@ Slice 6 adds:
 Slice 7 adds:
 
 - volume that never mints a qualifying event leaves heat, XP, and build pieces unchanged
+- a longer answering time does not mint more XP than the rules credit for that tier
 - review can mint a quiet sprout and cannot mint a badge, a build piece, or LevelUpSlight
 - a qualifying day credits heat and XP once; the next qualifying day credits the hot-streak piece once; a replay does not mint again
 - the kid flame is the `QualifyingPracticeDay` projection, including when the stored streak column disagrees
-- the parent one-breath card still has no XP
+- practice shows one fail-closed toast; a quiet tier never adds a piece beat; a full tier adds at most one
+- the child home glance is not a second practice destination, and the parent one-breath card still has no XP

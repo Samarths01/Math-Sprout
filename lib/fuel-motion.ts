@@ -1,17 +1,14 @@
 import type { CelebrationTier } from "@/lib/attempt-contract";
-import type { StreakState } from "@/lib/streak";
 
 /**
- * How the kid surface may move. Minting requires a QualifyingEvent on this try.
- * Waning is the flame cooling from the last qualifying day. It is not a reward.
+ * One mint moment for the practice try that just saved.
+ * The tier has to be backed by a QualifyingEvent credit in the same response.
+ * Review (quietXp) is a reduced toast only. A full try may add one piece beat.
+ * A replay does not play the piece beat again.
  */
-export type FuelMotionKind = "mint" | "wane" | "steady";
-
-const HEAT_RANK: Record<StreakState, number> = {
-  dormant: 0,
-  ember: 1,
-  warm: 2,
-  hot: 3,
+export type MintToastPlan = {
+  xp: "full" | "quietXp" | "none";
+  pieceEventId: string | null;
 };
 
 export function xpBacked(input: {
@@ -26,33 +23,16 @@ export function xpBacked(input: {
   );
 }
 
-/**
- * Practice may animate fuel only from QualifyingEvent-derived state.
- * A hotter flame without a heat event stays steady. A first paint does not mint.
- */
-export function fuelMotion(input: {
-  previousHeat: StreakState | null;
-  nextHeat: StreakState | null;
-  previousPieceIds: readonly string[] | null;
-  nextPieceIds: readonly string[];
+export function mintToast(input: {
+  tier: CelebrationTier;
   credit: number;
-  heatEventId: string | null;
+  eventCount: number;
+  pieceEventIds: readonly string[];
   replayed: boolean;
-}): { heat: FuelMotionKind; pieces: FuelMotionKind; xp: FuelMotionKind } {
-  const xp: FuelMotionKind = input.credit > 0 && !input.replayed ? "mint" : "steady";
-
-  let heat: FuelMotionKind = "steady";
-  if (input.previousHeat && input.nextHeat) {
-    const delta = HEAT_RANK[input.nextHeat] - HEAT_RANK[input.previousHeat];
-    if (delta > 0 && input.heatEventId && !input.replayed) heat = "mint";
-    else if (delta < 0) heat = "wane";
-  }
-
-  let pieces: FuelMotionKind = "steady";
-  if (input.previousPieceIds) {
-    const before = new Set(input.previousPieceIds);
-    if (input.nextPieceIds.some((id) => !before.has(id))) pieces = "mint";
-  }
-
-  return { heat, pieces, xp };
+}): MintToastPlan {
+  if (!xpBacked(input)) return { xp: "none", pieceEventId: null };
+  if (input.tier !== "full") return { xp: "quietXp", pieceEventId: null };
+  const pieceEventId =
+    !input.replayed && input.pieceEventIds.length > 0 ? input.pieceEventIds[0] : null;
+  return { xp: "full", pieceEventId };
 }

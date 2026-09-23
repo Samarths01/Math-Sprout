@@ -10,15 +10,16 @@ import { XP_AMOUNT } from "@/lib/attempt-contract";
 import { startPracticeSession, submitAttempt, type SubmitAttemptInput } from "@/lib/attempts";
 import { choosePracticeLane, endPracticeSession } from "@/lib/boundary";
 import { CompanionState } from "@/components/companion-state";
-import { FuelMoment } from "@/components/fuel-moment";
+import { MintToast } from "@/components/mint-toast";
 import { ParentOneBreathCard } from "@/components/parent-one-breath";
 import { readCompanion } from "@/lib/companion";
 import { openDatabase } from "@/lib/db";
 import { createChild, createGuardian, setConsent } from "@/lib/domain";
 import { accruedXp, projectHeat, readKidFuel } from "@/lib/fuel";
-import { fuelMotion, xpBacked } from "@/lib/fuel-motion";
+import { mintToast, xpBacked } from "@/lib/fuel-motion";
 import { MasteryEstimator } from "@/lib/mastery";
 import { PARENT_SUMMARY_KEYS, readParentSummary } from "@/lib/parent-summary";
+import { INTERFACE_COPY } from "@/lib/interface-copy";
 import { POLICY_VERSION } from "@/lib/policy";
 import { queueDisposition } from "@/lib/practice-gate";
 import { assertCelebrationBacked, readStreak } from "@/lib/qualifying-bus";
@@ -305,112 +306,139 @@ describe("qualifying-event fuel", () => {
     const html = renderToStaticMarkup(createElement(ParentOneBreathCard, { summary }));
     expect(html).not.toMatch(/xp|sprout|streak|piece/i);
     const parentPage = readFileSync(new URL("../app/parent/page.tsx", import.meta.url), "utf8");
+    expect(parentPage).not.toContain("MintToast");
     expect(parentPage).not.toContain("FuelMoment");
     expect(parentPage).not.toContain("xpAmount");
+    expect(parentPage).not.toContain("sproutGlance");
+  });
+
+  it("does not pay XP for time on the app", () => {
+    const db = tempDb();
+    const { guardian, child, session } = grantedChild(db);
+    const slow = submitAttempt(
+      db,
+      guardian.id,
+      child.id,
+      tryInput(session.sessionId, WHEN, {
+        idempotencyKey: "slow-try-0001",
+        shownAt: new Date(Date.parse(WHEN) - 12 * 60_000).toISOString(),
+      }),
+      { now: WHEN },
+    );
+    const quick = submitAttempt(
+      db,
+      guardian.id,
+      child.id,
+      tryInput(session.sessionId, WHEN, { idempotencyKey: "quick-try-001" }),
+      { now: WHEN },
+    );
+    expect(slow.fuel.credit).toBe(XP_AMOUNT.full);
+    expect(quick.fuel.credit).toBe(XP_AMOUNT.full);
+    expect(slow.xpAmount).toBe(quick.xpAmount);
+    expect(accruedXp(db, child.id)).toBe(XP_AMOUNT.full * 2);
+    expect(slow).not.toHaveProperty("score");
+    expect(quick.clientView).not.toHaveProperty("confidence");
+    const summary = readParentSummary(db, guardian.id, child.id, WHEN);
+    expect(summary.minutes).toBeGreaterThan(0);
+    expect(JSON.stringify(summary)).not.toMatch(/xp|credit/i);
   });
 });
 
-describe("fuel motion", () => {
-  it("mints only from a qualifying event and wanes without one", () => {
+describe("mint toast and home glance", () => {
+  it("fail-closes the toast and keeps review to a quiet line", () => {
     expect(xpBacked({ credit: 0, eventCount: 0, tier: "full" })).toBe(false);
     expect(xpBacked({ credit: XP_AMOUNT.full, eventCount: 1, tier: "full" })).toBe(true);
     expect(
-      fuelMotion({
-        previousHeat: "dormant",
-        nextHeat: "warm",
-        previousPieceIds: [],
-        nextPieceIds: [],
-        credit: XP_AMOUNT.full,
-        heatEventId: "day-1",
+      mintToast({
+        tier: "full",
+        credit: 0,
+        eventCount: 0,
+        pieceEventIds: ["piece-1", "piece-2"],
         replayed: false,
       }),
-    ).toEqual({ heat: "mint", pieces: "steady", xp: "mint" });
+    ).toEqual({ xp: "none", pieceEventId: null });
     expect(
-      fuelMotion({
-        previousHeat: "warm",
-        nextHeat: "hot",
-        previousPieceIds: [],
-        nextPieceIds: ["piece-1"],
-        credit: 0,
-        heatEventId: null,
-        replayed: false,
-      }).heat,
-    ).toBe("steady");
-    expect(
-      fuelMotion({
-        previousHeat: "warm",
-        nextHeat: "ember",
-        previousPieceIds: ["piece-1"],
-        nextPieceIds: ["piece-1"],
-        credit: 0,
-        heatEventId: null,
+      mintToast({
+        tier: "quietXp",
+        credit: XP_AMOUNT.quietXp,
+        eventCount: 1,
+        pieceEventIds: ["piece-1"],
         replayed: false,
       }),
-    ).toEqual({ heat: "wane", pieces: "steady", xp: "steady" });
+    ).toEqual({ xp: "quietXp", pieceEventId: null });
     expect(
-      fuelMotion({
-        previousHeat: "dormant",
-        nextHeat: "warm",
-        previousPieceIds: null,
-        nextPieceIds: ["piece-1"],
+      mintToast({
+        tier: "full",
         credit: XP_AMOUNT.full,
-        heatEventId: "day-1",
+        eventCount: 2,
+        pieceEventIds: ["piece-1", "piece-2"],
+        replayed: false,
+      }),
+    ).toEqual({ xp: "full", pieceEventId: "piece-1" });
+    expect(
+      mintToast({
+        tier: "full",
+        credit: XP_AMOUNT.full,
+        eventCount: 2,
+        pieceEventIds: ["piece-1"],
         replayed: true,
-      }),
-    ).toEqual({ heat: "steady", pieces: "steady", xp: "steady" });
+      }).pieceEventId,
+    ).toBeNull();
 
     const empty = projectHeat([], "America/Los_Angeles", WHEN);
     expect(empty.state).toBe("dormant");
-    const warmed = projectHeat(
-      [{ id: "qe-day", localDay: "2026-06-15" }],
-      "America/Los_Angeles",
-      WHEN,
-    );
-    expect(warmed).toMatchObject({ state: "warm", sourceEventId: "qe-day", lastQualifyingDay: "2026-06-15" });
+    expect(INTERFACE_COPY["streak.ember.recover"]).toMatch(/practice today/i);
+    expect(INTERFACE_COPY["streak.ember"]).not.toMatch(/shame|fail|lost|goes out/i);
+    expect(INTERFACE_COPY["streak.ember.recover.detail"]).not.toMatch(/shame|goes out|fail/i);
   });
 
-  it("renders heat, a backed sprout, and a piece from qualifying-event props", () => {
-    const html = renderToStaticMarkup(
-      createElement(FuelMoment, {
-        heat: {
-          streakState: "ember",
-          copyKey: "streak.ember",
-          sourceEventId: "qe-day",
-          motion: "wane",
-        },
+  it("renders one toast and a home glance that does not replace practice", () => {
+    const closed = renderToStaticMarkup(
+      createElement(MintToast, {
+        tier: "full",
+        credit: 0,
+        eventCount: 0,
         pieceEventIds: ["piece-1"],
-        pieceMotion: "mint",
-        xp: { credit: 0, eventCount: 0, tier: "full", replayed: false },
+        replayed: false,
       }),
     );
-    expect(html).toContain('data-fuel-source="qualifying-event"');
-    expect(html).toContain('data-testid="fuel-heat"');
-    expect(html).toContain('data-waning="true"');
-    expect(html).toContain('data-heat-motion="wane"');
-    expect(html).toContain('data-heat-event-id="qe-day"');
-    expect(html).toContain('data-xp-backed="false"');
-    expect(html).toContain("No sprout this time.");
-    expect(html).not.toContain("A sprout for that try.");
-    expect(html).toContain('data-testid="fuel-piece"');
-    expect(html).toContain("A piece of the build is in place.");
-    expect(html).not.toMatch(/xpAmount|score|confidence/i);
+    expect(closed).toContain("No sprout this time.");
+    expect(closed).not.toContain("A sprout for that try.");
+    expect(closed).not.toContain("A piece of the build is in place.");
+    expect(closed).not.toContain("<a ");
 
-    const sproutOnly = renderToStaticMarkup(
-      createElement(FuelMoment, {
-        heat: null,
-        pieceEventIds: [],
-        pieceMotion: "steady",
-        xp: { credit: XP_AMOUNT.full, eventCount: 1, tier: "full", replayed: false },
+    const full = renderToStaticMarkup(
+      createElement(MintToast, {
+        tier: "full",
+        credit: XP_AMOUNT.full,
+        eventCount: 1,
+        pieceEventIds: ["piece-1", "piece-2"],
+        replayed: false,
       }),
     );
-    expect(sproutOnly).toContain("A sprout for that try.");
-    expect(sproutOnly).toContain('data-xp-backed="true"');
-    expect(sproutOnly).not.toContain('data-testid="fuel-heat"');
+    expect(full).toContain("A sprout for that try.");
+    expect(full.match(/A piece of the build is in place/g)).toHaveLength(1);
+    expect(full).toContain('data-piece-id="piece-1"');
+    expect(full).not.toContain("piece-2");
+    expect(full).not.toMatch(/xpAmount|score|confidence/i);
+
+    const review = renderToStaticMarkup(
+      createElement(MintToast, {
+        tier: "quietXp",
+        credit: XP_AMOUNT.quietXp,
+        eventCount: 1,
+        pieceEventIds: ["piece-1"],
+        replayed: false,
+      }),
+    );
+    expect(review).toContain("A quiet sprout. This one stays small.");
+    expect(review).not.toContain("A piece of the build is in place.");
 
     const home = renderToStaticMarkup(
       createElement(CompanionState, {
         childId: "child-1",
         practiceAllowed: true,
+        sproutGlance: true,
         companion: {
           build: {
             active: {
@@ -425,20 +453,38 @@ describe("fuel motion", () => {
           },
           badges: [],
           streak: {
-            state: "dormant",
-            copyKey: "streak.dormant",
-            emberExpiresAt: null,
-            lastQualifyingDay: null,
-            sourceEventId: null,
-            recovery: null,
+            state: "ember",
+            copyKey: "streak.ember",
+            emberExpiresAt: "2026-06-17T07:00:00.000Z",
+            lastQualifyingDay: "2026-06-15",
+            sourceEventId: "qe-day",
+            recovery: {
+              copyKey: "streak.ember.recover",
+              detailKey: "streak.ember.recover.detail",
+            },
           },
         },
       }),
     );
-    expect(home).toContain('data-fuel-source="qualifying-event"');
     expect(home).toContain('data-fuel="heat"');
     expect(home).toContain('data-fuel="pieces"');
-    expect(home).not.toMatch(/xpAmount|confidence|score/i);
+    expect(home).toContain('data-testid="sprout-glance"');
+    expect(home).toContain("A sprout grew from a careful try.");
+    expect(home).not.toMatch(/\b\d+\s*xp\b|xpAmount|confidence|score/i);
+    expect(home).toContain("There is no rush.");
+    const glance = home.slice(home.indexOf('data-testid="sprout-glance"'));
+    expect(glance.slice(0, glance.indexOf("</p>"))).not.toContain("href");
+
+    const childPage = readFileSync(new URL("../app/child/[id]/page.tsx", import.meta.url), "utf8");
+    const practicePage = readFileSync(
+      new URL("../components/practice-session.tsx", import.meta.url),
+      "utf8",
+    );
+    expect(childPage.indexOf("<CompanionState")).toBeLessThan(childPage.indexOf("<PracticeCta"));
+    expect(childPage).toContain("<PracticeCta");
+    expect(practicePage).not.toContain("/companion");
+    expect(practicePage).not.toContain("FuelMoment");
+    expect(practicePage).toContain("MintToast");
   });
 });
 
