@@ -271,6 +271,46 @@ describe("child route ownership", () => {
     );
     expect(attempt.status).toBe(200);
     expect(count("attempts")).toBe(1);
+    const firstBody = attempt.body as {
+      attemptId?: string;
+      eventIds?: string[];
+      clientView?: { bandLabel?: string; showConceptChip?: boolean; celebrationTier?: string };
+    } | null;
+    expect(firstBody?.attemptId).toBeTruthy();
+    expect(firstBody?.eventIds?.length).toBeGreaterThan(0);
+    expect(Object.keys(firstBody?.clientView ?? {}).sort()).toEqual([
+      "bandLabel",
+      "celebrationTier",
+      "showConceptChip",
+    ]);
+
+    const replay = await call(
+      submitAttemptRoute,
+      `http://127.0.0.1/api/children/${childId}/attempts`,
+      { id: childId },
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          idempotencyKey: "owner-key-0001",
+          sessionId,
+          itemId: "ops-g2-add",
+          answer: "0",
+          shownAt: "2026-04-01T00:00:00.000Z",
+          submittedAt: "2026-04-01T00:00:09.000Z",
+        }),
+      },
+    );
+    expect(replay.status).toBe(200);
+    expect(replay.status).not.toBe(409);
+    expect(replay.body).toMatchObject({
+      attemptId: firstBody?.attemptId,
+      replayed: true,
+      eventIds: firstBody?.eventIds,
+      clientView: firstBody?.clientView,
+    });
+    expect(JSON.stringify(replay.body).length).toBeGreaterThan(2);
+    expect(count("attempts")).toBe(1);
 
     const ended = await call(
       endSessionRoute,
@@ -280,6 +320,30 @@ describe("child route ownership", () => {
     );
     expect(ended.status).toBe(200);
     expect((ended.body as { defaultLane?: string } | null)?.defaultLane).toBe("recommended");
+
+    const replayAfterEnd = await call(
+      submitAttemptRoute,
+      `http://127.0.0.1/api/children/${childId}/attempts`,
+      { id: childId },
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          idempotencyKey: "owner-key-0001",
+          sessionId,
+          itemId: "ops-g2-add",
+          answer: "0",
+          shownAt: "2026-04-01T00:00:00.000Z",
+          submittedAt: "2026-04-01T00:00:09.000Z",
+        }),
+      },
+    );
+    expect(replayAfterEnd.status).toBe(200);
+    expect(replayAfterEnd.body).toMatchObject({
+      attemptId: firstBody?.attemptId,
+      replayed: true,
+      eventIds: firstBody?.eventIds,
+    });
 
     const chosen = await call(
       chooseLaneRoute,

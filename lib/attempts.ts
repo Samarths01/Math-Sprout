@@ -11,7 +11,7 @@ import {
   SPAM_WINDOW_MS,
 } from "@/lib/attempt-contract";
 import { buildFourBeat } from "@/lib/beats";
-import { DomainError, getChild } from "@/lib/domain";
+import { consentDenied, DomainError, getChild } from "@/lib/domain";
 import { catalogItem, itemAt, ITEM_CATALOG } from "@/lib/item-catalog";
 import {
   assertBankMatchesCatalog,
@@ -253,12 +253,7 @@ export function startPracticeSession(
 ): PracticeSessionStart {
   const child = getChild(db, guardianId, childId);
   const gate = practiceGate(child.consentStatus);
-  if (!gate.practiceAllowed) {
-    throw new DomainError(
-      gate.reason ?? "Practice is blocked until a parent grants consent.",
-      403,
-    );
-  }
+  if (!gate.practiceAllowed) throw consentDenied(child.consentStatus);
   const open = db.transaction(() => {
     observeStreak(db, childId, readChildTimeZone(db, childId), nowIso());
     const practicing = db
@@ -342,12 +337,7 @@ export function submitAttempt(
 
     const child = getChild(db, guardianId, childId);
     const gate = practiceGate(child.consentStatus);
-    if (!gate.practiceAllowed) {
-      throw new DomainError(
-        gate.reason ?? "Practice is blocked until a parent grants consent.",
-        403,
-      );
-    }
+    if (!gate.practiceAllowed) throw consentDenied(child.consentStatus);
     const session = requireSession(db, childId, sessionId);
     if (session.phase !== "practicing") {
       throw new DomainError(

@@ -7,6 +7,7 @@ import { FOUR_BEAT_KEYS } from "@/lib/attempt-contract";
 import type { BoundaryOptions, PracticeLane } from "@/lib/mastery";
 import { itemAt, ITEM_CATALOG } from "@/lib/item-catalog";
 import {
+  consentQueueReason,
   createAttemptQueue,
   storageQueueStore,
   type QueuedAttempt,
@@ -62,12 +63,13 @@ async function postAttempt(childId: string, attempt: QueuedAttempt): Promise<Syn
       body: JSON.stringify(attempt),
     });
     const body = (await response.json().catch(() => null)) as
-      | (AttemptResult & { error?: string })
+      | (AttemptResult & { error?: string; queueDisposition?: unknown })
       | null;
     if (response.status === 403) {
+      const reason = consentQueueReason(body);
       return {
         ok: false,
-        reason: "blocked",
+        reason,
         message: body?.error ?? "Practice is blocked.",
       };
     }

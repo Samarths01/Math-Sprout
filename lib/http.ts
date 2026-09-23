@@ -88,7 +88,13 @@ export async function requireGuardian(): Promise<Guardian> {
 
 export function errorResponse(error: unknown): NextResponse {
   if (error instanceof DomainError) {
-    return NextResponse.json({ error: error.message }, { status: error.status });
+    return NextResponse.json(
+      {
+        error: error.message,
+        ...(error.queueDisposition ? { queueDisposition: error.queueDisposition } : {}),
+      },
+      { status: error.status },
+    );
   }
   console.error(error);
   return NextResponse.json({ error: "Something went wrong." }, { status: 500 });

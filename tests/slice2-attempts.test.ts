@@ -56,7 +56,10 @@ function at(offsetMs: number): string {
   return new Date(T0 + offsetMs).toISOString();
 }
 
-function count(db: Database.Database, table: "attempts" | "xp_events" | "practice_sessions") {
+function count(
+  db: Database.Database,
+  table: "attempts" | "xp_events" | "practice_sessions" | "qualifying_events",
+) {
   return (
     db.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get() as { count: number }
   ).count;
@@ -507,7 +510,52 @@ describe("offline queue reconcile", () => {
     expect(count(db, "xp_events")).toBe(1);
   });
 
-  it("does not mint when a queued attempt syncs after consent is revoked", async () => {
+  it("holds a pending flush while consent is paused and syncs after grant", async () => {
+    const db = tempDb();
+    const { guardian, child, session } = grantedChild(db);
+    const queue = createAttemptQueue(memoryQueueStore());
+    const attempt = {
+      idempotencyKey: "paused-key-0001",
+      childId: child.id,
+      sessionId: session.sessionId,
+      itemId: "ops-g2-add",
+      answer: "42",
+      shownAt: at(0),
+      submittedAt: at(2_000),
+    };
+    queue.enqueue(attempt);
+    setConsent(db, guardian.id, child.id, "pause");
+
+    const post = async (queued: QueuedAttempt): Promise<SyncPost> => {
+      try {
+        return { ok: true, result: submitAttempt(db, guardian.id, child.id, queued) };
+      } catch (error) {
+        if (error instanceof DomainError && error.queueDisposition) {
+          return { ok: false, reason: error.queueDisposition, message: error.message };
+        }
+        throw error;
+      }
+    };
+
+    const held = await queue.reconcile(post);
+    expect(held.pending.map((item) => item.idempotencyKey)).toEqual(["paused-key-0001"]);
+    expect(held.pending[0]?.answer).toBe("42");
+    expect(held.dropped).toEqual([]);
+    expect(held.synced).toEqual([]);
+    expect(count(db, "attempts")).toBe(0);
+    expect(count(db, "xp_events")).toBe(0);
+    expect(count(db, "qualifying_events")).toBe(0);
+
+    setConsent(db, guardian.id, child.id, "grant");
+    const flushed = await queue.reconcile(post);
+    expect(flushed.pending).toEqual([]);
+    expect(flushed.synced).toHaveLength(1);
+    expect(flushed.synced[0]?.eventIds.length).toBeGreaterThan(0);
+    expect(count(db, "attempts")).toBe(1);
+    expect(count(db, "qualifying_events")).toBeGreaterThan(0);
+  });
+
+  it("drops and anonymizes a pending try when consent is revoked", async () => {
     const db = tempDb();
     const { guardian, child, session } = grantedChild(db);
     const queue = createAttemptQueue(memoryQueueStore());
@@ -521,7 +569,7 @@ describe("offline queue reconcile", () => {
       submittedAt: at(2_000),
     };
     queue.enqueue(attempt);
-    setConsent(db, guardian.id, child.id, "pause");
+    setConsent(db, guardian.id, child.id, "revoke");
 
     const snapshot = await queue.reconcile(async (queued) => {
       try {
@@ -530,19 +578,43 @@ describe("offline queue reconcile", () => {
           result: submitAttempt(db, guardian.id, child.id, queued),
         };
       } catch (error) {
-        if (error instanceof DomainError && error.status === 403) {
-          return { ok: false as const, reason: "blocked" as const, message: error.message };
+        if (error instanceof DomainError && error.queueDisposition) {
+          return { ok: false as const, reason: error.queueDisposition, message: error.message };
         }
         throw error;
       }
     });
 
-    expect(snapshot.pending).toHaveLength(0);
-    expect(snapshot.blocked).toHaveLength(1);
-    expect(snapshot.synced).toHaveLength(0);
+    expect(snapshot.pending).toEqual([]);
+    expect(snapshot.synced).toEqual([]);
+    expect(snapshot.dropped).toEqual([
+      {
+        idempotencyKey: "revoked-key-001",
+        childId: child.id,
+        sessionId: session.sessionId,
+      },
+    ]);
+    expect(Object.keys(snapshot.dropped[0] ?? {}).sort()).toEqual([
+      "childId",
+      "idempotencyKey",
+      "sessionId",
+    ]);
+    expect(snapshot.dropped[0]).not.toHaveProperty("answer");
+    expect(snapshot.dropped[0]).not.toHaveProperty("itemId");
     expect(count(db, "attempts")).toBe(0);
     expect(count(db, "xp_events")).toBe(0);
+    expect(count(db, "qualifying_events")).toBe(0);
     expect(queue.rewards()).toEqual({ eventIds: [], totalXp: 0 });
+
+    setConsent(db, guardian.id, child.id, "grant");
+    queue.enqueue(attempt);
+    const again = await queue.reconcile(async (queued) => ({
+      ok: true as const,
+      result: submitAttempt(db, guardian.id, child.id, queued),
+    }));
+    expect(again.pending).toEqual([]);
+    expect(again.synced).toEqual([]);
+    expect(count(db, "attempts")).toBe(0);
   });
 
   it("reloads a persisted queue from storage", () => {
@@ -567,6 +639,42 @@ describe("offline queue reconcile", () => {
     expect(restored.snapshot().pending.map((item) => item.idempotencyKey)).toEqual([
       "stored-key-0001",
     ]);
+  });
+
+  it("strips a stored answer when a blocked queue is reloaded", () => {
+    const saved = new Map<string, string>();
+    const storage = {
+      getItem: (key: string) => saved.get(key) ?? null,
+      setItem: (key: string, value: string) => {
+        saved.set(key, value);
+      },
+    };
+    saved.set(
+      "math-sprout-queue",
+      JSON.stringify({
+        version: 1,
+        pending: [],
+        blocked: [
+          {
+            idempotencyKey: "old-blocked-001",
+            childId: "child",
+            sessionId: "session",
+            itemId: "ops-g2-add",
+            answer: "42",
+            shownAt: at(0),
+            submittedAt: at(2_000),
+            message: "Practice is blocked because a parent revoked consent.",
+          },
+        ],
+        synced: [],
+      }),
+    );
+    const restored = createAttemptQueue(storageQueueStore(storage, "math-sprout-queue"));
+    expect(restored.snapshot().pending).toEqual([]);
+    expect(restored.snapshot().dropped).toEqual([
+      { idempotencyKey: "old-blocked-001", childId: "child", sessionId: "session" },
+    ]);
+    expect(JSON.stringify(restored.snapshot().dropped)).not.toContain("42");
   });
 });
 

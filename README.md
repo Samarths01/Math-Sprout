@@ -45,15 +45,15 @@ npm start
 3. Grant, pause, or revoke consent from the parent home. Only `granted` allows practice.
 4. Open the child home. The Start practice button stays disabled until consent is granted. Missing, paused, and revoked consent do not start a session.
 5. With consent granted, start practice. Answer a problem from the operations or fractions pack. The response names what went well, one focus, what to try next, and a lock-in. It does not show a score or a confidence number.
-6. If the connection drops, the answer stays in a device queue and syncs with the same idempotency key when the connection returns. A replay returns the original attempt and the original event ids.
+6. If the connection drops, the answer stays in a device queue and syncs with the same idempotency key when the connection returns. A replay returns the original attempt, the original `ClientView`, and the original event ids. That response is the saved try, not an empty 409. Pause holds the queue until consent is granted again. Revoke drops the queued try and does not keep the answer. Neither pause nor revoke syncs a new learning event.
 7. End the session to pick the next lane. Recommended is the usual choice. Challenge is a step up. Review shows up when a skill is still short of Got it, with how many review sets are left this week. A little harder is offered only after Recommended or Challenge evidence supports it. After the weekly review cap, that choice does not mint a sprout.
 8. On the child home, the sprout shows the flame and the one active build. Open spots fill when the bus mints a badge, a slightly harder step, or a hot-streak piece. Badges are listed on their own screen. If the flame is an ember, practice today is the way to bring it back.
 
 ## Deferred
 
-Revoke sets consent to `revoked` and blocks practice. It does not delete the guardian, the child, or the consent row.
+Revoke sets consent to `revoked` and blocks practice. A pending device queue is dropped and the stored answer is removed. It does not delete the guardian, the child, the consent row, or the attempt ledger. Pause sets consent to `paused`, blocks new practice, and leaves the device queue in place until a parent grants consent again.
 
-Account, child, and consent delete hooks are not in this slice. A later version should stop any in-flight practice, then cascade or anonymize the attempt ledger. Do not describe this slice as consent-complete, or as a production revoke-and-delete flow.
+Account, child, and consent delete/export cascades are not in this slice. COPPA verification method is not in this slice. Do not describe this slice as consent-complete, as a production revoke-and-delete flow, or as a cleared kid-reachable mint beyond the replay, queue-disposition, and `rules-v0` fixtures.
 
 ## API
 
@@ -73,7 +73,7 @@ The same Next.js server is the API. All child and consent routes require the par
 | GET | `/api/children/:id/companion` | The child companion: one active BuildGoal, badge rows, and the streak surface. Pieces and badges are projections of QualifyingEvent ids. Ember includes a recovery copy key. This payload has no XP total, score, or confidence. |
 | GET | `/api/parent/home` | Guardian plus children and consent. |
 | POST | `/api/children/:id/sessions` | Start or resume a practice session when consent is `granted`. Returns `{ sessionId, item, lane, atBoundary, clientView }`. `clientView` is the stored chip for that problem's skill, when one exists. |
-| POST | `/api/children/:id/attempts` | Submit one try. Body: `idempotencyKey`, `sessionId`, `itemId`, `answer`, `shownAt`, `submittedAt`. The same key returns the original attempt, four-beat copy, `clientView`, and `eventIds`. `eventIds` are the QualifyingEvent ids for that try. XP credits point at those ids. |
+| POST | `/api/children/:id/attempts` | Submit one try. Body: `idempotencyKey`, `sessionId`, `itemId`, `answer`, `shownAt`, `submittedAt`. The same key returns HTTP 200 with the original attempt, four-beat copy, `clientView`, and `eventIds`. It does not return an empty 409. A new try while consent is paused returns 403 with `queueDisposition: "hold"`. A new try while consent is revoked or missing returns 403 with `queueDisposition: "drop"`. `eventIds` are the QualifyingEvent ids for that try. XP credits point at those ids. |
 | POST | `/api/children/:id/sessions/:sessionId/end` | Reach the session boundary after at least one try. Returns lane options, including `reviewSessionsRemaining`. A second call does not fire LevelUpSlight again. |
 | GET | `/api/children/:id/sessions/:sessionId/boundary-options` | Lane menu. Only while the session is at that boundary. Recommended is the default. Review shows skills still going and review sets left this week. |
 | POST | `/api/children/:id/sessions/:sessionId/lane` | Body: `{ "lane": "recommended" \| "challenge" \| "review" }`. Closes the session and stores the lane for the next one. |
@@ -112,7 +112,9 @@ The image listens on `43123` and stores the database at `/data/math-sprout.sqlit
 - practice is allowed only when consent is `granted`
 - pause and revoke block practice again
 - a blocked practice click does not start a session
-- the same idempotency key replays the original attempt and event ids
+- the same idempotency key replays the original attempt, `ClientView`, and event ids, including after the session has ended, and that HTTP response is 200 rather than an empty 409
+- pause holds a pending device queue and does not mint; grant flushes it
+- revoke drops that queue, removes the answer, and does not mint, including if the same key is enqueued again
 - an empty answer, a too-fast answer, and a spam window stay in the review lane (`quietXp` or `none`)
 - the celebration tier and the XP mint commit together
 - an offline queue reconciles through that same key
