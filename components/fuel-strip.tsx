@@ -1,112 +1,64 @@
-import type { ReactNode } from "react";
-import type { ProjectedPiece } from "@/lib/build-goal";
-import type { StreakSurface } from "@/lib/companion";
-import { interfaceCopy, type InterfaceCopyKey } from "@/lib/interface-copy";
-import type { StreakState } from "@/lib/streak";
-import { Flame, Leaf, Puzzle } from "lucide-react";
+"use client";
 
-const HEAT_KEY: Record<StreakState, InterfaceCopyKey> = {
-  hot: "fuel.glance.heat.hot",
-  warm: "fuel.glance.heat.warm",
-  ember: "fuel.glance.heat.ember",
-  dormant: "fuel.glance.heat.dormant",
-};
-
-function GlanceCell({
-  testId,
-  fuel,
-  backed,
-  labelKey,
-  copyKey,
-  value,
-  icon,
-  eventId,
-}: {
-  testId: string;
-  fuel: "heat" | "xp" | "pieces";
-  backed: boolean;
-  labelKey: InterfaceCopyKey;
-  copyKey: InterfaceCopyKey;
-  value: string;
-  icon: ReactNode;
-  eventId?: string;
-}) {
-  return (
-    <div
-      data-testid={testId}
-      data-fuel={fuel}
-      data-fuel-source="qualifying-event"
-      data-backed={backed ? "true" : "false"}
-      data-copy-key={copyKey}
-      data-event-id={eventId ?? ""}
-      className={
-        backed
-          ? "grid justify-items-center gap-1 rounded-lg bg-secondary px-2 py-2 text-center text-secondary-foreground"
-          : "grid justify-items-center gap-1 rounded-lg bg-muted px-2 py-2 text-center text-muted-foreground"
-      }
-    >
-      {icon}
-      <span className="text-[0.7rem] font-medium tracking-wide">
-        {interfaceCopy(labelKey)}
-      </span>
-      <span className="font-sans text-sm font-bold leading-snug">{value}</span>
-    </div>
-  );
-}
+import { useEffect, useRef } from "react";
+import { consumeFuelPulse, releaseFuelPulse } from "@/lib/fuel-motion";
+import { cn } from "@/lib/utils";
 
 /**
- * Flame, sprout, and piece under the Practice button.
- * Each cell is a qualifying-event projection. This strip is not a link.
+ * Numeric fuel line under the practice control.
+ * Not a link. Pulses once when practice just stored a mint-toast flag.
  */
 export function FuelStrip({
-  streak,
-  sprout,
-  piece,
+  childId,
+  text,
+  xp,
+  dayCount,
+  pieces,
+  goal,
+  flame,
+  sourceEventId,
+  forcePulse = false,
 }: {
-  streak: StreakSurface;
-  sprout: boolean;
-  piece: ProjectedPiece | null;
+  childId: string;
+  text: string;
+  xp: number;
+  dayCount: number | null;
+  pieces: number;
+  goal: number;
+  flame: "start" | "resting" | "lit";
+  sourceEventId: string | null;
+  forcePulse?: boolean;
 }) {
-  const heatKey = HEAT_KEY[streak.state];
-  const xpKey: InterfaceCopyKey = sprout ? "fuel.home.sprout" : "fuel.glance.xp.empty";
-  const pieceKey: InterfaceCopyKey = piece?.copyKey ?? "fuel.glance.piece.empty";
+  const stripRef = useRef<HTMLParagraphElement>(null);
+  useEffect(() => {
+    if (forcePulse) return;
+    const node = stripRef.current;
+    if (!node || !consumeFuelPulse(window.sessionStorage, childId)) return;
+    node.dataset.pulse = "once";
+    node.classList.add("fuel-strip-pulse");
+    const timer = window.setTimeout(() => releaseFuelPulse(childId), 1000);
+    return () => window.clearTimeout(timer);
+  }, [childId, forcePulse]);
+
   return (
-    <div
+    <p
       data-testid="fuel-strip"
       data-fuel-source="qualifying-event"
-      role="group"
-      aria-label="Practice fuel"
-      className="grid grid-cols-3 gap-2"
+      data-fuel="heat xp pieces"
+      data-xp={xp}
+      data-day-count={dayCount ?? ""}
+      data-pieces={pieces}
+      data-goal={goal}
+      data-flame={flame}
+      data-heat-event-id={sourceEventId ?? ""}
+      ref={stripRef}
+      data-pulse={forcePulse ? "once" : "false"}
+      className={cn(
+        "flex h-11 items-center overflow-hidden rounded-lg bg-secondary/70 px-3 font-sans text-sm font-medium tracking-tight text-secondary-foreground whitespace-nowrap",
+        forcePulse && "fuel-strip-pulse",
+      )}
     >
-      <GlanceCell
-        testId="fuel-glance-heat"
-        fuel="heat"
-        backed={streak.state !== "dormant"}
-        labelKey="fuel.glance.label.heat"
-        copyKey={heatKey}
-        value={interfaceCopy(heatKey)}
-        icon={<Flame className="size-5" aria-hidden="true" />}
-        eventId={streak.sourceEventId ?? undefined}
-      />
-      <GlanceCell
-        testId="sprout-glance"
-        fuel="xp"
-        backed={sprout}
-        labelKey="fuel.glance.label.xp"
-        copyKey={xpKey}
-        value={interfaceCopy(xpKey)}
-        icon={<Leaf className="size-5" aria-hidden="true" />}
-      />
-      <GlanceCell
-        testId="fuel-glance-piece"
-        fuel="pieces"
-        backed={piece !== null}
-        labelKey="fuel.glance.label.piece"
-        copyKey={pieceKey}
-        value={interfaceCopy(pieceKey)}
-        icon={<Puzzle className="size-5" aria-hidden="true" />}
-        eventId={piece?.eventId}
-      />
-    </div>
+      {text}
+    </p>
   );
 }

@@ -15,6 +15,7 @@ import {
   type QueuedAttempt,
   type SyncPost,
 } from "@/lib/offline-queue";
+import { markFuelPulse } from "@/lib/fuel-motion";
 import { showResumeCelebration } from "@/lib/pause-hold";
 import { postPauseHoldUntilVisible } from "@/lib/pause-hold-receipt";
 import { Button } from "@/components/ui/button";
@@ -135,6 +136,14 @@ export function PracticeSession({
         (result) => result.idempotencyKey === waitingKey.current,
       );
       if (synced && showResumeCelebration(synced)) {
+        markFuelPulse(window.sessionStorage, childId, {
+          tier: synced.clientView.celebrationTier,
+          credit: synced.fuel.credit,
+          eventCount: synced.eventIds.length,
+          replayed: synced.replayed,
+          resumeQuiet: false,
+          eventId: synced.eventIds[0] ?? null,
+        });
         setFeedback(synced);
         setSavedOffline(false);
         setHeldNotice(false);
@@ -314,6 +323,14 @@ export function PracticeSession({
     const snapshot = await flush();
     const synced = snapshot.synced.find((result) => result.idempotencyKey === idempotencyKey);
     if (synced && showResumeCelebration(synced)) {
+      markFuelPulse(window.sessionStorage, childId, {
+        tier: synced.clientView.celebrationTier,
+        credit: synced.fuel.credit,
+        eventCount: synced.eventIds.length,
+        replayed: synced.replayed,
+        resumeQuiet: false,
+        eventId: synced.eventIds[0] ?? null,
+      });
       setFeedback(synced);
       setPersistedView(synced.clientView);
       setSavedOffline(false);

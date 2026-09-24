@@ -9,7 +9,6 @@ import type Database from "better-sqlite3";
 import { XP_AMOUNT } from "@/lib/attempt-contract";
 import { startPracticeSession, submitAttempt, type SubmitAttemptInput } from "@/lib/attempts";
 import { choosePracticeLane, endPracticeSession } from "@/lib/boundary";
-import { CompanionState } from "@/components/companion-state";
 import { MintToast } from "@/components/mint-toast";
 import { ParentOneBreathCard } from "@/components/parent-one-breath";
 import { readCompanion } from "@/lib/companion";
@@ -434,44 +433,8 @@ describe("mint toast and home glance", () => {
     expect(review).toContain("A quiet sprout. This one stays small.");
     expect(review).not.toContain("A piece of the build is in place.");
 
-    const home = renderToStaticMarkup(
-      createElement(CompanionState, {
-        childId: "child-1",
-        practiceAllowed: true,
-        companion: {
-          build: {
-            active: {
-              id: "pot",
-              title: "A pot for the sprout",
-              pieceTarget: 3,
-              pieces: [],
-              complete: false,
-              active: true,
-            },
-            completed: [],
-          },
-          badges: [],
-          streak: {
-            state: "ember",
-            copyKey: "streak.ember",
-            emberExpiresAt: "2026-06-17T07:00:00.000Z",
-            lastQualifyingDay: "2026-06-15",
-            sourceEventId: "qe-day",
-            recovery: {
-              copyKey: "streak.ember.recover",
-              detailKey: "streak.ember.recover.detail",
-            },
-          },
-        },
-      }),
-    );
-    expect(home).toContain('data-fuel="heat"');
-    expect(home).toContain('data-fuel="pieces"');
-    expect(home).not.toContain('data-testid="sprout-glance"');
-    expect(home).not.toMatch(/\b\d+\s*xp\b|xpAmount|confidence|score/i);
-    expect(home).toContain("There is no rush.");
-
     const childPage = readFileSync(new URL("../app/child/[id]/page.tsx", import.meta.url), "utf8");
+    const homeFrame = readFileSync(new URL("../components/child-home.tsx", import.meta.url), "utf8");
     const practicePage = readFileSync(
       new URL("../components/practice-session.tsx", import.meta.url),
       "utf8",
@@ -480,12 +443,14 @@ describe("mint toast and home glance", () => {
       new URL("../components/practice-feedback.tsx", import.meta.url),
       "utf8",
     );
-    const ctaAt = childPage.indexOf("<PracticeCta");
-    const stripAt = childPage.indexOf("<FuelStrip");
-    const companionAt = childPage.indexOf("<CompanionState");
+    const ctaAt = homeFrame.indexOf("<PracticeCta");
+    const stripAt = homeFrame.indexOf("<FuelStrip");
     expect(ctaAt).toBeGreaterThan(-1);
     expect(stripAt).toBeGreaterThan(ctaAt);
-    expect(companionAt).toBeGreaterThan(stripAt);
+    expect(homeFrame).not.toContain("CompanionState");
+    expect(homeFrame).not.toContain("ember-recovery");
+    expect(homeFrame).not.toContain("Still open");
+    expect(childPage).not.toContain("CompanionState");
     expect(childPage).not.toMatch(/href=.*\/fuel|FuelTab/);
     expect(practicePage).not.toContain("/companion");
     expect(practicePage).not.toContain("FuelMoment");

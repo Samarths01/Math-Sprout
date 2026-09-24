@@ -95,8 +95,11 @@ export default async function ParentHomePage() {
           </Link>
         </div>
         <Card>
-          <CardContent className="text-sm leading-6 text-muted-foreground">
-            {home.narrative}
+          <CardContent className="grid gap-3 text-sm leading-6 text-muted-foreground">
+            <p>{home.narrative}</p>
+            <p data-testid="parent-consent-line" data-copy-key="parent.consent.line">
+              {interfaceCopy("parent.consent.line")}
+            </p>
           </CardContent>
         </Card>
         {home.children.length === 0 ? (

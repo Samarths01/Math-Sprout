@@ -132,8 +132,11 @@ describe("child route ownership", () => {
     expect(companion.status).toBe(200);
     expect(companion.body).toMatchObject({
       streak: { state: "dormant", recovery: null },
+      glance: { xp: 0, dayCount: null, pieces: 0, goal: 3 },
     });
-    expect(companion.body).not.toHaveProperty("xp");
+    expect(JSON.stringify(companion.body)).not.toMatch(
+      /scorePercent|confidence|xpAmount|judgment|judgement/i,
+    );
 
     cookieState.token = otherToken;
     const routes: Array<{

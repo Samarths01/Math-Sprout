@@ -91,3 +91,18 @@
     @apply bg-background font-sans text-foreground;
   }
 }
+
+@keyframes fuel-strip-pulse {
+  0% {
+    box-shadow: 0 0 0 0 color-mix(in oklch, var(--primary) 45%, transparent);
+  }
+  100% {
+    box-shadow: 0 0 0 0 transparent;
+  }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .fuel-strip-pulse {
+    animation: fuel-strip-pulse 800ms ease-out 1;
+  }
+}
