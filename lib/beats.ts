@@ -13,9 +13,27 @@ export function buildFourBeat(input: {
   flags: readonly IntegrityFlag[];
   item: PublicItem;
   canonicalAnswer: string;
+  /** Frozen completed equation. Scoring does not rebuild it. */
+  answerLine?: string;
+  /** Miss focus assembled from a cue key. Empty omits the beat. */
+  focus?: string;
+  tryNext?: string;
+  /** Correct-path solidify. Empty omits Why it works. */
+  solidify?: string;
+  unparseable?: boolean;
 }): FourBeat {
-  const answer = answerStamp(input.item.prompt, input.canonicalAnswer);
-  const solidify = whyItWorksForItem(input.item.id);
+  if (input.unparseable) {
+    return {
+      whatWentWell: "You stayed with the problem.",
+      oneFocus: "",
+      tryNext: "",
+      lockIn: "That answer stays quiet.",
+    };
+  }
+  const answer = input.answerLine ?? answerStamp(input.item.prompt, input.canonicalAnswer);
+  const solidify = input.solidify !== undefined ? input.solidify : whyItWorksForItem(input.item.id);
+  const missFocus = input.focus !== undefined ? input.focus : oneFocusForItem(input.item.id);
+  const missNext = input.tryNext !== undefined ? input.tryNext : tryNextForItem(input.item.id);
   if (input.flags.includes("empty_answer")) {
     return {
       whatWentWell: "You stayed with the problem.",
@@ -56,8 +74,8 @@ export function buildFourBeat(input: {
   }
   return {
     whatWentWell: "You committed to an answer.",
-    oneFocus: oneFocusForItem(input.item.id),
-    tryNext: tryNextForItem(input.item.id),
+    oneFocus: missFocus,
+    tryNext: missNext,
     lockIn: answer,
   };
 }

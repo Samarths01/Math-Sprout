@@ -23,6 +23,7 @@ import { formatAttemptLogLine, readAttemptLog } from "@/lib/attempt-log";
 import { startPracticeSession, submitAttempt } from "@/lib/attempts";
 import { ParentBuildFooter } from "@/components/build-footer";
 import { ChildHomeFrame } from "@/components/child-home";
+import { PracticeProblem } from "@/components/practice-problem";
 import { readCompanion } from "@/lib/companion";
 import { openDatabase } from "@/lib/db";
 import { createChild, createGuardian, getChildHome, setConsent } from "@/lib/domain";
@@ -73,7 +74,9 @@ function tempDb() {
 
 function assertChildPayloadSealed(value: unknown) {
   const dumped = JSON.stringify(value);
-  expect(dumped).not.toMatch(/build_sha|policy_version|buildSha|policyVersion/);
+  expect(dumped).not.toMatch(
+    /build_sha|policy_version|buildSha|policyVersion|provenance|evidence_eligible|evidenceEligible|computed_step|computedStep|assigned_step|assignedStep|parent_prior|parentPrior|template_version|templateVersion|canonical_answer|canonicalAnswer/,
+  );
 }
 
 type GitExec = typeof buildCommands.execFile;
@@ -491,6 +494,20 @@ describe("app build tag", () => {
       timezone: "America/Los_Angeles",
     });
     setConsent(db, guardian.id, child.id, "grant");
+    db.prepare(
+      `UPDATE item_template_versions
+       SET spec_json = json_set(
+         spec_json,
+         '$.provenance', 'SENTINEL_PROVENANCE',
+         '$.evidence_eligible', 'SENTINEL_EVIDENCE_ELIGIBLE',
+         '$.computed_step', 'SENTINEL_COMPUTED_STEP',
+         '$.assigned_step', 'SENTINEL_ASSIGNED_STEP',
+         '$.parent_prior', 'SENTINEL_PARENT_PRIOR',
+         '$.template_version', 'SENTINEL_TEMPLATE_VERSION',
+         '$.canonical_answer', 'SENTINEL_CANONICAL_ANSWER'
+       ),
+       bug_rules_json = json_set(bug_rules_json, '$[0].tag', 'SENTINEL_BUG_TAG')`,
+    ).run();
     const emitted: string[] = [];
     const spy = vi.spyOn(console, "info").mockImplementation((message) => {
       emitted.push(String(message));
@@ -564,6 +581,29 @@ describe("app build tag", () => {
     );
     expect(homeHtml).not.toContain(sha);
     expect(homeHtml).not.toContain("Build ");
+    const practiceHtml = renderToStaticMarkup(
+      createElement(PracticeProblem, { item: session.item }),
+    );
+    const sealed = [JSON.stringify(result), JSON.stringify(session), JSON.stringify(home), JSON.stringify(companion), homeHtml, practiceHtml].join("\n");
+    for (const needle of [
+      "SENTINEL_PROVENANCE",
+      "SENTINEL_EVIDENCE_ELIGIBLE",
+      "SENTINEL_COMPUTED_STEP",
+      "SENTINEL_ASSIGNED_STEP",
+      "SENTINEL_PARENT_PRIOR",
+      "SENTINEL_TEMPLATE_VERSION",
+      "SENTINEL_CANONICAL_ANSWER",
+      "SENTINEL_BUG_TAG",
+      "provenance",
+      "evidence_eligible",
+      "computed_step",
+      "assigned_step",
+      "parent_prior",
+    ]) {
+      expect(sealed).not.toContain(needle);
+    }
+    expect(practiceHtml).toContain("Warm-up");
+    expect(practiceHtml).not.toMatch(/Step 1|step 1/);
   });
 
   it("renders the build footer from the cache and keeps it off child routes", async () => {

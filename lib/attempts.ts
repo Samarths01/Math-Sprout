@@ -12,7 +12,7 @@ import {
 } from "@/lib/attempt-contract";
 import { buildFourBeat } from "@/lib/beats";
 import { consentDenied, DomainError, getChild } from "@/lib/domain";
-import { catalogItem, itemAt, ITEM_CATALOG } from "@/lib/item-catalog";
+import { catalogItem, ITEM_CATALOG } from "@/lib/item-catalog";
 import {
   assertBankMatchesCatalog,
   canonicalAnswer,
@@ -41,6 +41,13 @@ import * as appBuild from "@/lib/app-build";
 import { POLICY_VERSION } from "@/lib/policy";
 import { takePendingPauseHold } from "@/lib/pause-hold";
 import { practiceGate } from "@/lib/practice-gate";
+import {
+  consumeItemInstance,
+  focusForStoredAnswer,
+  gradeStoredAnswer,
+  presentIssuedItem,
+  readItemInstance,
+} from "@/lib/templates/issue";
 
 const KEY_PATTERN = /^[A-Za-z0-9_-]{8,80}$/;
 
@@ -51,6 +58,7 @@ export type SubmitAttemptInput = {
   answer: string;
   shownAt: string;
   submittedAt: string;
+  itemInstanceId?: string;
 };
 
 export type PracticeSessionStart = {
@@ -116,6 +124,11 @@ export function parseSubmitAttempt(
       400,
     );
   }
+  for (const key of ["operands", "canonicalAnswer", "answerKey", "canonical_answer", "operandKey"]) {
+    if (key in body) {
+      throw new DomainError("The answer is scored from the stored problem.", 400);
+    }
+  }
   if (typeof body.answer !== "string") {
     throw new DomainError("Answer must be a string.", 400);
   }
@@ -124,6 +137,13 @@ export function parseSubmitAttempt(
   }
   const shownAt = requireText(body.shownAt, "Shown time");
   const submittedAt = requireText(body.submittedAt, "Submitted time");
+  const itemInstanceId =
+    typeof body.itemInstanceId === "string" && body.itemInstanceId.trim().length > 0
+      ? body.itemInstanceId.trim()
+      : undefined;
+  if (itemInstanceId && !KEY_PATTERN.test(itemInstanceId)) {
+    throw new DomainError("That problem is not in this practice pack.", 400);
+  }
   return {
     idempotencyKey,
     sessionId: requireText(body.sessionId, "Session"),
@@ -131,6 +151,7 @@ export function parseSubmitAttempt(
     answer: body.answer,
     shownAt,
     submittedAt,
+    ...(itemInstanceId ? { itemInstanceId } : {}),
   };
 }
 
@@ -150,7 +171,7 @@ function presentSession(
     phase: "practicing" | "boundary" | "closed";
   },
 ): PracticeSessionStart {
-  const item = itemAt(session.item_index);
+  const item = presentIssuedItem(db, childId, session.id, session.item_index);
   return {
     sessionId: session.id,
     item,
@@ -249,7 +270,7 @@ function resultFromRow(
     xpAmount: credit,
     fuel: fuelFromEvents(qualifying, credit),
     clientView,
-    nextItem: itemAt(session.item_index),
+    nextItem: presentIssuedItem(db, row.child_id, row.session_id, session.item_index),
     ...(row.resume_presentation === "quiet" ? { resumePresentation: "quiet" as const } : {}),
   };
 }
@@ -376,32 +397,127 @@ export function submitAttempt(
       )
       .get(childId, windowStart, submittedAt) as { count: number };
     const elapsedMs = Date.parse(submittedAt) - Date.parse(shownAt);
-    const flags = integrityFlags({
+    let flags = integrityFlags({
       answer: input.answer,
       elapsedMs,
       priorInWindow: prior.count,
     });
-    const correct = gradeAnswer(itemId, input.answer);
-    const economy = planAttemptEconomy(db, {
-      childId,
-      sessionId,
-      idempotencyKey,
-      timeZone: child.timezone,
-      submittedAt,
-      skill: item.skill,
-      correct,
-      flags,
-      practiceLane: session.practice_lane,
-      history: evidenceForSkill(db, childId, item.skill),
-      previousBand: readSkillClientView(db, childId, item.skill)?.bandLabel ?? null,
-    });
-    const beats = buildFourBeat({
-      correct,
-      flags,
-      item,
-      canonicalAnswer: canonicalAnswer(itemId),
-    });
-    saveSkillState(db, childId, item.skill, economy.clientView);
+    let correct = false;
+    let beats: FourBeat;
+    let economy: {
+      lane: AttemptResult["lane"];
+      celebrationTier: AttemptResult["celebrationTier"];
+      clientView: ClientView;
+      mints: Parameters<typeof commitAttemptEconomy>[1]["mints"];
+    };
+    let scoredItemId = itemId;
+    let instanceId: string | null = null;
+    let templateId: string | null = null;
+    let difficultyStep: number | null = null;
+    let estimatorEvidence: number | null = null;
+    let skipEconomy = false;
+
+    if (input.itemInstanceId) {
+      const instance = readItemInstance(db, input.itemInstanceId);
+      if (!instance) throw new DomainError("That problem is not in this practice pack.", 404);
+      if (instance.childId !== childId || instance.sessionId !== sessionId) {
+        throw new DomainError("That problem is already locked.", 409);
+      }
+      if (instance.consumedAt) {
+        throw new DomainError("That problem is already locked.", 409);
+      }
+      const skillRow = db
+        .prepare(
+          `SELECT skill_id FROM item_template_versions
+           WHERE template_id = ? AND template_version = ?`,
+        )
+        .get(instance.templateId, instance.templateVersion) as { skill_id: string } | undefined;
+      const skillItem =
+        ITEM_CATALOG.find((entry) => entry.skill === skillRow?.skill_id) ?? item;
+      scoredItemId = skillItem.id;
+      instanceId = instance.itemInstanceId;
+      templateId = instance.templateId;
+      difficultyStep = instance.difficultyStep;
+      const verdict = gradeStoredAnswer(instance, input.answer);
+      if (verdict === "unparseable") {
+        flags = ["unparseable"];
+        correct = false;
+        estimatorEvidence = 0;
+        skipEconomy = true;
+        beats = buildFourBeat({
+          correct: false,
+          flags,
+          item: skillItem,
+          canonicalAnswer: instance.canonicalAnswer,
+          unparseable: true,
+        });
+        economy = {
+          lane: "review",
+          celebrationTier: "none",
+          mints: [],
+          clientView: readSkillClientView(db, childId, skillItem.skill) ?? {
+            bandLabel: "Still learning",
+            showConceptChip: false,
+            celebrationTier: "none",
+          },
+        };
+      } else {
+        correct = verdict === "correct";
+        estimatorEvidence = instance.evidenceEligible ? 1 : 0;
+        const focus =
+          verdict === "incorrect" ? focusForStoredAnswer(instance, input.answer) : null;
+        beats = buildFourBeat({
+          correct,
+          flags,
+          item: skillItem,
+          canonicalAnswer: instance.canonicalAnswer,
+          answerLine: instance.answerLine,
+          ...(flags.length === 0 && verdict === "incorrect" && focus
+            ? { focus: focus.oneFocus, tryNext: focus.tryNext }
+            : {}),
+          ...(flags.length === 0 && correct ? { solidify: instance.whyItWorks ?? "" } : {}),
+        });
+        economy = planAttemptEconomy(db, {
+          childId,
+          sessionId,
+          idempotencyKey,
+          timeZone: child.timezone,
+          submittedAt,
+          skill: skillItem.skill,
+          correct,
+          flags,
+          practiceLane: session.practice_lane,
+          history: evidenceForSkill(db, childId, skillItem.skill),
+          previousBand: readSkillClientView(db, childId, skillItem.skill)?.bandLabel ?? null,
+        });
+        if (instance.evidenceEligible) {
+          saveSkillState(db, childId, skillItem.skill, economy.clientView);
+        }
+      }
+      consumeItemInstance(db, instance, idempotencyKey, submittedAt);
+    } else {
+      correct = gradeAnswer(itemId, input.answer);
+      economy = planAttemptEconomy(db, {
+        childId,
+        sessionId,
+        idempotencyKey,
+        timeZone: child.timezone,
+        submittedAt,
+        skill: item.skill,
+        correct,
+        flags,
+        practiceLane: session.practice_lane,
+        history: evidenceForSkill(db, childId, item.skill),
+        previousBand: readSkillClientView(db, childId, item.skill)?.bandLabel ?? null,
+      });
+      beats = buildFourBeat({
+        correct,
+        flags,
+        item,
+        canonicalAnswer: canonicalAnswer(itemId),
+      });
+      saveSkillState(db, childId, item.skill, economy.clientView);
+    }
     const quietResume = takePendingPauseHold(db, childId, idempotencyKey);
     const attemptId = randomUUID();
     const createdAt = nowIso();
@@ -409,18 +525,20 @@ export function submitAttempt(
       `INSERT INTO attempts (
          id, child_id, session_id, idempotency_key, item_id, answer, shown_at,
          submitted_at, correct, lane, celebration_tier, flags_json, beats_json,
-         client_view_json, created_at, policy_version, build_sha, resume_presentation
+         client_view_json, created_at, policy_version, build_sha, resume_presentation,
+         item_instance_id, template_id, difficulty_step, estimator_evidence
        ) VALUES (
          @id, @child_id, @session_id, @idempotency_key, @item_id, @answer, @shown_at,
          @submitted_at, @correct, @lane, @celebration_tier, @flags_json, @beats_json,
-         @client_view_json, @created_at, @policy_version, @build_sha, @resume_presentation
+         @client_view_json, @created_at, @policy_version, @build_sha, @resume_presentation,
+         @item_instance_id, @template_id, @difficulty_step, @estimator_evidence
        )`,
     ).run({
       id: attemptId,
       child_id: childId,
       session_id: sessionId,
       idempotency_key: idempotencyKey,
-      item_id: itemId,
+      item_id: scoredItemId,
       answer: input.answer,
       shown_at: shownAt,
       submitted_at: submittedAt,
@@ -434,8 +552,12 @@ export function submitAttempt(
       policy_version: POLICY_VERSION,
       build_sha: buildSha,
       resume_presentation: quietResume ? "quiet" : "live",
+      item_instance_id: instanceId,
+      template_id: templateId,
+      difficulty_step: difficultyStep,
+      estimator_evidence: estimatorEvidence,
     });
-    commitAttemptEconomy(db, {
+    if (!skipEconomy) commitAttemptEconomy(db, {
       childId,
       attemptId,
       sessionId,

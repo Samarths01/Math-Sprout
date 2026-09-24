@@ -4,7 +4,6 @@ import { useEffect, useRef, useState, type FormEvent } from "react";
 import Link from "next/link";
 import type { AttemptResult, ClientView, PublicItem } from "@/lib/attempt-contract";
 import type { BoundaryOptions, PracticeLane } from "@/lib/mastery";
-import { itemAt, ITEM_CATALOG } from "@/lib/item-catalog";
 import { interfaceCopy } from "@/lib/interface-copy";
 import { PracticeFeedback } from "@/components/practice-feedback";
 import {
@@ -18,7 +17,8 @@ import {
 import { markFuelPulse } from "@/lib/fuel-motion";
 import { showResumeCelebration } from "@/lib/pause-hold";
 import { postPauseHoldUntilVisible } from "@/lib/pause-hold-receipt";
-import { stepClass } from "@/lib/palette";
+import { PracticeProblem } from "@/components/practice-problem";
+import { provisionalVerdict } from "@/lib/provisional-verdict";
 import { Button } from "@/components/ui/button";
 import {
   Card,
@@ -318,6 +318,7 @@ export function PracticeSession({
       answer,
       shownAt,
       submittedAt: new Date().toISOString(),
+      ...(item.itemInstanceId ? { itemInstanceId: item.itemInstanceId } : {}),
     };
     waitingKey.current = idempotencyKey;
     queue().enqueue(queued);
@@ -394,8 +395,8 @@ export function PracticeSession({
   }
 
   const nextFromFeedback = feedback?.nextItem;
-  const localNext = itemAt(ITEM_CATALOG.findIndex((entry) => entry.id === item.id) + 1);
   const offlineCapped = pending >= OFFLINE_QUEUE_CAP;
+  const pendingVerdict = provisionalVerdict();
 
   return (
     <div className="grid gap-4">
@@ -483,22 +484,23 @@ export function PracticeSession({
       ) : (
       <Card>
         <CardHeader>
-          <CardDescription className="flex items-center gap-2">
-            <span
-              data-testid="difficulty-badge"
-              data-grade={item.grade}
-              className={`inline-flex w-fit items-center rounded-full px-2.5 py-0.5 text-xs font-medium ${stepClass(item.grade)}`}
-            >
-              Grade {item.grade}
-            </span>
-            <span>{item.pack === "fractions" ? "Fractions" : "Operations"}</span>
-          </CardDescription>
-          <CardTitle
-            data-testid="practice-prompt"
-            className="font-heading text-[32px] leading-[40px] tracking-tight tabular-nums"
-          >
-            {item.prompt}
-          </CardTitle>
+          <PracticeProblem
+            item={item}
+            answerSlot={
+              item.blankInline && !feedback ? (
+                <Input
+                  id="practice-answer"
+                  form="practice-form"
+                  data-testid="practice-answer"
+                  value={answer}
+                  onChange={(event) => setAnswer(event.target.value)}
+                  autoComplete="off"
+                  className="h-12 w-24 text-center font-heading text-2xl tabular-nums"
+                  aria-label="Your answer"
+                />
+              ) : undefined
+            }
+          />
         </CardHeader>
         <CardContent>
           {feedback ? (
@@ -508,30 +510,41 @@ export function PracticeSession({
                 <Button
                   type="button"
                   size="primary"
-                  onClick={() => showNext(nextFromFeedback ?? localNext)}
+                  onClick={() => {
+                    if (nextFromFeedback) showNext(nextFromFeedback);
+                  }}
                 >
                   Next problem
                 </Button>
               )}
             </div>
           ) : (
-            <form className="grid gap-3" onSubmit={onSubmit}>
+            <form id="practice-form" className="grid gap-3" onSubmit={onSubmit}>
               {savedOffline && !offlineCapped ? (
-                <p role="status" className="text-sm leading-6">
+                <p
+                  role="status"
+                  data-testid="provisional-verdict"
+                  data-pending={pendingVerdict.pending ? "true" : "false"}
+                  data-reveals-answer={pendingVerdict.revealsAnswer ? "true" : "false"}
+                  data-mints={pendingVerdict.mints ? "true" : "false"}
+                  className="text-sm leading-6"
+                >
                   Saved on this device. It will check in when you reconnect.
                 </p>
               ) : null}
-              <div className="grid gap-2">
-                <Label htmlFor="practice-answer">Your answer</Label>
-                <Input
-                  id="practice-answer"
-                  data-testid="practice-answer"
-                  value={answer}
-                  onChange={(event) => setAnswer(event.target.value)}
-                  autoComplete="off"
-                  className="h-12 text-lg"
-                />
-              </div>
+              {item.blankInline ? null : (
+                <div className="grid gap-2">
+                  <Label htmlFor="practice-answer">Your answer</Label>
+                  <Input
+                    id="practice-answer"
+                    data-testid="practice-answer"
+                    value={answer}
+                    onChange={(event) => setAnswer(event.target.value)}
+                    autoComplete="off"
+                    className="h-12 text-lg"
+                  />
+                </div>
+              )}
               {error ? <p className="text-sm text-destructive">{error}</p> : null}
               <Button
                 type="submit"
@@ -541,16 +554,6 @@ export function PracticeSession({
               >
                 {busy ? "Checking…" : "Check answer"}
               </Button>
-              {savedOffline && !offlineCapped ? (
-                <Button
-                  type="button"
-                  variant="outline"
-                  className="h-12 text-base"
-                  onClick={() => showNext(localNext)}
-                >
-                  Next problem
-                </Button>
-              ) : null}
             </form>
           )}
           <Button

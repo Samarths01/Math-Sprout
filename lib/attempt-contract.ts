@@ -14,7 +14,7 @@ export function displayedOneFocus(beat: Pick<FourBeat, "oneFocus">): string {
   return beat.oneFocus;
 }
 
-export type IntegrityFlag = "empty_answer" | "too_fast" | "spam_window";
+export type IntegrityFlag = "empty_answer" | "too_fast" | "spam_window" | "unparseable";
 
 export type ReviewLane = "celebrate" | "review";
 
@@ -39,6 +39,12 @@ export type PublicItem = {
   grade: 2 | 3 | 4;
   skill: string;
   prompt: string;
+  /** Kid-facing difficulty word. Practice serves Warm-up in this release. */
+  stepWord?: "Warm-up" | "Steady" | "Stretch";
+  itemInstanceId?: string;
+  layout?: "inline" | "column";
+  blankInline?: { leading: string; trailing: string };
+  columnLines?: string[];
 };
 
 /**

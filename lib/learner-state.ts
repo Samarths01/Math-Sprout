@@ -85,6 +85,12 @@ export function evidenceForSkill(
   childId: string,
   skill: string,
 ): SkillEvidence[] {
+  const columns = new Set(
+    (db.pragma("table_info(attempts)") as Array<{ name: string }>).map((row) => row.name),
+  );
+  const evidenceFilter = columns.has("estimator_evidence")
+    ? "AND (a.estimator_evidence IS NULL OR a.estimator_evidence != 0)"
+    : "";
   const rows = db
     .prepare(
       `SELECT a.correct AS correct, a.lane AS lane, ps.practice_lane AS practice_lane,
@@ -92,6 +98,7 @@ export function evidenceForSkill(
        FROM attempts a
        JOIN practice_sessions ps ON ps.id = a.session_id
        WHERE a.child_id = ?
+       ${evidenceFilter}
        ORDER BY a.submitted_at ASC, a.created_at ASC, a.id ASC`,
     )
     .all(childId) as EvidenceRow[];

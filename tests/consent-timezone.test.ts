@@ -203,6 +203,8 @@ describe("consent gating", () => {
       "children",
       "consents",
       "guardians",
+      "item_instances",
+      "item_template_versions",
       "learner_progress",
       "learner_skill_state",
       "practice_sessions",

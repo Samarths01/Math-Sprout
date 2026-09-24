@@ -9,6 +9,7 @@ export type QueuedAttempt = {
   answer: string;
   shownAt: string;
   submittedAt: string;
+  itemInstanceId?: string;
 };
 
 export type BlockedAttempt = QueuedAttempt & { message: string };
