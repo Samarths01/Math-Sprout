@@ -10,6 +10,8 @@ import {
   createBuildResolver,
   currentAppBuildSha,
   formatParentBuildLabel,
+  primeAppBuildSha,
+  refreshAppBuildSha,
   resetBuildCacheForTests,
   warnIfBuildUnknown,
 } from "@/lib/app-build";
@@ -27,6 +29,31 @@ afterEach(() => {
   while (cleanups.length > 0) cleanups.pop()?.();
 });
 
+function seedPractice(db: ReturnType<typeof tempDb>) {
+  const guardian = createGuardian(db, {
+    email: "parent@example.com",
+    password: "correct-horse",
+    timezone: "America/Los_Angeles",
+  });
+  const child = createChild(db, guardian.id, {
+    displayName: "Leo",
+    timezone: "America/Los_Angeles",
+  });
+  setConsent(db, guardian.id, child.id, "grant");
+  return { guardian, child };
+}
+
+function attemptInput(sessionId: string) {
+  return {
+    idempotencyKey: "build-tag-0001",
+    sessionId,
+    itemId: "ops-g2-add",
+    answer: "42",
+    shownAt: new Date(Date.parse(WHEN) - 2_000).toISOString(),
+    submittedAt: WHEN,
+  };
+}
+
 function tempDb() {
   const dir = mkdtempSync(path.join(tmpdir(), "math-sprout-build-"));
   const db = openDatabase(path.join(dir, "test.sqlite"));
@@ -42,12 +69,36 @@ function assertChildPayloadSealed(value: unknown) {
   expect(dumped).not.toMatch(/build_sha|policy_version|buildSha|policyVersion/);
 }
 
+type GitExec = typeof buildCommands.execFile;
+
+function restoreGit(original: {
+  execFile: GitExec;
+  statSync: typeof buildCommands.statSync;
+  readFileSync: typeof buildCommands.readFileSync;
+}) {
+  buildCommands.execFile = original.execFile;
+  buildCommands.statSync = original.statSync;
+  buildCommands.readFileSync = original.readFileSync;
+  resetBuildCacheForTests();
+}
+
+function installGit(exec: GitExec) {
+  const original = {
+    execFile: buildCommands.execFile,
+    statSync: buildCommands.statSync,
+    readFileSync: buildCommands.readFileSync,
+  };
+  resetBuildCacheForTests();
+  buildCommands.execFile = exec;
+  return () => restoreGit(original);
+}
+
 describe("app build tag", () => {
-  it("prefers APP_BUILD_SHA, then git describe, then unknown", () => {
+  it("prefers APP_BUILD_SHA, then a background git describe, then unknown", async () => {
     let described = 0;
     const deployed = createBuildResolver({
       env: () => "abc123",
-      describe: () => {
+      describe: async () => {
         described += 1;
         return "from-git-dirty";
       },
@@ -55,75 +106,114 @@ describe("app build tag", () => {
       now: () => 0,
     });
     expect(deployed.current()).toBe("abc123");
+    await deployed.refresh();
     expect(described).toBe(0);
 
     const fromGit = createBuildResolver({
       env: () => "   ",
-      describe: () => "from-git",
+      describe: async () => "from-git",
       headStamp: () => "stamp",
       now: () => 0,
     });
+    expect(fromGit.current()).toBe("unknown");
+    await fromGit.refresh();
     expect(fromGit.current()).toBe("from-git");
-    expect(
-      createBuildResolver({
-        env: () => "",
-        describe: () => "  ",
-        headStamp: () => null,
-        now: () => 0,
-      }).current(),
-    ).toBe("unknown");
-    expect(
-      createBuildResolver({
-        env: () => undefined,
-        describe: () => {
-          throw new Error("git unavailable");
-        },
-        headStamp: () => null,
-        now: () => 0,
-      }).current(),
-    ).toBe("unknown");
+
+    const blank = createBuildResolver({
+      env: () => "",
+      describe: async () => "  ",
+      headStamp: () => null,
+      now: () => 0,
+    });
+    expect(blank.current()).toBe("unknown");
+    await blank.refresh();
+    expect(blank.current()).toBe("unknown");
+
+    const thrown = createBuildResolver({
+      env: () => undefined,
+      describe: async () => {
+        throw new Error("git unavailable");
+      },
+      headStamp: () => null,
+      now: () => 0,
+    });
+    expect(thrown.current()).toBe("unknown");
+    await thrown.refresh();
+    expect(thrown.current()).toBe("unknown");
+    await primeAppBuildSha();
     expect(currentAppBuildSha().trim().length).toBeGreaterThan(0);
   });
 
-  it("keeps a dirty suffix and re-resolves when HEAD changes or the dirty TTL elapses", () => {
+  it("keeps a dirty suffix and refreshes in the background when HEAD changes or the TTL elapses", async () => {
     let stamp = "head-a";
     let described = "abc123def456";
     let now = 1_000;
+    let calls = 0;
     const resolver = createBuildResolver({
       env: () => undefined,
-      describe: () => described,
+      describe: async () => {
+        calls += 1;
+        return described;
+      },
       headStamp: () => stamp,
       now: () => now,
     });
+    expect(resolver.current()).toBe("unknown");
+    await resolver.refresh();
     expect(resolver.current()).toBe("abc123def456");
+    expect(calls).toBe(1);
     described = "ignored-while-cached";
     expect(resolver.current()).toBe("abc123def456");
+    await resolver.refresh();
+    expect(calls).toBe(1);
     stamp = "head-b";
     described = "fff999111222";
+    expect(resolver.current()).toBe("abc123def456");
+    await resolver.refresh();
     expect(resolver.current()).toBe("fff999111222");
     described = "fff999111222-dirty";
     now = 1_000 + 4_999;
     expect(resolver.current()).toBe("fff999111222");
+    await resolver.refresh();
+    expect(resolver.current()).toBe("fff999111222");
     now = 1_000 + 5_000;
+    expect(resolver.current()).toBe("fff999111222");
+    await resolver.refresh();
     expect(resolver.current()).toBe("fff999111222-dirty");
   });
 
-  it("reads a dirty describe from git and a new tag after HEAD's mtime changes", () => {
-    resetBuildCacheForTests();
+  it("reads a dirty describe from git and a new tag after HEAD's mtime changes", async () => {
     const original = {
-      execFileSync: buildCommands.execFileSync,
+      execFile: buildCommands.execFile,
       statSync: buildCommands.statSync,
       readFileSync: buildCommands.readFileSync,
     };
     let headMtime = 10;
     let described = "aaa111bbb222\n";
-    buildCommands.execFileSync = ((file: string, args?: readonly string[]) => {
-      if (file !== "git") return "";
-      const command = args?.[0];
-      if (command === "describe") return described;
-      if (command === "rev-parse") return ".git\n";
-      return "";
-    }) as typeof buildCommands.execFileSync;
+    const seen: Array<{ command: string; timeout?: number; killSignal?: string; maxBuffer?: number }> =
+      [];
+    buildCommands.execFile = ((file, args, options, callback) => {
+      const command = args[0] ?? "";
+      seen.push({
+        command,
+        timeout: options.timeout,
+        killSignal: options.killSignal,
+        maxBuffer: options.maxBuffer,
+      });
+      if (file !== "git") {
+        callback(new Error("not git"), "", "");
+        return;
+      }
+      if (command === "describe") {
+        callback(null, described, "");
+        return;
+      }
+      if (command === "rev-parse") {
+        callback(null, ".git\n", "");
+        return;
+      }
+      callback(null, "", "");
+    }) as GitExec;
     buildCommands.statSync = ((target: Parameters<typeof statSync>[0]) => {
       const name = String(target);
       return { mtimeMs: name.endsWith("HEAD") ? headMtime : headMtime + 3 } as ReturnType<
@@ -134,23 +224,159 @@ describe("app build tag", () => {
       if (String(target).endsWith("HEAD")) return "ref: refs/heads/main";
       return "";
     }) as typeof buildCommands.readFileSync;
+    resetBuildCacheForTests();
 
     try {
+      await primeAppBuildSha();
       expect(currentAppBuildSha()).toBe("aaa111bbb222");
+      expect(seen.some((call) => call.command === "rev-parse")).toBe(true);
+      expect(seen.find((call) => call.command === "describe")).toMatchObject({
+        timeout: 1_500,
+        killSignal: "SIGKILL",
+        maxBuffer: 16 * 1024,
+      });
+      const describes = seen.filter((call) => call.command === "describe").length;
       described = "should-stay-cached\n";
       expect(currentAppBuildSha()).toBe("aaa111bbb222");
+      await refreshAppBuildSha();
+      expect(seen.filter((call) => call.command === "describe")).toHaveLength(describes);
       headMtime = 40;
       described = "ccc444ddd555-dirty\n";
+      expect(currentAppBuildSha()).toBe("aaa111bbb222");
+      await refreshAppBuildSha();
       expect(currentAppBuildSha()).toBe("ccc444ddd555-dirty");
       expect(formatParentBuildLabel("ccc444ddd555-dirty")).toBe("Build ccc444ddd555-dirty");
       expect(formatParentBuildLabel("0123456789abcdef0123456789abcdef01234567")).toBe(
         "Build 0123456789ab",
       );
     } finally {
-      buildCommands.execFileSync = original.execFileSync;
-      buildCommands.statSync = original.statSync;
-      buildCommands.readFileSync = original.readFileSync;
-      resetBuildCacheForTests();
+      restoreGit(original);
+    }
+  });
+
+  it("stores a non-empty tag when git errors, and still saves the attempt", async () => {
+    const restore = installGit((_file, _args, _options, callback) => {
+      callback(new Error("git failed"), "", "");
+    });
+    try {
+      await primeAppBuildSha();
+      expect(currentAppBuildSha()).toBe("unknown");
+      const db = tempDb();
+      const { guardian, child } = seedPractice(db);
+      const session = startPracticeSession(db, guardian.id, child.id);
+      const result = submitAttempt(db, guardian.id, child.id, attemptInput(session.sessionId), {
+        now: WHEN,
+      });
+      const attempt = db
+        .prepare(`SELECT build_sha FROM attempts WHERE id = ?`)
+        .get(result.attemptId) as { build_sha: string };
+      expect(result.attemptId).toBeTruthy();
+      expect(attempt.build_sha).toBe("unknown");
+      expect(attempt.build_sha.trim().length).toBeGreaterThan(0);
+    } finally {
+      restore();
+    }
+  });
+
+  it("returns from submit without waiting for a hung git refresh", async () => {
+    let describes = 0;
+    const restore = installGit((_file, args, options, _callback) => {
+      if (args[0] === "describe") {
+        describes += 1;
+        expect(options.timeout).toBe(1_500);
+        expect(options.killSignal).toBe("SIGKILL");
+      }
+    });
+    try {
+      const db = tempDb();
+      const { guardian, child } = seedPractice(db);
+      const started = Date.now();
+      const session = startPracticeSession(db, guardian.id, child.id);
+      const result = submitAttempt(db, guardian.id, child.id, attemptInput(session.sessionId), {
+        now: WHEN,
+      });
+      expect(Date.now() - started).toBeLessThan(800);
+      expect(describes).toBe(1);
+      const attempt = db
+        .prepare(`SELECT build_sha FROM attempts WHERE id = ?`)
+        .get(result.attemptId) as { build_sha: string };
+      expect(attempt.build_sha.trim().length).toBeGreaterThan(0);
+      await refreshAppBuildSha();
+      expect(currentAppBuildSha()).toBe("unknown");
+    } finally {
+      restore();
+    }
+  });
+
+  it("keeps the last good tag after a later refresh fails", async () => {
+    let headMtime = 10;
+    let fail = false;
+    const restore = installGit((_file, args, _options, callback) => {
+      if (args[0] === "rev-parse") {
+        callback(null, ".git\n", "");
+        return;
+      }
+      if (fail) {
+        callback(new Error("describe failed"), "", "");
+        return;
+      }
+      callback(null, "abc123def456\n", "");
+    });
+    buildCommands.statSync = ((target: Parameters<typeof statSync>[0]) => {
+      const name = String(target);
+      return { mtimeMs: name.endsWith("HEAD") ? headMtime : headMtime + 1 } as ReturnType<
+        typeof statSync
+      >;
+    }) as typeof buildCommands.statSync;
+    buildCommands.readFileSync = ((target: Parameters<typeof readFileSync>[0]) => {
+      if (String(target).endsWith("HEAD")) return "ref: refs/heads/main";
+      return "";
+    }) as typeof buildCommands.readFileSync;
+    try {
+      await primeAppBuildSha();
+      expect(currentAppBuildSha()).toBe("abc123def456");
+      fail = true;
+      headMtime = 80;
+      expect(currentAppBuildSha()).toBe("abc123def456");
+      await refreshAppBuildSha();
+      expect(currentAppBuildSha()).toBe("abc123def456");
+      const db = tempDb();
+      const { guardian, child } = seedPractice(db);
+      const session = startPracticeSession(db, guardian.id, child.id);
+      const result = submitAttempt(db, guardian.id, child.id, attemptInput(session.sessionId), {
+        now: WHEN,
+      });
+      const attempt = db
+        .prepare(`SELECT build_sha FROM attempts WHERE id = ?`)
+        .get(result.attemptId) as { build_sha: string };
+      expect(attempt.build_sha).toBe("abc123def456");
+    } finally {
+      restore();
+    }
+  });
+
+  it("spawns git once when two refreshes overlap", async () => {
+    let describes = 0;
+    let release: ((error: Error | null, stdout: string, stderr: string) => void) | null = null;
+    const restore = installGit((_file, args, _options, callback) => {
+      if (args[0] === "rev-parse") {
+        callback(null, ".git\n", "");
+        return;
+      }
+      describes += 1;
+      release = callback;
+    });
+    try {
+      const first = refreshAppBuildSha();
+      const second = refreshAppBuildSha();
+      expect(describes).toBe(1);
+      release?.(null, "abc123def456\n", "");
+      await first;
+      await second;
+      expect(currentAppBuildSha()).toBe("abc123def456");
+      expect(describes).toBe(1);
+    } finally {
+      restore();
     }
   });
 
@@ -176,7 +402,8 @@ describe("app build tag", () => {
     }
   });
 
-  it("stores a non-empty build tag on a new attempt and session, and the log line includes it", () => {
+  it("stores a non-empty build tag on a new attempt and session, and the log line includes it", async () => {
+    await primeAppBuildSha();
     const db = tempDb();
     const guardian = createGuardian(db, {
       email: "parent@example.com",
@@ -241,7 +468,8 @@ describe("app build tag", () => {
     expect(JSON.stringify(session)).not.toContain(storedSession.build_sha as string);
   });
 
-  it("renders the build footer on the parent home and keeps it off child routes", () => {
+  it("renders the build footer on the parent home and keeps it off child routes", async () => {
+    await primeAppBuildSha();
     const html = renderToStaticMarkup(createElement(ParentBuildFooter));
     expect(html).toContain('data-testid="parent-build-footer"');
     expect(html).toContain(`Build ${formatParentBuildLabel(currentAppBuildSha()).replace(/^Build /, "")}`);
