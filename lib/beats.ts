@@ -1,5 +1,6 @@
 import type { FourBeat, IntegrityFlag, PublicItem } from "@/lib/attempt-contract";
 import { oneFocusForItem, tryNextForItem, whyItWorksForItem } from "@/lib/item-bank";
+import { unparseableChildLine, type UnparseableBehavior } from "@/lib/unparseable";
 
 /** The value once. Arithmetic stems become `27 + 15 = 42`. */
 export function answerStamp(prompt: string, canonicalAnswer: string): string {
@@ -21,13 +22,15 @@ export function buildFourBeat(input: {
   /** Correct-path solidify. Empty omits Why it works. */
   solidify?: string;
   unparseable?: boolean;
+  /** Branch already chosen by `submitAttempt`. This file does not read the seam. */
+  unparseableBehavior?: UnparseableBehavior;
 }): FourBeat {
   if (input.unparseable) {
     return {
       whatWentWell: "You stayed with the problem.",
       oneFocus: "",
       tryNext: "",
-      lockIn: "That answer stays quiet.",
+      lockIn: unparseableChildLine(input.unparseableBehavior ?? "lock"),
     };
   }
   const answer = input.answerLine ?? answerStamp(input.item.prompt, input.canonicalAnswer);

@@ -48,6 +48,7 @@ import {
   presentIssuedItem,
   readItemInstance,
 } from "@/lib/templates/issue";
+import { UNPARSEABLE_BEHAVIOR, type UnparseableBehavior } from "@/lib/unparseable";
 
 const KEY_PATTERN = /^[A-Za-z0-9_-]{8,80}$/;
 
@@ -347,7 +348,7 @@ export function submitAttempt(
   guardianId: string,
   childId: string,
   input: SubmitAttemptInput,
-  options?: { now?: string },
+  options?: { now?: string; unparseableBehavior?: UnparseableBehavior },
 ): AttemptResult {
   const idempotencyKey = input.idempotencyKey.trim();
   if (!KEY_PATTERN.test(idempotencyKey)) {
@@ -416,6 +417,9 @@ export function submitAttempt(
     let difficultyStep: number | null = null;
     let estimatorEvidence: number | null = null;
     let skipEconomy = false;
+    let outcome: "unparseable" | null = null;
+    let consumeThisInstance = false;
+    let advanceSession = true;
 
     if (input.itemInstanceId) {
       const instance = readItemInstance(db, input.itemInstanceId);
@@ -438,18 +442,26 @@ export function submitAttempt(
       instanceId = instance.itemInstanceId;
       templateId = instance.templateId;
       difficultyStep = instance.difficultyStep;
+      consumeThisInstance = true;
       const verdict = gradeStoredAnswer(instance, input.answer);
       if (verdict === "unparseable") {
+        const unparseableBehavior = options?.unparseableBehavior ?? UNPARSEABLE_BEHAVIOR;
         flags = ["unparseable"];
         correct = false;
         estimatorEvidence = 0;
+        outcome = "unparseable";
         skipEconomy = true;
+        if (unparseableBehavior === "retry") {
+          consumeThisInstance = false;
+          advanceSession = false;
+        }
         beats = buildFourBeat({
           correct: false,
           flags,
           item: skillItem,
           canonicalAnswer: instance.canonicalAnswer,
           unparseable: true,
+          unparseableBehavior,
         });
         economy = {
           lane: "review",
@@ -494,7 +506,9 @@ export function submitAttempt(
           saveSkillState(db, childId, skillItem.skill, economy.clientView);
         }
       }
-      consumeItemInstance(db, instance, idempotencyKey, submittedAt);
+      if (consumeThisInstance) {
+        consumeItemInstance(db, instance, idempotencyKey, submittedAt);
+      }
     } else {
       correct = gradeAnswer(itemId, input.answer);
       economy = planAttemptEconomy(db, {
@@ -526,12 +540,12 @@ export function submitAttempt(
          id, child_id, session_id, idempotency_key, item_id, answer, shown_at,
          submitted_at, correct, lane, celebration_tier, flags_json, beats_json,
          client_view_json, created_at, policy_version, build_sha, resume_presentation,
-         item_instance_id, template_id, difficulty_step, estimator_evidence
+         item_instance_id, template_id, difficulty_step, estimator_evidence, outcome
        ) VALUES (
          @id, @child_id, @session_id, @idempotency_key, @item_id, @answer, @shown_at,
          @submitted_at, @correct, @lane, @celebration_tier, @flags_json, @beats_json,
          @client_view_json, @created_at, @policy_version, @build_sha, @resume_presentation,
-         @item_instance_id, @template_id, @difficulty_step, @estimator_evidence
+         @item_instance_id, @template_id, @difficulty_step, @estimator_evidence, @outcome
        )`,
     ).run({
       id: attemptId,
@@ -556,6 +570,7 @@ export function submitAttempt(
       template_id: templateId,
       difficulty_step: difficultyStep,
       estimator_evidence: estimatorEvidence,
+      outcome,
     });
     if (!skipEconomy) commitAttemptEconomy(db, {
       childId,
@@ -570,9 +585,11 @@ export function submitAttempt(
       celebrationTier: economy.celebrationTier,
       mints: economy.mints,
     });
-    db.prepare(
-      `UPDATE practice_sessions SET item_index = ? WHERE id = ?`,
-    ).run((session.item_index + 1) % ITEM_CATALOG.length, session.id);
+    if (advanceSession) {
+      db.prepare(
+        `UPDATE practice_sessions SET item_index = ? WHERE id = ?`,
+      ).run((session.item_index + 1) % ITEM_CATALOG.length, session.id);
+    }
     const stored = findAttempt(db, childId, idempotencyKey);
     if (!stored) throw new DomainError("Attempt was not saved.", 500);
     const log = readAttemptLog(db, stored.id);

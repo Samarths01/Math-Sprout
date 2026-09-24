@@ -28,7 +28,7 @@ Architecture §21 supersedes treating those integrity fixtures as a Slice 2 exit
 
 ## Item templates
 
-Practice problems are issued on the server from versioned templates. Each of the 11 skills has the original item as a legacy `v0` seed plus at least three generated shapes. Progression stays `rules-v0` and serves difficulty step 1 (Warm-up) only. Steps 2 and 3 exist on the template so later policies can turn them on. The server copies `template_version`, `evidence_eligible`, and the canonical answer onto `item_instances` at issue time. Scoring reads that copy. A blank answer is still review-lane evidence and mints nothing. An unparseable answer is a separate path: it locks the item, records no estimator evidence, and mints nothing. See `docs/item-templates.md`.
+Practice problems are issued on the server from versioned templates. Each of the 11 skills has the original item as a legacy `v0` seed plus at least three generated shapes. Progression stays `rules-v0` and serves difficulty step 1 (Warm-up) only. Steps 2 and 3 exist on the template so later policies can turn them on. The server copies `template_version`, `evidence_eligible`, and the canonical answer onto `item_instances` at issue time. Scoring reads that copy. A blank answer is still review-lane evidence and mints nothing. An unparseable answer is a separate path: the attempt is stored with outcome `unparseable`, it records no estimator evidence, and it mints nothing. Lock versus retry is the one constant `UNPARSEABLE_BEHAVIOR`, currently `lock`. See `docs/item-templates.md`.
 
 ## Run locally
 

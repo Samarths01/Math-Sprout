@@ -9,7 +9,7 @@ import { DomainError, createChild, createGuardian, setConsent } from "@/lib/doma
 import { SKILLS, TEMPLATE_VERSIONS, generatedTemplates } from "@/lib/templates/catalog";
 import { ambiguousBugs, drawAccepted, drawOnce, seeded, validateTemplate } from "@/lib/templates/engine";
 import { cueText } from "@/lib/templates/cues";
-import { exactRepeatRate, stepsPracticed } from "@/lib/templates/instruments";
+import { exactRepeatRate, stepsPracticed, unparseableRates } from "@/lib/templates/instruments";
 import {
   ISSUE_BATCH_CAP,
   PROGRESSION_DIFFICULTY_STEP,
@@ -25,6 +25,7 @@ import {
 import { answersMatch } from "@/lib/templates/rational";
 import { ISSUANCE_TEMPLATE_COLUMNS, issuanceTemplateSelect } from "@/lib/templates/store";
 import type { TemplateVersion } from "@/lib/templates/types";
+import { ITEM_CATALOG } from "@/lib/item-catalog";
 import { evidenceForSkill } from "@/lib/learner-state";
 import { provisionalVerdict } from "@/lib/provisional-verdict";
 import { POLICY_VERSION } from "@/lib/policy";
@@ -77,6 +78,21 @@ function qeCount(db: Database.Database, attemptId: string): number {
       count: number;
     }
   ).count;
+}
+
+function itemIndex(db: Database.Database, sessionId: string): number {
+  return (
+    db.prepare(`SELECT item_index AS itemIndex FROM practice_sessions WHERE id = ?`).get(sessionId) as {
+      itemIndex: number;
+    }
+  ).itemIndex;
+}
+
+function streakState(db: Database.Database, childId: string): string | null {
+  const row = db
+    .prepare(`SELECT streak_state FROM learner_progress WHERE child_id = ?`)
+    .get(childId) as { streak_state: string } | undefined;
+  return row?.streak_state ?? null;
 }
 
 function instanceCount(db: Database.Database, childId: string): number {
@@ -728,6 +744,11 @@ describe("item templates and issuance", () => {
     expect(blank.lane).toBe("review");
     expect(blank.flags).toContain("empty_answer");
     expect(blank.lockIn).toBe("A blank answer stays quiet.");
+    const blankRow = db
+      .prepare(`SELECT outcome, estimator_evidence FROM attempts WHERE id = ?`)
+      .get(blank.attemptId) as { outcome: string | null; estimator_evidence: number | null };
+    expect(blankRow.outcome).toBeNull();
+    expect(blankRow.estimator_evidence).toBeNull();
     const blankEvidence = evidenceForSkill(db, child.id, skill);
     expect(blankEvidence.some((row) => row.correct === false && row.lane === "review")).toBe(true);
     expect(blankEvidence.some((row) => row.correct === false && row.lane === "celebrate")).toBe(false);
@@ -741,6 +762,8 @@ describe("item templates and issuance", () => {
     });
     const before = evidenceForSkill(db, child.id, skill);
     const beforeXp = xpCount(db);
+    const beforeStreak = streakState(db, child.id);
+    const beforeIndex = itemIndex(db, session.sessionId);
     const locked = submitAttempt(
       db,
       guardian.id,
@@ -769,13 +792,34 @@ describe("item templates and issuance", () => {
     const after = evidenceForSkill(db, child.id, skill);
     expect(after).toEqual(before);
     const row = db
-      .prepare(`SELECT estimator_evidence, lane, correct FROM attempts WHERE id = ?`)
-      .get(locked.attemptId) as { estimator_evidence: number; lane: string; correct: number };
+      .prepare(
+        `SELECT estimator_evidence, lane, correct, outcome FROM attempts WHERE id = ?`,
+      )
+      .get(locked.attemptId) as {
+      estimator_evidence: number;
+      lane: string;
+      correct: number;
+      outcome: string | null;
+    };
     expect(row.estimator_evidence).toBe(0);
     expect(row.lane).toBe("review");
     expect(row.correct).toBe(0);
+    expect(row.outcome).toBe("unparseable");
+    expect(row.lane).not.toBe("celebrate");
+    expect(streakState(db, child.id)).toBe(beforeStreak);
+    expect(itemIndex(db, session.sessionId)).toBe((beforeIndex + 1) % ITEM_CATALOG.length);
     const consumed = readItemInstance(db, issued.itemInstanceId);
     expect(consumed?.consumedByAttemptKey).toBe("unparse-key-01");
+    expect(unparseableRates(db, child.id)).toEqual([
+      {
+        templateId: issued.templateId,
+        templateVersion: issued.templateVersion,
+        provenance: "seed",
+        unparseable: 1,
+        attempts: 1,
+        rate: 1,
+      },
+    ]);
 
     const replay = submitAttempt(db, guardian.id, child.id, {
       idempotencyKey: "unparse-key-01",
@@ -800,6 +844,102 @@ describe("item templates and issuance", () => {
       }),
     ).toThrow(DomainError);
     expect(evidenceForSkill(db, child.id, skill)).toEqual(before);
+  });
+
+  it("retries an unparseable answer without consuming the instance", () => {
+    const db = tempDb();
+    const { guardian, child, session } = granted(db);
+    const skill = session.item.skill;
+    const issued = issueForProgression(db, {
+      childId: child.id,
+      sessionId: session.sessionId,
+      skillId: skill,
+      idempotencyKey: "unparse-retry-slot",
+      now: WHEN,
+    });
+    const before = evidenceForSkill(db, child.id, skill);
+    const beforeXp = xpCount(db);
+    const beforeStreak = streakState(db, child.id);
+    const beforeIndex = itemIndex(db, session.sessionId);
+    const hinted = submitAttempt(
+      db,
+      guardian.id,
+      child.id,
+      {
+        idempotencyKey: "unparse-retry-01",
+        sessionId: session.sessionId,
+        itemId: session.item.id,
+        itemInstanceId: issued.itemInstanceId,
+        answer: "banana",
+        shownAt: shown(),
+        submittedAt: WHEN,
+      },
+      { now: WHEN, unparseableBehavior: "retry" },
+    );
+    expect(hinted.correct).toBe(false);
+    expect(hinted.flags).toEqual(["unparseable"]);
+    expect(hinted.xpAmount).toBe(0);
+    expect(hinted.eventIds).toEqual([]);
+    expect(hinted.lockIn).toBe("Type a number like 3 or 1/2.");
+    expect(hinted.lockIn).not.toContain(issued.canonicalAnswer);
+    expect(hinted.oneFocus).not.toContain(issued.canonicalAnswer);
+    expect(qeCount(db, hinted.attemptId)).toBe(0);
+    expect(xpCount(db, hinted.attemptId)).toBe(0);
+    expect(xpCount(db)).toBe(beforeXp);
+    expect(evidenceForSkill(db, child.id, skill)).toEqual(before);
+    expect(streakState(db, child.id)).toBe(beforeStreak);
+    expect(itemIndex(db, session.sessionId)).toBe(beforeIndex);
+    const held = readItemInstance(db, issued.itemInstanceId);
+    expect(held?.consumedAt).toBeNull();
+    expect(held?.consumedByAttemptKey).toBeNull();
+    const row = db
+      .prepare(`SELECT outcome, estimator_evidence, lane, correct FROM attempts WHERE id = ?`)
+      .get(hinted.attemptId) as {
+      outcome: string | null;
+      estimator_evidence: number;
+      lane: string;
+      correct: number;
+    };
+    expect(row.outcome).toBe("unparseable");
+    expect(row.estimator_evidence).toBe(0);
+    expect(row.lane).toBe("review");
+    expect(row.correct).toBe(0);
+
+    const later = "2026-06-15T18:00:20.000Z";
+    const scored = submitAttempt(
+      db,
+      guardian.id,
+      child.id,
+      {
+        idempotencyKey: "unparse-retry-02",
+        sessionId: session.sessionId,
+        itemId: session.item.id,
+        itemInstanceId: issued.itemInstanceId,
+        answer: issued.canonicalAnswer,
+        shownAt: new Date(Date.parse(later) - 2_000).toISOString(),
+        submittedAt: later,
+      },
+      { now: later, unparseableBehavior: "retry" },
+    );
+    expect(scored.correct).toBe(true);
+    expect(scored.flags).toEqual([]);
+    const consumed = readItemInstance(db, issued.itemInstanceId);
+    expect(consumed?.consumedByAttemptKey).toBe("unparse-retry-02");
+    const kept = db
+      .prepare(`SELECT id, outcome FROM attempts WHERE outcome = 'unparseable'`)
+      .all() as Array<{ id: string; outcome: string }>;
+    expect(kept).toEqual([{ id: hinted.attemptId, outcome: "unparseable" }]);
+    expect(unparseableRates(db, child.id)).toEqual([
+      {
+        templateId: issued.templateId,
+        templateVersion: issued.templateVersion,
+        provenance: "seed",
+        unparseable: 1,
+        attempts: 2,
+        rate: 0.5,
+      },
+    ]);
+    expect(evidenceForSkill(db, child.id, skill).some((entry) => entry.correct)).toBe(true);
   });
 
   it("mints an offline batch only when the server scores it", () => {

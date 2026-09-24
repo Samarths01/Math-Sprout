@@ -10,4 +10,6 @@ A template version is immutable. Changing a spec means adding a new version. `te
 
 `parent_prior_grade` and `parent_prior_difficulty` are nullable columns on the template version. Every seed leaves them null. Issuance does not read them.
 
-An unparseable answer locks the instance, writes no estimator evidence, and mints no qualifying event, XP, or streak. A blank answer is not that path. A blank is an `empty_answer` review-lane try: it mints no XP, it is not a celebrate miss, and it still occupies a slot in the mastery window.
+An unparseable answer is its own path. The attempt row is kept with `outcome = 'unparseable'`. It records no estimator evidence, mints no qualifying event, XP, or streak, and is not a miss. Blank answers are unchanged: an `empty_answer` review-lane try mints no XP, is not a celebrate miss, and still occupies a slot in the mastery window.
+
+Whether the child is locked out or shown “Type a number like 3 or 1/2” and allowed to retry is not decided. `UNPARSEABLE_BEHAVIOR` in `lib/unparseable.ts` is the only switch (`'lock' | 'retry'`). It defaults to `'lock'`. `'retry'` leaves the instance unconsumed and still writes the attempt row. Changing that one constant is the whole decision.

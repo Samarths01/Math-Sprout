@@ -100,6 +100,11 @@ export function migrateItemTemplates(db: Database.Database): void {
   addAttemptColumn(db, "template_id", "template_id TEXT");
   addAttemptColumn(db, "difficulty_step", "difficulty_step INTEGER");
   addAttemptColumn(db, "estimator_evidence", "estimator_evidence INTEGER");
+  addAttemptColumn(
+    db,
+    "outcome",
+    "outcome TEXT CHECK (outcome IS NULL OR outcome = 'unparseable')",
+  );
   const count = db.prepare(`SELECT COUNT(*) AS count FROM item_template_versions`).get() as {
     count: number;
   };
