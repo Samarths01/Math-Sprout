@@ -12,6 +12,7 @@ import {
   createBuildResolver,
   currentAppBuildSha,
   formatParentBuildLabel,
+  type GitExecCallback,
   primeAppBuildSha,
   refreshAppBuildSha,
   resetBuildCacheForTests,
@@ -30,6 +31,7 @@ const cleanups: Array<() => void> = [];
 const WHEN = "2026-06-15T18:00:00.000Z";
 
 afterEach(() => {
+  vi.unstubAllEnvs();
   stopBuildShaRefresh();
   while (cleanups.length > 0) cleanups.pop()?.();
 });
@@ -362,7 +364,7 @@ describe("app build tag", () => {
 
   it("spawns git once when two refreshes overlap", async () => {
     let describes = 0;
-    let release: ((error: Error | null, stdout: string, stderr: string) => void) | null = null;
+    let release = null as GitExecCallback | null;
     const restore = installGit((_file, args, _options, callback) => {
       if (args[0] === "rev-parse") {
         callback(null, ".git\n", "");
@@ -429,7 +431,8 @@ describe("app build tag", () => {
       statCalls += 1;
       return { mtimeMs: 10 } as ReturnType<typeof statSync>;
     }) as typeof buildCommands.statSync;
-    buildCommands.readFileSync = (() => "ref: refs/heads/main") as typeof buildCommands.readFileSync;
+    buildCommands.readFileSync = (() =>
+      "ref: refs/heads/main") as unknown as typeof buildCommands.readFileSync;
     try {
       await primeAppBuildSha();
       gitCalls = 0;
@@ -459,24 +462,23 @@ describe("app build tag", () => {
     const spy = vi.spyOn(console, "warn").mockImplementation((message) => {
       warnings.push(String(message));
     });
-    const previous = process.env.NODE_ENV;
     try {
       warnIfBuildUnknown("abc123");
       expect(warnings).toEqual([]);
-      process.env.NODE_ENV = "production";
+      vi.stubEnv("NODE_ENV", "production");
       expect(() => warnIfBuildUnknown("unknown")).not.toThrow();
-      process.env.NODE_ENV = "development";
+      vi.stubEnv("NODE_ENV", "development");
       expect(() => warnIfBuildUnknown("unknown")).not.toThrow();
       expect(warnings).toHaveLength(2);
       expect(warnings[0]).toContain("APP_BUILD_SHA");
       expect(warnings[0]).toContain("Before/after analysis will exclude these rows");
     } finally {
-      process.env.NODE_ENV = previous;
       spy.mockRestore();
     }
   });
 
   it("stores a non-empty build tag on a new attempt and session, and the log line includes it", async () => {
+    vi.stubEnv("APP_BUILD_SHA", "test-sentinel-sha");
     await primeAppBuildSha();
     const db = tempDb();
     const guardian = createGuardian(db, {
@@ -519,6 +521,7 @@ describe("app build tag", () => {
       .get(session.sessionId) as { build_sha: string | null; policy_version: string };
     expect(attempt.policy_version).toBe("rules-v0");
     expect(storedSession.policy_version).toBe("rules-v0");
+    expect(attempt.build_sha).toBe("test-sentinel-sha");
     expect(attempt.build_sha).toBe(currentAppBuildSha());
     expect(storedSession.build_sha).toBe(currentAppBuildSha());
     expect(attempt.build_sha?.trim().length).toBeGreaterThan(0);

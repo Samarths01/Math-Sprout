@@ -48,28 +48,32 @@ export function createBuildResolver(deps: BuildResolverDeps) {
     }
   }
 
-  function stale(now: number): boolean {
+  function stale(now: number, stamp: string | null): boolean {
     if (!cache) return true;
-    if (cache.stamp !== snapshotStamp()) return true;
+    if (cache.stamp !== stamp) return true;
     return now - cache.at >= ttl;
   }
 
-  function rememberFailure(gen: number) {
+  function rememberFailure(gen: number, stamp: string | null) {
     if (gen !== generation) return;
     cache = {
       value: cache?.value ?? "unknown",
-      stamp: snapshotStamp(),
+      stamp,
       at: deps.now(),
     };
   }
 
-  function refresh(): Promise<void> {
+  /**
+   * One HEAD snapshot for this refresh. current() passes the stamp it already
+   * read so a save does not stat HEAD twice.
+   */
+  function refresh(preset?: string | null): Promise<void> {
     if (pinnedEnv()) return Promise.resolve();
     if (inflight) return inflight;
-    if (!stale(deps.now())) return Promise.resolve();
+    const stamp = preset !== undefined ? preset : snapshotStamp();
+    if (!stale(deps.now(), stamp)) return Promise.resolve();
     const gen = generation;
     const work = (async () => {
-      const stamp = snapshotStamp();
       const at = deps.now();
       const next = nonempty(await deps.describe());
       if (gen !== generation) return;
@@ -77,7 +81,7 @@ export function createBuildResolver(deps: BuildResolverDeps) {
     })();
     inflight = work
       .catch(() => {
-        rememberFailure(gen);
+        rememberFailure(gen, stamp);
       })
       .finally(() => {
         if (gen === generation) inflight = null;
@@ -94,7 +98,8 @@ export function createBuildResolver(deps: BuildResolverDeps) {
     current(): string {
       const pinned = pinnedEnv();
       if (pinned) return pinned;
-      if (stale(deps.now())) void refresh();
+      const stamp = snapshotStamp();
+      if (stale(deps.now(), stamp)) void refresh(stamp);
       return cache?.value ?? "unknown";
     },
     /** Cache only. Does not read HEAD and does not start git. */
@@ -120,7 +125,7 @@ type GitExecOptions = {
   encoding?: "utf8";
 };
 
-type GitExecCallback = (error: Error | null, stdout: string, stderr: string) => void;
+export type GitExecCallback = (error: Error | null, stdout: string, stderr: string) => void;
 
 /** Process calls the resolver uses. Tests replace these to mock git and the HEAD files. */
 export const buildCommands = {
@@ -191,7 +196,9 @@ function ensureGitDir(): Promise<void> {
   if (!gitDirPromise) {
     gitDirPromise = gitOutput(["rev-parse", "--git-dir"])
       .then((dir) => {
-        gitDirPath = dir ? path.resolve(process.cwd(), dir) : null;
+        gitDirPath = dir
+          ? path.resolve(/* turbopackIgnore: true */ process.cwd(), dir)
+          : null;
       })
       .catch(() => {
         gitDirPath = null;
@@ -208,13 +215,13 @@ export function readGitDescribe(): Promise<string | null> {
 export function readHeadStamp(): string | null {
   try {
     if (!gitDirPath) return null;
-    const headPath = path.join(gitDirPath, "HEAD");
+    const headPath = path.join(/* turbopackIgnore: true */ gitDirPath, "HEAD");
     const headStat = buildCommands.statSync(headPath);
     let stamp = String(headStat.mtimeMs);
     const head = String(buildCommands.readFileSync(headPath, "utf8")).trim();
     const ref = head.match(/^ref:\s+(.+)$/);
     if (ref) {
-      stamp += `:${buildCommands.statSync(path.join(gitDirPath, ref[1])).mtimeMs}`;
+      stamp += `:${buildCommands.statSync(path.join(/* turbopackIgnore: true */ gitDirPath, ref[1])).mtimeMs}`;
     }
     return stamp;
   } catch {

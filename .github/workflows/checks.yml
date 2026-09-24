@@ -17,3 +17,9 @@ jobs:
       - run: npm ci
       - run: node -v
       - run: npm test
+      - run: npx tsc --noEmit
+      - run: npm run build
+        env:
+          APP_BUILD_SHA: ci-build-sha
+          DATABASE_PATH: ./data/ci.sqlite
+          COOKIE_SECURE: "false"
