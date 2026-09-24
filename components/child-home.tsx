@@ -84,11 +84,10 @@ export function ChildHomeFrame({
             dayCount={glance.dayCount}
             pieces={glance.pieces}
             goal={glance.goal}
-            text={fuelLine}
+            text={fuelText ?? fuelLine}
             flame={flame}
             heat={heatState}
             sourceEventId={sourceEventId}
-            text={fuelText}
           />
         </CardContent>
       </Card>
