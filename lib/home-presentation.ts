@@ -3,6 +3,7 @@ import type { BandLabel } from "@/lib/attempt-contract";
 import { itemAt } from "@/lib/item-catalog";
 import { readSkillClientView, startIndexForLane, firstReviewSkill } from "@/lib/learner-state";
 import { DEFAULT_PRACTICE_LANE, practiceLaneOrRecommended } from "@/lib/mastery";
+import { assertFuelCopy, sealFuelGlance } from "@/lib/fuel-guards";
 import type { ConsentViewStatus } from "@/lib/practice-gate";
 import type { InterfaceCopyKey } from "@/lib/interface-copy";
 
@@ -16,12 +17,20 @@ export type FuelStripInput = {
 
 /** One line under the practice control. Numbers, not metaphor prose. */
 export function fuelStripText(input: FuelStripInput): string {
+  const glance = sealFuelGlance({
+    xp: input.xp,
+    dayCount: input.dayCount,
+    pieces: input.pieces,
+    goal: input.goal,
+  });
   const flame = !input.started
     ? "🔥 Start your flame"
-    : input.dayCount === null
+    : glance.dayCount === null
       ? "🔥 Flame resting"
-      : `🔥 ${input.dayCount}-day flame`;
-  return `${flame} · ⭐ ${input.xp} XP · 🧩 ${input.pieces}/${input.goal}`;
+      : `🔥 ${glance.dayCount}-day flame`;
+  return assertFuelCopy(
+    `${flame} · ⭐ ${glance.xp} XP · 🧩 ${glance.pieces}/${glance.goal}`,
+  );
 }
 
 export function childBlockCopyKey(
