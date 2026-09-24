@@ -169,17 +169,28 @@ function requireSession(db: Database.Database, childId: string, sessionId: strin
   return row;
 }
 
+/** Slot numbers only increase. The catalog length rotates skills, not issuance keys. */
+function advanceSessionSlot(db: Database.Database, sessionId: string, slotSeq: number): void {
+  const next = slotSeq + 1;
+  db.prepare(`UPDATE practice_sessions SET slot_seq = ?, item_index = ? WHERE id = ?`).run(
+    next,
+    next % ITEM_CATALOG.length,
+    sessionId,
+  );
+}
+
 function presentSession(
   db: Database.Database,
   childId: string,
   session: {
     id: string;
     item_index: number;
+    slot_seq: number;
     practice_lane: PracticeLane;
     phase: "practicing" | "boundary" | "closed";
   },
 ): PracticeSessionStart {
-  const item = presentIssuedItem(db, childId, session.id, session.item_index);
+  const item = presentIssuedItem(db, childId, session.id, session.slot_seq);
   return {
     sessionId: session.id,
     item,
@@ -253,8 +264,8 @@ function resultFromRow(
     .all(row.id) as Array<{ id: string; kind: string }>;
   const credit = credits.reduce((sum, event) => sum + event.amount, 0);
   const session = db
-    .prepare(`SELECT item_index FROM practice_sessions WHERE id = ?`)
-    .get(row.session_id) as { item_index: number } | undefined;
+    .prepare(`SELECT slot_seq FROM practice_sessions WHERE id = ?`)
+    .get(row.session_id) as { slot_seq: number } | undefined;
   if (!session) throw new DomainError("Practice session not found.", 404);
   const beats = readBeats(row.beats_json);
   if (row.celebration_tier === "full" && credits.length === 0) {
@@ -278,7 +289,7 @@ function resultFromRow(
     xpAmount: credit,
     fuel: fuelFromEvents(qualifying, credit),
     clientView,
-    nextItem: presentIssuedItem(db, row.child_id, row.session_id, session.item_index),
+    nextItem: presentIssuedItem(db, row.child_id, row.session_id, session.slot_seq),
     ...(row.resume_presentation === "quiet" ? { resumePresentation: "quiet" as const } : {}),
   };
 }
@@ -331,12 +342,13 @@ export function startPracticeSession(
     const sessionId = randomUUID();
     db.prepare(
       `INSERT INTO practice_sessions (
-         id, child_id, status, item_index, started_at, practice_lane, phase,
+         id, child_id, status, item_index, slot_seq, started_at, practice_lane, phase,
          policy_version, build_sha
-       ) VALUES (?, ?, 'active', ?, ?, ?, 'practicing', ?, ?)`,
+       ) VALUES (?, ?, 'active', ?, ?, ?, ?, 'practicing', ?, ?)`,
     ).run(
       sessionId,
       childId,
+      itemIndex % ITEM_CATALOG.length,
       itemIndex,
       nowIso(),
       progress.nextLane,
@@ -423,7 +435,15 @@ export function submitAnswer(
     let templateId: string | null = null;
     let difficultyStep: number | null = null;
     let estimatorEvidence: number | null = null;
+    let attemptOutcome: "correct" | "incorrect" | "form_mismatch" = "incorrect";
     let skipEconomy = false;
+
+    const issuedOnSession = db
+      .prepare(`SELECT COUNT(*) AS count FROM item_instances WHERE session_id = ?`)
+      .get(sessionId) as { count: number };
+    if (issuedOnSession.count > 0 && !input.itemInstanceId) {
+      throw new DomainError("An issued problem id is required.", 400);
+    }
 
     if (input.itemInstanceId) {
       const instance = readItemInstance(db, input.itemInstanceId);
@@ -485,10 +505,7 @@ export function submitAnswer(
         });
         if (unparseableBehavior === "lock") {
           consumeItemInstance(db, instance, idempotencyKey, submittedAt);
-          db.prepare(`UPDATE practice_sessions SET item_index = ? WHERE id = ?`).run(
-            (session.item_index + 1) % ITEM_CATALOG.length,
-            session.id,
-          );
+          advanceSessionSlot(db, session.id, session.slot_seq);
         }
         return {
           result: {
@@ -504,16 +521,18 @@ export function submitAnswer(
         };
       }
       correct = verdict === "correct";
+        const formMiss = verdict === "form_mismatch";
+        const valueMiss = verdict === "incorrect" || formMiss;
+        attemptOutcome = formMiss ? "form_mismatch" : correct ? "correct" : "incorrect";
         estimatorEvidence = instance.evidenceEligible ? 1 : 0;
-        const focus =
-          verdict === "incorrect" ? focusForStoredAnswer(instance, input.answer) : null;
+        const focus = valueMiss ? focusForStoredAnswer(instance, input.answer) : null;
         beats = buildFourBeat({
           correct,
           flags,
           item: skillItem,
           canonicalAnswer: instance.canonicalAnswer,
           answerLine: instance.answerLine,
-          ...(flags.length === 0 && verdict === "incorrect" && focus
+          ...(flags.length === 0 && valueMiss && focus
             ? { focus: focus.oneFocus, tryNext: focus.tryNext }
             : {}),
           ...(flags.length === 0 && correct ? { solidify: instance.whyItWorks ?? "" } : {}),
@@ -557,6 +576,7 @@ export function submitAnswer(
         canonicalAnswer: canonicalAnswer(itemId),
       });
       saveSkillState(db, childId, item.skill, economy.clientView);
+      attemptOutcome = correct ? "correct" : "incorrect";
     }
     const quietResume = takePendingPauseHold(db, childId, idempotencyKey);
     const attemptId = randomUUID();
@@ -566,12 +586,12 @@ export function submitAnswer(
          id, child_id, session_id, idempotency_key, item_id, answer, shown_at,
          submitted_at, correct, lane, celebration_tier, flags_json, beats_json,
          client_view_json, created_at, policy_version, build_sha, resume_presentation,
-         item_instance_id, template_id, difficulty_step, estimator_evidence
+         item_instance_id, template_id, difficulty_step, estimator_evidence, outcome
        ) VALUES (
          @id, @child_id, @session_id, @idempotency_key, @item_id, @answer, @shown_at,
          @submitted_at, @correct, @lane, @celebration_tier, @flags_json, @beats_json,
          @client_view_json, @created_at, @policy_version, @build_sha, @resume_presentation,
-         @item_instance_id, @template_id, @difficulty_step, @estimator_evidence
+         @item_instance_id, @template_id, @difficulty_step, @estimator_evidence, @outcome
        )`,
     ).run({
       id: attemptId,
@@ -596,6 +616,7 @@ export function submitAnswer(
       template_id: templateId,
       difficulty_step: difficultyStep,
       estimator_evidence: estimatorEvidence,
+      outcome: attemptOutcome,
     });
     if (!skipEconomy) commitAttemptEconomy(db, {
       childId,
@@ -610,9 +631,7 @@ export function submitAnswer(
       celebrationTier: economy.celebrationTier,
       mints: economy.mints,
     });
-    db.prepare(
-      `UPDATE practice_sessions SET item_index = ? WHERE id = ?`,
-    ).run((session.item_index + 1) % ITEM_CATALOG.length, session.id);
+    advanceSessionSlot(db, session.id, session.slot_seq);
     const stored = findAttempt(db, childId, idempotencyKey);
     if (!stored) throw new DomainError("Attempt was not saved.", 500);
     const log = readAttemptLog(db, stored.id);

@@ -134,13 +134,46 @@ export function migrateItemTemplates(db: Database.Database): void {
   addAttemptColumn(db, "template_id", "template_id TEXT");
   addAttemptColumn(db, "difficulty_step", "difficulty_step INTEGER");
   addAttemptColumn(db, "estimator_evidence", "estimator_evidence INTEGER");
-  const count = db.prepare(`SELECT COUNT(*) AS count FROM item_template_versions`).get() as {
-    count: number;
-  };
-  if (count.count === 0) seedTemplateVersions(db);
+  addAttemptColumn(
+    db,
+    "outcome",
+    "outcome TEXT CHECK (outcome IS NULL OR outcome IN ('correct', 'incorrect', 'form_mismatch'))",
+  );
+  if (addSessionColumn(db, "slot_seq", "slot_seq INTEGER NOT NULL DEFAULT 0")) {
+    db.exec(`UPDATE practice_sessions SET slot_seq = item_index`);
+  }
+  seedTemplateVersions(db);
+}
+
+function addSessionColumn(db: Database.Database, name: string, ddl: string): boolean {
+  const columns = new Set(
+    (db.pragma("table_info(practice_sessions)") as Array<{ name: string }>).map((row) => row.name),
+  );
+  if (columns.size === 0 || columns.has(name)) return false;
+  db.exec(`ALTER TABLE practice_sessions ADD COLUMN ${ddl}`);
+  return true;
 }
 
 export function seedTemplateVersions(db: Database.Database): void {
+  const existing = db
+    .prepare(
+      `SELECT template_id, template_version, content_hash
+       FROM item_template_versions`,
+    )
+    .all() as Array<{ template_id: string; template_version: number; content_hash: string }>;
+  const hashes = new Map(
+    existing.map((row) => [`${row.template_id}@${row.template_version}`, row.content_hash]),
+  );
+  for (const template of TEMPLATE_VERSIONS) {
+    const key = `${template.templateId}@${template.version}`;
+    const prior = hashes.get(key);
+    const next = templateContentHash(template);
+    if (prior !== undefined && prior !== next) {
+      throw new Error(
+        `Template ${key} content_hash does not match the spec. Ship a new version instead of editing this one.`,
+      );
+    }
+  }
   const insert = db.prepare(
     `INSERT OR IGNORE INTO item_template_versions (
        template_id, template_version, skill_id, prompt_shape, spec_json, bug_rules_json,

@@ -26,6 +26,8 @@ import { ChildHomeFrame } from "@/components/child-home";
 import { PracticeProblem } from "@/components/practice-problem";
 import { readCompanion } from "@/lib/companion";
 import { openDatabase } from "@/lib/db";
+import { itemAt } from "@/lib/item-catalog";
+import { issueItemBatch, readItemInstance, toPublicItem } from "@/lib/templates/issue";
 import { createChild, createGuardian, getChildHome, setConsent } from "@/lib/domain";
 
 const cleanups: Array<() => void> = [];
@@ -51,14 +53,22 @@ function seedPractice(db: ReturnType<typeof tempDb>) {
   return { guardian, child };
 }
 
-function attemptInput(sessionId: string) {
+function attemptInput(db: Database.Database, sessionId: string) {
+  const issued = db
+    .prepare(
+      `SELECT item_instance_id, canonical_answer FROM item_instances
+       WHERE session_id = ? AND consumed_at IS NULL
+       ORDER BY issued_at DESC LIMIT 1`,
+    )
+    .get(sessionId) as { item_instance_id: string; canonical_answer: string } | undefined;
   return {
     idempotencyKey: "build-tag-0001",
     sessionId,
     itemId: "ops-g2-add",
-    answer: "42",
+    answer: issued?.canonical_answer ?? "42",
     shownAt: new Date(Date.parse(WHEN) - 2_000).toISOString(),
     submittedAt: WHEN,
+    ...(issued ? { itemInstanceId: issued.item_instance_id } : {}),
   };
 }
 
@@ -75,7 +85,7 @@ function tempDb() {
 function assertChildPayloadSealed(value: unknown) {
   const dumped = JSON.stringify(value);
   expect(dumped).not.toMatch(
-    /build_sha|policy_version|buildSha|policyVersion|provenance|evidence_eligible|evidenceEligible|computed_step|computedStep|assigned_step|assignedStep|parent_prior|parentPrior|template_version|templateVersion|canonical_answer|canonicalAnswer/,
+    /build_sha|policy_version|buildSha|policyVersion|provenance|evidence_eligible|evidenceEligible|computed_step|computedStep|assigned_step|assignedStep|parent_prior|parentPrior|template_version|templateVersion|canonical_answer|canonicalAnswer|form_mismatch/,
   );
 }
 
@@ -274,7 +284,7 @@ describe("app build tag", () => {
       const db = tempDb();
       const { guardian, child } = seedPractice(db);
       const session = startPracticeSession(db, guardian.id, child.id);
-      const result = submitAttempt(db, guardian.id, child.id, attemptInput(session.sessionId), {
+      const result = submitAttempt(db, guardian.id, child.id, attemptInput(db, session.sessionId), {
         now: WHEN,
       });
       const attempt = db
@@ -302,7 +312,7 @@ describe("app build tag", () => {
       const { guardian, child } = seedPractice(db);
       const started = Date.now();
       const session = startPracticeSession(db, guardian.id, child.id);
-      const result = submitAttempt(db, guardian.id, child.id, attemptInput(session.sessionId), {
+      const result = submitAttempt(db, guardian.id, child.id, attemptInput(db, session.sessionId), {
         now: WHEN,
       });
       expect(Date.now() - started).toBeLessThan(800);
@@ -353,7 +363,7 @@ describe("app build tag", () => {
       const db = tempDb();
       const { guardian, child } = seedPractice(db);
       const session = startPracticeSession(db, guardian.id, child.id);
-      const result = submitAttempt(db, guardian.id, child.id, attemptInput(session.sessionId), {
+      const result = submitAttempt(db, guardian.id, child.id, attemptInput(db, session.sessionId), {
         now: WHEN,
       });
       const attempt = db
@@ -513,21 +523,38 @@ describe("app build tag", () => {
       emitted.push(String(message));
     });
     const session = startPracticeSession(db, guardian.id, child.id);
-    const shown = new Date(Date.parse(WHEN) - 2_000).toISOString();
-    const result = submitAttempt(
-      db,
-      guardian.id,
-      child.id,
-      {
-        idempotencyKey: "build-tag-0001",
-        sessionId: session.sessionId,
-        itemId: "ops-g2-add",
-        answer: "42",
-        shownAt: shown,
-        submittedAt: WHEN,
-      },
-      { now: WHEN },
+    const instanceId = session.item.itemInstanceId ?? "";
+    const original = db
+      .prepare(`SELECT canonical_answer FROM item_instances WHERE item_instance_id = ?`)
+      .get(instanceId) as { canonical_answer: string };
+    db.prepare(`UPDATE item_instances SET canonical_answer = ? WHERE item_instance_id = ?`).run(
+      "SENTINEL_STORED_ANSWER",
+      instanceId,
     );
+    const storedAnswer = readItemInstance(db, instanceId);
+    if (!storedAnswer) throw new Error("missing issued instance");
+    const published = toPublicItem(itemAt(0), storedAnswer);
+    const publishedHtml = renderToStaticMarkup(createElement(PracticeProblem, { item: published }));
+    const batch = issueItemBatch(db, {
+      childId: child.id,
+      sessionId: session.sessionId,
+      idempotencyKey: "leak-batch-0001",
+      count: 1,
+      itemIndex: 0,
+    });
+    const batchPayload = {
+      items: batch.map((instance, index) => toPublicItem(itemAt(index), instance)),
+    };
+    expect(JSON.stringify(published)).not.toContain("SENTINEL_STORED_ANSWER");
+    expect(publishedHtml).not.toContain("SENTINEL_STORED_ANSWER");
+    expect(JSON.stringify(batchPayload)).not.toContain("SENTINEL_STORED_ANSWER");
+    db.prepare(`UPDATE item_instances SET canonical_answer = ? WHERE item_instance_id = ?`).run(
+      original.canonical_answer,
+      instanceId,
+    );
+    const result = submitAttempt(db, guardian.id, child.id, attemptInput(db, session.sessionId), {
+      now: WHEN,
+    });
     spy.mockRestore();
 
     const attempt = db
@@ -584,7 +611,17 @@ describe("app build tag", () => {
     const practiceHtml = renderToStaticMarkup(
       createElement(PracticeProblem, { item: session.item }),
     );
-    const sealed = [JSON.stringify(result), JSON.stringify(session), JSON.stringify(home), JSON.stringify(companion), homeHtml, practiceHtml].join("\n");
+    const sealed = [
+      JSON.stringify(result),
+      JSON.stringify(session),
+      JSON.stringify(home),
+      JSON.stringify(companion),
+      JSON.stringify(published),
+      JSON.stringify(batchPayload),
+      homeHtml,
+      practiceHtml,
+      publishedHtml,
+    ].join("\n");
     for (const needle of [
       "SENTINEL_PROVENANCE",
       "SENTINEL_EVIDENCE_ELIGIBLE",
@@ -599,6 +636,8 @@ describe("app build tag", () => {
       "computed_step",
       "assigned_step",
       "parent_prior",
+      "form_mismatch",
+      "SENTINEL_STORED_ANSWER",
     ]) {
       expect(sealed).not.toContain(needle);
     }
@@ -678,7 +717,7 @@ describe("app build tag", () => {
     }) as typeof db.transaction;
     try {
       const session = startPracticeSession(db, guardian.id, child.id);
-      const result = submitAttempt(db, guardian.id, child.id, attemptInput(session.sessionId), {
+      const result = submitAttempt(db, guardian.id, child.id, attemptInput(db, session.sessionId), {
         now: WHEN,
       });
       const attempt = db
@@ -748,7 +787,7 @@ describe("app build tag", () => {
     }) as typeof db.transaction;
     try {
       expect(() =>
-        submitAttempt(db, guardian.id, child.id, attemptInput(session.sessionId), { now: WHEN }),
+        submitAttempt(db, guardian.id, child.id, attemptInput(db, session.sessionId), { now: WHEN }),
       ).toThrow(/forced rollback/);
       expect(emitted.filter((entry) => entry.includes("policy_version="))).toEqual([]);
       expect(emitted.filter((entry) => entry.includes("build_sha="))).toEqual([]);

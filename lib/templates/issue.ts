@@ -582,7 +582,7 @@ export function issueItemBatch(
 export function gradeStoredAnswer(
   instance: ItemInstance,
   given: string,
-): "blank" | "unparseable" | "correct" | "incorrect" {
+): "blank" | "unparseable" | "correct" | "incorrect" | "form_mismatch" {
   return answersMatch(instance.canonicalAnswer, given, instance.compareMode, instance.requireForm);
 }
 

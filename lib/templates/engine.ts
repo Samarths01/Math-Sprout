@@ -1,4 +1,5 @@
 import { cueText } from "@/lib/templates/cues";
+import { parseAnswer } from "@/lib/answer-parser";
 import {
   canonicalValueKey,
   formatRational,
@@ -595,13 +596,47 @@ function activeBugs(template: TemplateVersion, work: Work, answer: string): BugH
   return hits.filter((hit) => hit.wrong.length > 0);
 }
 
-export function drawOnce(template: TemplateVersion, step: 1 | 2 | 3, rng: Rng): Draw | null {
+/** A reduced denominator of 1 is a whole number, including 4/4. */
+export function isWholeCanonical(answer: string): boolean {
+  const parsed = parseAnswer(answer);
+  return parsed.kind === "rational" && parsed.value.d === 1;
+}
+
+/** Value strictly below 1. Whole numbers and improper values are not proper. */
+export function isProperFraction(answer: string): boolean {
+  const parsed = parseAnswer(answer);
+  return parsed.kind === "rational" && parsed.value.n > 0 && parsed.value.n < parsed.value.d;
+}
+
+/**
+ * Mixed form of a whole number is just that number, so requiring mixed
+ * would mark a correct `1` wrong. Those operand sets are not drawable.
+ */
+export function canonicalAllowedForForm(
+  requireForm: RequireForm | null,
+  canonical: string,
+): boolean {
+  if (requireForm !== "mixed") return true;
+  return !isWholeCanonical(canonical);
+}
+
+function slotProduct(slots: Record<string, { min: number; max: number }>): Work[] {
+  let combos: Work[] = [{}];
+  for (const [name, slot] of Object.entries(slots)) {
+    const next: Work[] = [];
+    for (const combo of combos) {
+      for (let value = slot.min; value <= slot.max; value += 1) {
+        next.push({ ...combo, [name]: value });
+      }
+    }
+    combos = next;
+  }
+  return combos;
+}
+
+function realizeDraw(template: TemplateVersion, step: 1 | 2 | 3, drawn: Work): Draw | null {
   const variant = template.spec.steps.find((item) => item.assignedStep === step);
   if (!variant) return null;
-  const drawn: Work = {};
-  for (const [name, slot] of Object.entries(variant.slots)) {
-    drawn[name] = drawInt(rng, slot.min, slot.max);
-  }
   const work = deriveWork(template.spec.answerOp, drawn);
   if (!work) return null;
   for (const constraint of variant.constraints) {
@@ -609,6 +644,14 @@ export function drawOnce(template: TemplateVersion, step: 1 | 2 | 3, rng: Rng): 
   }
   const canonicalAnswer = computeAnswer(template.spec.answerOp, work);
   if (!canonicalAnswer) return null;
+  if (!canonicalAllowedForForm(template.requireForm ?? null, canonicalAnswer)) return null;
+  if (
+    template.requireForm === "lowest_terms" &&
+    step === 1 &&
+    !isProperFraction(canonicalAnswer)
+  ) {
+    return null;
+  }
   const values = strMap(work, canonicalAnswer);
   const bugs = activeBugs(template, work, canonicalAnswer);
   const features = measureFeatures(template, drawn, work);
@@ -625,6 +668,30 @@ export function drawOnce(template: TemplateVersion, step: 1 | 2 | 3, rng: Rng): 
     features,
     ambiguous: ambiguousBugs(template.spec.compare, canonicalAnswer, bugs),
   };
+}
+
+export function drawOnce(template: TemplateVersion, step: 1 | 2 | 3, rng: Rng): Draw | null {
+  const variant = template.spec.steps.find((item) => item.assignedStep === step);
+  if (!variant) return null;
+  const drawn: Work = {};
+  for (const [name, slot] of Object.entries(variant.slots)) {
+    drawn[name] = drawInt(rng, slot.min, slot.max);
+  }
+  return realizeDraw(template, step, drawn);
+}
+
+/** Every operand set drawAccepted can return, after the mixed-form filter. */
+export function eligibleDraws(template: TemplateVersion, step: 1 | 2 | 3): Draw[] {
+  const variant = template.spec.steps.find((item) => item.assignedStep === step);
+  if (!variant) return [];
+  const draws: Draw[] = [];
+  for (const drawn of slotProduct(variant.slots)) {
+    const draw = realizeDraw(template, step, drawn);
+    if (!draw || draw.ambiguous) continue;
+    if (!featuresMatch(draw.features, variant.features)) continue;
+    draws.push(draw);
+  }
+  return draws;
 }
 
 export function drawAccepted(
@@ -708,6 +775,18 @@ export function validateTemplate(template: TemplateVersion, rng: Rng = seeded(1)
       }
     }
     if (!saw) reasons.push(`step ${step} produced no draw`);
+    if (template.requireForm === "mixed") {
+      const accepted = eligibleDraws(template, step);
+      if (accepted.some((draw) => isWholeCanonical(draw.canonicalAnswer))) {
+        reasons.push(`step ${step} mixed form includes a whole answer`);
+      }
+    }
+    if (template.requireForm === "lowest_terms" && step === 1) {
+      const accepted = eligibleDraws(template, step);
+      if (accepted.some((draw) => !isProperFraction(draw.canonicalAnswer))) {
+        reasons.push(`step ${step} lowest terms includes a value that is not a proper fraction`);
+      }
+    }
   }
   return { rejected: reasons.length > 0, reasons, flags, computedByStep };
 }

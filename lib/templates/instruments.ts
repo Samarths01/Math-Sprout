@@ -40,88 +40,114 @@ export type StepPractice = {
 };
 
 export type FormatRejectRate = {
+  templateId: string;
   templateVersion: number;
   provenance: string;
   answerKind: string;
-  rejects: number;
-  attempts: number;
+  totalRejects: number;
+  distinctRejectedItems: number;
+  servedItems: number;
+  /** Headline: distinct rejected items divided by items served. */
   rate: number;
+  /** Secondary: every reject event divided by items served. */
+  totalRate: number;
 };
 
 /**
- * Rejects divided by rejects plus scored attempts, per template version,
- * provenance, and answer kind. The child's text is not in this table.
- * These rows are a rate only. They are not estimator, band, or fuel input.
+ * Headline rate is distinct rejected items / items served, grouped by template,
+ * version, provenance, and answer kind. `totalRejects` counts every event,
+ * including three rejects of one item. These rows are not estimator, band, or fuel input.
  */
 export function formatRejectRates(db: Database.Database, childId: string): FormatRejectRate[] {
-  const rejects = db
+  const served = db
     .prepare(
       `SELECT
-         r.template_version AS templateVersion,
-         r.provenance AS provenance,
-         r.answer_kind AS answerKind,
-         COUNT(*) AS rejects
-       FROM answer_format_rejects r
-       JOIN item_instances i ON i.item_instance_id = r.item_instance_id
-       WHERE i.child_id = ?
-       GROUP BY r.template_version, r.provenance, r.answer_kind`,
-    )
-    .all(childId) as Array<{
-    templateVersion: number;
-    provenance: string;
-    answerKind: string;
-    rejects: number;
-  }>;
-  const attempts = db
-    .prepare(
-      `SELECT
+         i.template_id AS templateId,
          i.template_version AS templateVersion,
          t.provenance AS provenance,
-         json_extract(t.spec_json, '$.family') AS family
-       FROM attempts a
-       JOIN item_instances i ON i.item_instance_id = a.item_instance_id
+         json_extract(t.spec_json, '$.family') AS family,
+         COUNT(*) AS servedItems
+       FROM item_instances i
        JOIN item_template_versions t
          ON t.template_id = i.template_id AND t.template_version = i.template_version
-       WHERE a.child_id = ?`,
+       WHERE i.child_id = ?
+       GROUP BY i.template_id, i.template_version, t.provenance, family`,
     )
     .all(childId) as Array<{
+    templateId: string;
     templateVersion: number;
     provenance: string;
     family: string;
+    servedItems: number;
+  }>;
+  const rejects = db
+    .prepare(
+      `SELECT
+         i.template_id AS templateId,
+         r.template_version AS templateVersion,
+         r.provenance AS provenance,
+         r.answer_kind AS answerKind,
+         COUNT(*) AS totalRejects,
+         COUNT(DISTINCT r.item_instance_id) AS distinctRejectedItems
+       FROM answer_format_rejects r
+       JOIN item_instances i ON i.item_instance_id = r.item_instance_id
+       WHERE i.child_id = ?
+       GROUP BY i.template_id, r.template_version, r.provenance, r.answer_kind`,
+    )
+    .all(childId) as Array<{
+    templateId: string;
+    templateVersion: number;
+    provenance: string;
+    answerKind: string;
+    totalRejects: number;
+    distinctRejectedItems: number;
   }>;
   const buckets = new Map<string, FormatRejectRate>();
-  const touch = (templateVersion: number, provenance: string, answerKind: string) => {
-    const id = `${templateVersion}\0${provenance}\0${answerKind}`;
+  const touch = (templateId: string, templateVersion: number, provenance: string, answerKind: string) => {
+    const id = `${templateId}\0${templateVersion}\0${provenance}\0${answerKind}`;
     const existing = buckets.get(id);
     if (existing) return existing;
     const created: FormatRejectRate = {
+      templateId,
       templateVersion,
       provenance,
       answerKind,
-      rejects: 0,
-      attempts: 0,
+      totalRejects: 0,
+      distinctRejectedItems: 0,
+      servedItems: 0,
       rate: 0,
+      totalRate: 0,
     };
     buckets.set(id, created);
     return created;
   };
-  for (const row of rejects) {
-    touch(row.templateVersion, row.provenance, row.answerKind).rejects += row.rejects;
+  for (const row of served) {
+    const bucket = touch(
+      row.templateId,
+      row.templateVersion,
+      row.provenance,
+      answerKindForTemplate(row.family),
+    );
+    bucket.servedItems += row.servedItems;
   }
-  for (const row of attempts) {
-    touch(row.templateVersion, row.provenance, answerKindForTemplate(row.family)).attempts += 1;
+  for (const row of rejects) {
+    const bucket = touch(row.templateId, row.templateVersion, row.provenance, row.answerKind);
+    bucket.totalRejects += row.totalRejects;
+    bucket.distinctRejectedItems += row.distinctRejectedItems;
   }
   return [...buckets.values()]
     .sort(
       (left, right) =>
+        left.templateId.localeCompare(right.templateId) ||
         left.templateVersion - right.templateVersion ||
         left.provenance.localeCompare(right.provenance) ||
         left.answerKind.localeCompare(right.answerKind),
     )
-    .map((row) => {
-      const total = row.rejects + row.attempts;
-      return { ...row, rate: total === 0 ? 0 : row.rejects / total };
-    });
+    .map((row) => ({
+      ...row,
+      rate: row.servedItems === 0 ? 0 : row.distinctRejectedItems / row.servedItems,
+      totalRate: row.servedItems === 0 ? 0 : row.totalRejects / row.servedItems,
+    }));
 }
 
 /** Difficulty step practiced per skill, from issued instances. */

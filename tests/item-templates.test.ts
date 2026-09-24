@@ -12,7 +12,17 @@ import { AnswerBlank } from "@/components/answer-blank";
 import { openDatabase } from "@/lib/db";
 import { DomainError, createChild, createGuardian, setConsent } from "@/lib/domain";
 import { SKILLS, TEMPLATE_VERSIONS, generatedTemplates } from "@/lib/templates/catalog";
-import { ambiguousBugs, drawAccepted, drawOnce, seeded, validateTemplate } from "@/lib/templates/engine";
+import {
+  ambiguousBugs,
+  canonicalAllowedForForm,
+  drawAccepted,
+  drawOnce,
+  eligibleDraws,
+  isProperFraction,
+  isWholeCanonical,
+  seeded,
+  validateTemplate,
+} from "@/lib/templates/engine";
 import { cueText } from "@/lib/templates/cues";
 import { exactRepeatRate, formatRejectRates, stepsPracticed } from "@/lib/templates/instruments";
 import {
@@ -23,15 +33,17 @@ import {
   issueForProgression,
   issueItemBatch,
   pickOldestExposure,
+  presentIssuedItem,
   readItemInstance,
+  sessionSlotKey,
   toPublicItem,
   variantsForAssignedStep,
   type ItemInstance,
 } from "@/lib/templates/issue";
 import { answerKindForTemplate, formatExampleFor } from "@/lib/templates/format-example";
-import { itemAt } from "@/lib/item-catalog";
+import { ITEM_CATALOG, itemAt } from "@/lib/item-catalog";
 import { answersMatch } from "@/lib/templates/rational";
-import { ISSUANCE_TEMPLATE_COLUMNS, issuanceTemplateSelect } from "@/lib/templates/store";
+import { ISSUANCE_TEMPLATE_COLUMNS, issuanceTemplateSelect, seedTemplateVersions } from "@/lib/templates/store";
 import type { TemplateVersion } from "@/lib/templates/types";
 import { evidenceForSkill, readSkillClientView } from "@/lib/learner-state";
 import { createAttemptQueue, memoryQueueStore } from "@/lib/offline-queue";
@@ -476,12 +488,12 @@ describe("item templates and issuance", () => {
     expect(answersMatch("1/2", "2/4", "rational", null)).toBe("correct");
     expect(answersMatch("3/2", "1 1/2", "rational", null)).toBe("correct");
     expect(answersMatch("3/2", "6/4", "rational", null)).toBe("correct");
-    expect(answersMatch("1/2", "2/4", "rational", "lowest_terms")).toBe("incorrect");
+    expect(answersMatch("1/2", "2/4", "rational", "lowest_terms")).toBe("form_mismatch");
     expect(answersMatch("1/2", "1/2", "rational", "lowest_terms")).toBe("correct");
-    expect(answersMatch("3/2", "1 1/2", "rational", "improper")).toBe("incorrect");
+    expect(answersMatch("3/2", "1 1/2", "rational", "improper")).toBe("form_mismatch");
     expect(answersMatch("3/2", "3/2", "rational", "improper")).toBe("correct");
     expect(answersMatch("3/2", "1 1/2", "rational", "mixed")).toBe("correct");
-    expect(answersMatch("3/2", "3/2", "rational", "mixed")).toBe("incorrect");
+    expect(answersMatch("3/2", "3/2", "rational", "mixed")).toBe("form_mismatch");
     expect(answersMatch("2/4", "1/2", "exact", null)).toBe("incorrect");
     expect(answersMatch("42", "banana", "exact", null)).toBe("unparseable");
     const forms = TEMPLATE_VERSIONS.filter((template) => template.requireForm);
@@ -610,6 +622,137 @@ describe("item templates and issuance", () => {
     const rate = exactRepeatRate(db, child.id, WHEN);
     expect(rate.forced).toBeGreaterThan(0);
     expect(rate.rate).toBeGreaterThan(0);
+  });
+
+  it("never issues a whole answer from a mixed require_form template", () => {
+    const mixed = TEMPLATE_VERSIONS.find((template) => template.templateId === "frac-equiv-mixed");
+    if (!mixed) throw new Error("missing mixed template");
+    const variant = mixed.spec.steps.find((step) => step.assignedStep === 1);
+    if (!variant) throw new Error("missing mixed step");
+    const raw = Object.values(variant.slots).reduce((count, slot) => count * (slot.max - slot.min + 1), 1);
+    const filtered = eligibleDraws(mixed, 1);
+    expect(filtered.length).toBeGreaterThan(0);
+    expect(filtered.length).toBeLessThan(raw);
+    expect(filtered.every((draw) => !isWholeCanonical(draw.canonicalAnswer))).toBe(true);
+    expect(canonicalAllowedForForm("mixed", "1")).toBe(false);
+    expect(canonicalAllowedForForm("mixed", "4/4")).toBe(false);
+    expect(canonicalAllowedForForm("mixed", "1 1/2")).toBe(true);
+    expect(canonicalAllowedForForm("improper", "1")).toBe(true);
+    expect(canonicalAllowedForForm("lowest_terms", "4/4")).toBe(true);
+
+    const names = Object.keys(variant.slots);
+    const ranges = names.map((name) => variant.slots[name]!);
+    const oracleWhole = (answer: string) => {
+      if (/^\d+$/.test(answer)) return true;
+      const fraction = answer.match(/^(\d+)\/(\d+)$/);
+      if (!fraction) return false;
+      const denominator = Number(fraction[2]);
+      return denominator > 0 && Number(fraction[1]) % denominator === 0;
+    };
+    const walk = (index: number, drawn: Record<string, number>) => {
+      if (index >= names.length) {
+        const answer = oracle("to_mixed", drawn);
+        const matched = filtered.some((draw) =>
+          names.every((name) => draw.operands[name] === drawn[name]),
+        );
+        if (answer === null || oracleWhole(answer)) {
+          expect(matched).toBe(false);
+        }
+        if (matched && answer) {
+          expect(oracleWhole(answer)).toBe(false);
+          expect(isWholeCanonical(answer)).toBe(false);
+        }
+        return;
+      }
+      const slot = ranges[index];
+      const name = names[index];
+      if (!slot || !name) return;
+      for (let value = slot.min; value <= slot.max; value += 1) {
+        walk(index + 1, { ...drawn, [name]: value });
+      }
+    };
+    walk(0, {});
+    const report = validateTemplate(mixed, seeded(11));
+    expect(report.rejected, report.reasons.join("; ")).toBe(false);
+    for (const step of [1, 2, 3] as const) {
+      for (const draw of eligibleDraws(mixed, step)) {
+        expect(isWholeCanonical(draw.canonicalAnswer)).toBe(false);
+      }
+      for (let seed = 1; seed <= 40; seed += 1) {
+        const draw = drawAccepted(mixed, step, seeded(seed * 17 + step), 40);
+        if (!draw) continue;
+        expect(isWholeCanonical(draw.canonicalAnswer)).toBe(false);
+      }
+    }
+
+    const db = tempDb();
+    db.prepare(
+      `UPDATE item_template_versions SET active = 0
+       WHERE skill_id = ? AND template_id != 'frac-equiv-mixed'`,
+    ).run(SKILLS.equiv);
+    const { child, session } = granted(db);
+    const seen = new Set<string>();
+    let previousKey = "";
+    let oldestKey = "";
+    for (let index = 0; index < filtered.length; index += 1) {
+      const issued = issueForProgression(db, {
+        childId: child.id,
+        sessionId: session.sessionId,
+        skillId: SKILLS.equiv,
+        idempotencyKey: `mixed-pool-${index}`,
+        now: new Date(Date.parse(WHEN) + index * 1000).toISOString(),
+      });
+      expect(issued.templateId).toBe("frac-equiv-mixed");
+      expect(issued.requireForm).toBe("mixed");
+      expect(issued.repeatForced).toBe(false);
+      expect(isWholeCanonical(issued.canonicalAnswer)).toBe(false);
+      expect(seen.has(issued.operandKey)).toBe(false);
+      if (previousKey) expect(issued.operandKey).not.toBe(previousKey);
+      if (index === 0) oldestKey = issued.operandKey;
+      previousKey = issued.operandKey;
+      seen.add(issued.operandKey);
+    }
+    expect(seen.size).toBe(filtered.length);
+    const forced = issueForProgression(db, {
+      childId: child.id,
+      sessionId: session.sessionId,
+      skillId: SKILLS.equiv,
+      idempotencyKey: "mixed-pool-forced",
+      now: new Date(Date.parse(WHEN) + filtered.length * 1000).toISOString(),
+    });
+    expect(forced.repeatForced).toBe(true);
+    expect(forced.operandKey).toBe(oldestKey);
+    expect(isWholeCanonical(forced.canonicalAnswer)).toBe(false);
+    const repeat = exactRepeatRate(db, child.id, forced.issuedAt);
+    expect(repeat.forced).toBeGreaterThan(0);
+    for (let seed = 0; seed < 12; seed += 1) {
+      const fresh = granted(db, `mixed-seed-${seed}@example.com`);
+      const issued = issueForProgression(db, {
+        childId: fresh.child.id,
+        sessionId: fresh.session.sessionId,
+        skillId: SKILLS.equiv,
+        idempotencyKey: `mixed-seed-${seed}`,
+        now: WHEN,
+      });
+      expect(issued.templateId).toBe("frac-equiv-mixed");
+      expect(issued.repeatForced).toBe(false);
+      expect(isWholeCanonical(issued.canonicalAnswer)).toBe(false);
+    }
+
+    const { child: batchChild, session: batchSession } = granted(db, "batch-mixed@example.com");
+    const equivIndex = ITEM_CATALOG.findIndex((item) => item.skill === SKILLS.equiv);
+    const batch = issueItemBatch(db, {
+      childId: batchChild.id,
+      sessionId: batchSession.sessionId,
+      count: 3,
+      itemIndex: equivIndex,
+      idempotencyKey: "mixed-batch",
+      now: WHEN,
+    });
+    const batchRows = batch.map((item) => readItemInstance(db, item.itemInstanceId ?? ""));
+    const mixedRows = batchRows.filter((row) => row?.templateId === "frac-equiv-mixed");
+    expect(mixedRows.length).toBeGreaterThan(0);
+    expect(mixedRows.every((row) => row && !isWholeCanonical(row.canonicalAnswer))).toBe(true);
   });
 
   it("keeps the instance copy of evidence_eligible after the template changes", () => {
@@ -807,6 +950,7 @@ describe("item templates and issuance", () => {
         idempotencyKey: "blank-path-0001",
         sessionId: session.sessionId,
         itemId: session.item.id,
+        itemInstanceId: session.item.itemInstanceId,
         answer: "   ",
         shownAt: shown(),
         submittedAt: WHEN,
@@ -902,16 +1046,20 @@ describe("item templates and issuance", () => {
          WHERE template_id = ? AND template_version = ?`,
       )
       .get(issued.templateId, issued.templateVersion) as { provenance: string };
-    expect(formatRejectRates(db, child.id)).toEqual([
-      {
-        templateVersion: issued.templateVersion,
-        provenance: "seed",
-        answerKind: example.answerKind,
-        rejects: 1,
-        attempts: 0,
-        rate: 1,
-      },
-    ]);
+    const rejectedRate = formatRejectRates(db, child.id).find(
+      (row) => row.templateId === issued.templateId && row.templateVersion === issued.templateVersion,
+    );
+    expect(rejectedRate).toMatchObject({
+      templateId: issued.templateId,
+      templateVersion: issued.templateVersion,
+      provenance: "seed",
+      answerKind: example.answerKind,
+      totalRejects: 1,
+      distinctRejectedItems: 1,
+    });
+    expect(rejectedRate?.rate).toBe(
+      (rejectedRate?.distinctRejectedItems ?? 0) / (rejectedRate?.servedItems ?? 1),
+    );
     expect(shape.provenance).toBe("seed");
 
     const later = "2026-06-15T18:00:20.000Z";
@@ -937,16 +1085,16 @@ describe("item templates and issuance", () => {
     expect(scored.xpAmount).toBeGreaterThan(0);
     expect(qeCount(db, scored.attemptId)).toBeGreaterThan(0);
     expect(readItemInstance(db, issued.itemInstanceId)?.consumedByAttemptKey).toBe("format-key-0001");
-    expect(formatRejectRates(db, child.id)).toEqual([
-      {
-        templateVersion: issued.templateVersion,
-        provenance: "seed",
-        answerKind: example.answerKind,
-        rejects: 1,
-        attempts: 1,
-        rate: 0.5,
-      },
-    ]);
+    const scoredRate = formatRejectRates(db, child.id).find(
+      (row) => row.templateId === issued.templateId && row.templateVersion === issued.templateVersion,
+    );
+    expect(scoredRate).toMatchObject({
+      totalRejects: 1,
+      distinctRejectedItems: 1,
+    });
+    expect(scoredRate?.rate).toBe(
+      (scoredRate?.distinctRejectedItems ?? 0) / (scoredRate?.servedItems ?? 1),
+    );
   });
 
   it("locks an unreadable answer without writing an attempt", () => {
@@ -1241,9 +1389,8 @@ describe("item templates and issuance", () => {
     expect(gradeStoredAnswer(held, "1")).toBe("correct");
     expect(gradeStoredAnswer(held, "4/4")).toBe("correct");
     expect(gradeStoredAnswer({ ...held, requireForm: "lowest_terms" }, "1")).toBe("correct");
-    expect(gradeStoredAnswer({ ...held, requireForm: "lowest_terms" }, "4/4")).toBe("incorrect");
-    expect(gradeStoredAnswer({ ...held, requireForm: "improper" }, "1")).toBe("incorrect");
-    expect(gradeStoredAnswer({ ...held, requireForm: "mixed" }, "1")).toBe("incorrect");
+    expect(gradeStoredAnswer({ ...held, requireForm: "lowest_terms" }, "4/4")).toBe("form_mismatch");
+    expect(gradeStoredAnswer({ ...held, requireForm: "improper" }, "1")).toBe("form_mismatch");
 
     const scored = submitAnswer(
       db,
@@ -1413,5 +1560,414 @@ describe("item templates and issuance", () => {
     );
     expect(scored.correct).toBe(true);
     expect(scored.xpAmount).toBeGreaterThan(0);
+  });
+
+  it("stores form_mismatch when the value matches and the form does not", () => {
+    const db = tempDb();
+    const score = (
+      email: string,
+      requireForm: "improper" | "lowest_terms",
+      canonical: string,
+      answer: string,
+      key: string,
+    ) => {
+      const { guardian, child, session } = granted(db, email);
+      const issued = issueForProgression(db, {
+        childId: child.id,
+        sessionId: session.sessionId,
+        skillId: SKILLS.equiv,
+        idempotencyKey: `${key}-issue`,
+        now: WHEN,
+      });
+      db.prepare(
+        `UPDATE item_instances
+         SET canonical_answer = ?, require_form = ?, compare_mode = 'rational'
+         WHERE item_instance_id = ?`,
+      ).run(canonical, requireForm, issued.itemInstanceId);
+      const result = submitAnswer(
+        db,
+        guardian.id,
+        child.id,
+        {
+          idempotencyKey: key,
+          sessionId: session.sessionId,
+          itemId: session.item.id,
+          itemInstanceId: issued.itemInstanceId,
+          answer,
+          shownAt: shown(),
+          submittedAt: WHEN,
+        },
+        { now: WHEN },
+      );
+      if (isFormatRejected(result)) throw new Error("a readable answer was rejected");
+      const row = db
+        .prepare(`SELECT outcome, correct, estimator_evidence FROM attempts WHERE id = ?`)
+        .get(result.attemptId) as {
+        outcome: string;
+        correct: number;
+        estimator_evidence: number;
+      };
+      return { result, row, childId: child.id, skill: issued.templateId };
+    };
+
+    const formOnImproper = score("form-improper@example.com", "improper", "4/4", "1", "form-improper");
+    const wrongValue = score("wrong-value@example.com", "improper", "4/4", "3/4", "wrong-value");
+    const formOnLowest = score("form-lowest@example.com", "lowest_terms", "1", "4/4", "form-lowest");
+
+    expect(formOnImproper.row).toEqual({ outcome: "form_mismatch", correct: 0, estimator_evidence: 1 });
+    expect(formOnLowest.row).toEqual({ outcome: "form_mismatch", correct: 0, estimator_evidence: 1 });
+    expect(wrongValue.row).toEqual({ outcome: "incorrect", correct: 0, estimator_evidence: 1 });
+    expect(formOnImproper.result.correct).toBe(false);
+    expect(wrongValue.result.correct).toBe(false);
+    expect(formOnImproper.result.lane).toBe(wrongValue.result.lane);
+    expect(formOnImproper.result.xpAmount).toBe(wrongValue.result.xpAmount);
+    expect(formOnImproper.result.celebrationTier).toBe(wrongValue.result.celebrationTier);
+    expect(formOnImproper.result.clientView).toEqual(wrongValue.result.clientView);
+    expect(JSON.stringify(formOnImproper.result)).not.toContain("form_mismatch");
+    expect(JSON.stringify(formOnLowest.result)).not.toContain("form_mismatch");
+    expect(JSON.stringify(wrongValue.result)).not.toContain("form_mismatch");
+    const evidence = evidenceForSkill(db, formOnImproper.childId, SKILLS.equiv);
+    expect(evidence.map((row) => row.correct)).toEqual([false]);
+  });
+
+  it("uses distinct rejected items as the format-reject headline", () => {
+    const db = tempDb();
+    db.prepare(`UPDATE item_template_versions SET active = 0 WHERE template_version = 0`).run();
+    const { guardian, child, session } = granted(db);
+    const first = issueForProgression(db, {
+      childId: child.id,
+      sessionId: session.sessionId,
+      skillId: SKILLS.equiv,
+      idempotencyKey: "headline-equiv",
+      now: WHEN,
+    });
+    const second = issueForProgression(db, {
+      childId: child.id,
+      sessionId: session.sessionId,
+      skillId: SKILLS.add,
+      idempotencyKey: "headline-add",
+      now: WHEN,
+    });
+    expect(first.templateVersion).toBe(second.templateVersion);
+    expect(first.templateId).not.toBe(second.templateId);
+    for (let index = 0; index < 3; index += 1) {
+      const rejected = submitAnswer(
+        db,
+        guardian.id,
+        child.id,
+        {
+          idempotencyKey: `headline-reject-${index}`,
+          sessionId: session.sessionId,
+          itemId: session.item.id,
+          itemInstanceId: first.itemInstanceId,
+          answer: "nope",
+          shownAt: shown(),
+          submittedAt: new Date(Date.parse(WHEN) + index * 1000).toISOString(),
+        },
+        { now: new Date(Date.parse(WHEN) + index * 1000).toISOString() },
+      );
+      if (!isFormatRejected(rejected)) throw new Error("expected format_rejected");
+    }
+    const events = db
+      .prepare(`SELECT COUNT(*) AS count FROM answer_format_rejects WHERE item_instance_id = ?`)
+      .get(first.itemInstanceId) as { count: number };
+    expect(events.count).toBe(3);
+    const row = formatRejectRates(db, child.id).find((rate) => rate.templateId === first.templateId);
+    const served = db
+      .prepare(
+        `SELECT COUNT(*) AS count FROM item_instances
+         WHERE child_id = ? AND template_id = ? AND template_version = ?`,
+      )
+      .get(child.id, first.templateId, first.templateVersion) as { count: number };
+    expect(row).toMatchObject({
+      templateId: first.templateId,
+      templateVersion: first.templateVersion,
+      provenance: "seed",
+      answerKind: first.answerKind,
+      totalRejects: 3,
+      distinctRejectedItems: 1,
+      servedItems: served.count,
+    });
+    expect(row?.rate).toBe(1 / served.count);
+    expect(row?.totalRate).toBe(3 / served.count);
+    expect(row?.rate).not.toBe(row?.totalRate);
+    const other = formatRejectRates(db, child.id).find((rate) => rate.templateId === second.templateId);
+    expect(other?.templateVersion).toBe(first.templateVersion);
+    expect(other?.distinctRejectedItems).toBe(0);
+    expect(other?.totalRejects).toBe(0);
+  });
+
+  it("rejects a missing instance id when the session already issued", () => {
+    const db = tempDb();
+    const { guardian, child, session } = granted(db);
+    const beforeXp = xpCount(db);
+    const beforeAttempts = attemptCount(db);
+    const beforeDays = qualifyingDays(db, child.id);
+    const beforeStreak = streakState(db, child.id);
+    const beforeFuel = (db.prepare(`SELECT COUNT(*) AS count FROM qualifying_events`).get() as { count: number }).count;
+    expect(() =>
+      submitAnswer(db, guardian.id, child.id, {
+        idempotencyKey: "missing-instance-id",
+        sessionId: session.sessionId,
+        itemId: session.item.id,
+        answer: "42",
+        shownAt: shown(),
+        submittedAt: WHEN,
+      }),
+    ).toThrow(/issued problem id is required/);
+    expect(attemptCount(db)).toBe(beforeAttempts);
+    expect(xpCount(db)).toBe(beforeXp);
+    expect(qualifyingDays(db, child.id)).toBe(beforeDays);
+    expect(streakState(db, child.id)).toBe(beforeStreak);
+    expect((db.prepare(`SELECT COUNT(*) AS count FROM qualifying_events`).get() as { count: number }).count).toBe(
+      beforeFuel,
+    );
+  });
+
+  it("still grades the fixed catalog when the session has no instances", () => {
+    const db = tempDb();
+    const { guardian, child, session } = granted(db);
+    db.prepare(`DELETE FROM item_instances WHERE session_id = ?`).run(session.sessionId);
+    const scored = submitAttempt(
+      db,
+      guardian.id,
+      child.id,
+      {
+        idempotencyKey: "legacy-catalog-01",
+        sessionId: session.sessionId,
+        itemId: "ops-g2-add",
+        answer: "42",
+        shownAt: shown(),
+        submittedAt: WHEN,
+      },
+      { now: WHEN },
+    );
+    expect(scored.correct).toBe(true);
+    expect(scored.xpAmount).toBeGreaterThan(0);
+    expect(scored.lockIn).toBe("27 + 15 = 42");
+  });
+
+  it("issues a fresh instance for every slot past the catalog length", () => {
+    const db = tempDb();
+    const { guardian, child, session } = granted(db);
+    const start = db
+      .prepare(`SELECT slot_seq AS slotSeq FROM practice_sessions WHERE id = ?`)
+      .get(session.sessionId) as { slotSeq: number };
+    const seen = new Set<string>();
+    let currentId = session.item.itemInstanceId ?? "";
+    for (let index = 0; index < 25; index += 1) {
+      const issued = readItemInstance(db, currentId);
+      if (!issued) throw new Error("missing slot");
+      expect(seen.has(issued.itemInstanceId)).toBe(false);
+      seen.add(issued.itemInstanceId);
+      const when = new Date(Date.parse(WHEN) + index * 20_000).toISOString();
+      const scored = submitAttempt(
+        db,
+        guardian.id,
+        child.id,
+        {
+          idempotencyKey: `slot-seq-${index}`,
+          sessionId: session.sessionId,
+          itemId: session.item.id,
+          itemInstanceId: issued.itemInstanceId,
+          answer: issued.canonicalAnswer,
+          shownAt: new Date(Date.parse(when) - 2_000).toISOString(),
+          submittedAt: when,
+        },
+        { now: when },
+      );
+      currentId = scored.nextItem.itemInstanceId ?? "";
+    }
+    expect(seen.size).toBe(25);
+    expect(seen.has(currentId)).toBe(false);
+    const slot = db
+      .prepare(`SELECT slot_seq AS slotSeq, item_index AS itemIndex FROM practice_sessions WHERE id = ?`)
+      .get(session.sessionId) as { slotSeq: number; itemIndex: number };
+    expect(slot.slotSeq).toBe(start.slotSeq + 25);
+    expect(slot.itemIndex).toBe(slot.slotSeq % ITEM_CATALOG.length);
+    const again = presentIssuedItem(db, child.id, session.sessionId, slot.slotSeq);
+    expect(again.itemInstanceId).toBe(currentId);
+    const retry = issueForProgression(db, {
+      childId: child.id,
+      sessionId: session.sessionId,
+      skillId: again.skill,
+      idempotencyKey: sessionSlotKey(session.sessionId, slot.slotSeq),
+      now: WHEN,
+    });
+    expect(retry.itemInstanceId).toBe(currentId);
+  });
+
+  it("adds template versions that were missing from an older database", () => {
+    const db = tempDb();
+    const before = db.prepare(`SELECT COUNT(*) AS count FROM item_template_versions`).get() as { count: number };
+    db.prepare(`DELETE FROM item_template_versions WHERE template_id = 'frac-equiv-lowest'`).run();
+    expect(
+      (db.prepare(`SELECT COUNT(*) AS count FROM item_template_versions WHERE template_id = 'frac-equiv-lowest'`).get() as { count: number }).count,
+    ).toBe(0);
+    seedTemplateVersions(db);
+    const after = db.prepare(`SELECT COUNT(*) AS count FROM item_template_versions`).get() as { count: number };
+    expect(after.count).toBe(before.count);
+    expect(
+      (db.prepare(`SELECT COUNT(*) AS count FROM item_template_versions WHERE template_id = 'frac-equiv-lowest'`).get() as { count: number }).count,
+    ).toBe(1);
+  });
+
+  it("throws when an existing template version has a different content hash", () => {
+    const db = tempDb();
+    db.prepare(
+      `UPDATE item_template_versions SET content_hash = 'tampered' WHERE template_id = 'add-2d-inline'`,
+    ).run();
+    expect(() => seedTemplateVersions(db)).toThrow(/content_hash does not match the spec/);
+  });
+
+  it("draws only proper fractions on lowest_terms step 1", () => {
+    const lowest = TEMPLATE_VERSIONS.find((template) => template.templateId === "frac-equiv-lowest");
+    if (!lowest) throw new Error("missing lowest template");
+    const stepOne = eligibleDraws(lowest, 1);
+    expect(stepOne.length).toBeGreaterThan(0);
+    expect(stepOne.every((draw) => isProperFraction(draw.canonicalAnswer))).toBe(true);
+    const report = validateTemplate(lowest, seeded(5));
+    expect(report.rejected, report.reasons.join("; ")).toBe(false);
+    for (let seed = 1; seed <= 40; seed += 1) {
+      const draw = drawAccepted(lowest, 1, seeded(seed), 40);
+      if (!draw) continue;
+      expect(isProperFraction(draw.canonicalAnswer)).toBe(true);
+    }
+    const variant = lowest.spec.steps.find((step) => step.assignedStep === 1);
+    if (!variant) throw new Error("missing lowest step");
+    const names = Object.keys(variant.slots);
+    const ranges = names.map((name) => variant.slots[name]!);
+    const walk = (index: number, drawn: Record<string, number>) => {
+      if (index >= names.length) {
+        const answer = oracle("lowest", drawn);
+        const matched = stepOne.some((draw) => names.every((name) => draw.operands[name] === drawn[name]));
+        if (answer && !isProperFraction(answer)) expect(matched).toBe(false);
+        if (matched && answer) expect(isProperFraction(answer)).toBe(true);
+        return;
+      }
+      const slot = ranges[index];
+      const name = names[index];
+      if (!slot || !name) return;
+      for (let value = slot.min; value <= slot.max; value += 1) {
+        walk(index + 1, { ...drawn, [name]: value });
+      }
+    };
+    walk(0, {});
+    expect(eligibleDraws(lowest, 2).some((draw) => !isProperFraction(draw.canonicalAnswer))).toBe(true);
+  });
+
+  it("accepts a reduced mixed number on lowest_terms", () => {
+    expect(answersMatch("3/2", "1 1/2", "rational", "lowest_terms")).toBe("correct");
+    const db = tempDb();
+    const { guardian, child, session } = granted(db);
+    const issued = issueForProgression(db, {
+      childId: child.id,
+      sessionId: session.sessionId,
+      skillId: SKILLS.equiv,
+      idempotencyKey: "lowest-mixed-ok",
+      now: WHEN,
+    });
+    db.prepare(
+      `UPDATE item_instances
+       SET canonical_answer = '3/2', answer_line = '3/2', require_form = 'lowest_terms', compare_mode = 'rational'
+       WHERE item_instance_id = ?`,
+    ).run(issued.itemInstanceId);
+    const scored = submitAnswer(
+      db,
+      guardian.id,
+      child.id,
+      {
+        idempotencyKey: "lowest-mixed-score",
+        sessionId: session.sessionId,
+        itemId: session.item.id,
+        itemInstanceId: issued.itemInstanceId,
+        answer: "1 1/2",
+        shownAt: shown(),
+        submittedAt: WHEN,
+      },
+      { now: WHEN },
+    );
+    if (isFormatRejected(scored)) throw new Error("a readable answer was rejected");
+    expect(scored.correct).toBe(true);
+  });
+
+  it("stores form_mismatch for an unreduced mixed number on lowest_terms", () => {
+    expect(answersMatch("3/2", "1 2/4", "rational", "lowest_terms")).toBe("form_mismatch");
+    const db = tempDb();
+    const { guardian, child, session } = granted(db);
+    const issued = issueForProgression(db, {
+      childId: child.id,
+      sessionId: session.sessionId,
+      skillId: SKILLS.equiv,
+      idempotencyKey: "lowest-mixed-bad",
+      now: WHEN,
+    });
+    db.prepare(
+      `UPDATE item_instances
+       SET canonical_answer = '3/2', answer_line = '3/2', require_form = 'lowest_terms', compare_mode = 'rational'
+       WHERE item_instance_id = ?`,
+    ).run(issued.itemInstanceId);
+    const scored = submitAnswer(
+      db,
+      guardian.id,
+      child.id,
+      {
+        idempotencyKey: "lowest-mixed-miss",
+        sessionId: session.sessionId,
+        itemId: session.item.id,
+        itemInstanceId: issued.itemInstanceId,
+        answer: "1 2/4",
+        shownAt: shown(),
+        submittedAt: WHEN,
+      },
+      { now: WHEN },
+    );
+    if (isFormatRejected(scored)) throw new Error("a readable answer was rejected");
+    expect(scored.correct).toBe(false);
+    const row = db.prepare(`SELECT outcome, correct FROM attempts WHERE id = ?`).get(scored.attemptId) as {
+      outcome: string;
+      correct: number;
+    };
+    expect(row).toEqual({ outcome: "form_mismatch", correct: 0 });
+    expect(JSON.stringify(scored)).not.toContain("form_mismatch");
+  });
+
+  it("accepts a whole number written over one on lowest_terms", () => {
+    expect(answersMatch("3", "3/1", "rational", "lowest_terms")).toBe("correct");
+    expect(answersMatch("3", "1", "rational", "lowest_terms")).toBe("incorrect");
+    expect(answersMatch("1", "1", "rational", "lowest_terms")).toBe("correct");
+    const db = tempDb();
+    const { guardian, child, session } = granted(db);
+    const issued = issueForProgression(db, {
+      childId: child.id,
+      sessionId: session.sessionId,
+      skillId: SKILLS.equiv,
+      idempotencyKey: "lowest-over-one",
+      now: WHEN,
+    });
+    db.prepare(
+      `UPDATE item_instances
+       SET canonical_answer = '3', answer_line = '3', require_form = 'lowest_terms', compare_mode = 'rational'
+       WHERE item_instance_id = ?`,
+    ).run(issued.itemInstanceId);
+    const scored = submitAnswer(
+      db,
+      guardian.id,
+      child.id,
+      {
+        idempotencyKey: "lowest-over-one-score",
+        sessionId: session.sessionId,
+        itemId: session.item.id,
+        itemInstanceId: issued.itemInstanceId,
+        answer: "3/1",
+        shownAt: shown(),
+        submittedAt: WHEN,
+      },
+      { now: WHEN },
+    );
+    if (isFormatRejected(scored)) throw new Error("a readable answer was rejected");
+    expect(scored.correct).toBe(true);
+    expect(scored.lockIn).toBe("3");
+    expect(scored.lockIn).not.toContain("3/1");
   });
 });

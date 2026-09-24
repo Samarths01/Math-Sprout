@@ -7,11 +7,8 @@ import { afterEach, describe, expect, it } from "vitest";
 import { renderToStaticMarkup } from "react-dom/server";
 import type Database from "better-sqlite3";
 import { ParentOneBreathCard } from "@/components/parent-one-breath";
-import {
-  startPracticeSession,
-  submitAttempt,
-  type SubmitAttemptInput,
-} from "@/lib/attempts";
+import { startPracticeSession, type SubmitAttemptInput } from "@/lib/attempts";
+import { submitCatalogAttempt as submitAttempt } from "./catalog-submit";
 import { choosePracticeLane, endPracticeSession } from "@/lib/boundary";
 import { openDatabase } from "@/lib/db";
 import {

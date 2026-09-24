@@ -31,7 +31,7 @@ export function answersMatch(
   given: string,
   mode: "rational" | "exact",
   requireForm: RequireForm | null,
-): "blank" | "unparseable" | "correct" | "incorrect" {
+): "blank" | "unparseable" | "correct" | "incorrect" | "form_mismatch" {
   if (given.trim().length === 0) return "blank";
   if (mode === "exact") {
     const left = cleanup(expected).replace(/\s+/g, "");
@@ -55,18 +55,23 @@ export function answersMatch(
   if (want.kind !== "rational" || got.kind !== "rational") return "incorrect";
   if (!rationalsEqual(want.value, got.value)) return "incorrect";
   if (!requireForm) return "correct";
-  if (requireForm === "mixed") return got.form === "mixed" ? "correct" : "incorrect";
+  if (requireForm === "mixed") return got.form === "mixed" ? "correct" : "form_mismatch";
   if (requireForm === "improper") {
-    return got.form === "improper" ? "correct" : "incorrect";
+    return got.form === "improper" ? "correct" : "form_mismatch";
   }
-  const reducedWrite =
-    got.form === "lowest_terms" || got.form === "integer" || (got.form === "improper" && gcdFromWritten(got.written));
-  return reducedWrite ? "correct" : "incorrect";
+  if (got.form === "integer" || got.form === "lowest_terms") return "correct";
+  if (got.form === "mixed" || got.form === "improper") {
+    return fractionPartReduced(got.written) ? "correct" : "form_mismatch";
+  }
+  return "form_mismatch";
 }
 
-function gcdFromWritten(written: string): boolean {
+/** Lowest terms means the fraction part cannot be reduced. Mixed and improper both qualify. */
+function fractionPartReduced(written: string): boolean {
+  const mixed = written.match(/^(\d+)\s+(\d+)\/(\d+)$/);
+  if (mixed) return gcd(Number(mixed[2]), Number(mixed[3])) === 1;
   const fraction = written.match(/^(-?\d+)\/(\d+)$/);
-  if (!fraction) return written.match(/^-?\d+$/) !== null;
+  if (!fraction) return /^-?\d+$/.test(written);
   return gcd(Number(fraction[1]), Number(fraction[2])) === 1;
 }
 

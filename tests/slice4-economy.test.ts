@@ -13,7 +13,8 @@ import {
   type CelebrationTier,
 } from "@/lib/attempt-contract";
 import { readAttemptLog } from "@/lib/attempt-log";
-import { startPracticeSession, submitAttempt, type SubmitAttemptInput } from "@/lib/attempts";
+import { startPracticeSession, type SubmitAttemptInput } from "@/lib/attempts";
+import { submitCatalogAttempt as submitAttempt } from "./catalog-submit";
 import { choosePracticeLane, endPracticeSession } from "@/lib/boundary";
 import { openDatabase } from "@/lib/db";
 import { POLICY_VERSION } from "@/lib/policy";
