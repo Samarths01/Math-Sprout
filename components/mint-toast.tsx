@@ -36,7 +36,13 @@ export function MintToast({
         data-celebration-tier={plan.xp}
         data-copy-key={xpKey}
         role="status"
-        className="text-sm leading-6 text-muted-foreground"
+        className={
+          plan.xp === "full"
+            ? "text-sm font-medium leading-6 text-primary"
+            : plan.xp === "quietXp"
+              ? "text-sm font-medium leading-6 text-foreground"
+              : "text-sm leading-6 text-muted-foreground"
+        }
       >
         {interfaceCopy(xpKey)}
         {replayed ? " This try was already saved." : ""}

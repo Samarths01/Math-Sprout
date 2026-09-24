@@ -438,7 +438,6 @@ describe("mint toast and home glance", () => {
       createElement(CompanionState, {
         childId: "child-1",
         practiceAllowed: true,
-        sproutGlance: true,
         companion: {
           build: {
             active: {
@@ -468,23 +467,31 @@ describe("mint toast and home glance", () => {
     );
     expect(home).toContain('data-fuel="heat"');
     expect(home).toContain('data-fuel="pieces"');
-    expect(home).toContain('data-testid="sprout-glance"');
-    expect(home).toContain("A sprout grew from a careful try.");
+    expect(home).not.toContain('data-testid="sprout-glance"');
     expect(home).not.toMatch(/\b\d+\s*xp\b|xpAmount|confidence|score/i);
     expect(home).toContain("There is no rush.");
-    const glance = home.slice(home.indexOf('data-testid="sprout-glance"'));
-    expect(glance.slice(0, glance.indexOf("</p>"))).not.toContain("href");
 
     const childPage = readFileSync(new URL("../app/child/[id]/page.tsx", import.meta.url), "utf8");
     const practicePage = readFileSync(
       new URL("../components/practice-session.tsx", import.meta.url),
       "utf8",
     );
-    expect(childPage.indexOf("<CompanionState")).toBeLessThan(childPage.indexOf("<PracticeCta"));
-    expect(childPage).toContain("<PracticeCta");
+    const feedbackPage = readFileSync(
+      new URL("../components/practice-feedback.tsx", import.meta.url),
+      "utf8",
+    );
+    const ctaAt = childPage.indexOf("<PracticeCta");
+    const stripAt = childPage.indexOf("<FuelStrip");
+    const companionAt = childPage.indexOf("<CompanionState");
+    expect(ctaAt).toBeGreaterThan(-1);
+    expect(stripAt).toBeGreaterThan(ctaAt);
+    expect(companionAt).toBeGreaterThan(stripAt);
+    expect(childPage).not.toMatch(/href=.*\/fuel|FuelTab/);
     expect(practicePage).not.toContain("/companion");
     expect(practicePage).not.toContain("FuelMoment");
-    expect(practicePage).toContain("MintToast");
+    expect(practicePage).toContain("PracticeFeedback");
+    expect(feedbackPage).toContain("MintToast");
+    expect(feedbackPage.indexOf("<VerdictStrip")).toBeLessThan(feedbackPage.indexOf("<MintToast"));
   });
 });
 

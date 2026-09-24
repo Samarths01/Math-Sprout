@@ -1,5 +1,12 @@
 import type { FourBeat, IntegrityFlag, PublicItem } from "@/lib/attempt-contract";
-import { oneFocusForItem, tryNextForItem } from "@/lib/item-bank";
+import { oneFocusForItem, tryNextForItem, whyItWorksForItem } from "@/lib/item-bank";
+
+/** The value once. Arithmetic stems become `27 + 15 = 42`. */
+export function answerStamp(prompt: string, canonicalAnswer: string): string {
+  const arithmetic = prompt.match(/^What is (.+)\?$/);
+  if (arithmetic && canonicalAnswer) return `${arithmetic[1]} = ${canonicalAnswer}`;
+  return canonicalAnswer;
+}
 
 export function buildFourBeat(input: {
   correct: boolean;
@@ -7,6 +14,8 @@ export function buildFourBeat(input: {
   item: PublicItem;
   canonicalAnswer: string;
 }): FourBeat {
+  const answer = answerStamp(input.item.prompt, input.canonicalAnswer);
+  const solidify = whyItWorksForItem(input.item.id);
   if (input.flags.includes("empty_answer")) {
     return {
       whatWentWell: "You stayed with the problem.",
@@ -20,32 +29,35 @@ export function buildFourBeat(input: {
       whatWentWell: input.correct
         ? "The answer matches."
         : "You put an answer down.",
-      oneFocus: "Slow down enough to read the whole question.",
-      tryNext: "Give the next one a full look before you answer.",
-      lockIn: "That was too fast to count as a careful try.",
+      oneFocus: input.correct ? solidify : "Slow down enough to read the whole question.",
+      tryNext: input.correct
+        ? "That was too fast to count as a careful try. Give the next one a full look before you answer."
+        : "Give the next one a full look before you answer.",
+      lockIn: input.correct ? answer : "That was too fast to count as a careful try.",
     };
   }
   if (input.flags.includes("spam_window")) {
     return {
       whatWentWell: input.correct ? "You reached an answer." : "You kept trying.",
-      oneFocus: "Leave a little space between tries.",
-      tryNext: "Take the next problem one at a time.",
-      lockIn: "This one stays a quiet sprout.",
+      oneFocus: input.correct ? solidify : "Leave a little space between tries.",
+      tryNext: input.correct
+        ? "This one stays a quiet sprout. Take the next problem one at a time."
+        : "Take the next problem one at a time.",
+      lockIn: input.correct ? answer : "This one stays a quiet sprout.",
     };
   }
-  const oneFocus = oneFocusForItem(input.item.id);
   if (input.correct) {
     return {
       whatWentWell: `You worked out ${input.item.skill}.`,
-      oneFocus,
+      oneFocus: solidify,
       tryNext: `Try another grade ${input.item.grade} ${input.item.pack} problem.`,
-      lockIn: "That is the answer we were looking for.",
+      lockIn: answer,
     };
   }
   return {
     whatWentWell: "You committed to an answer.",
-    oneFocus,
+    oneFocus: oneFocusForItem(input.item.id),
     tryNext: tryNextForItem(input.item.id),
-    lockIn: `The answer we were looking for is ${input.canonicalAnswer}.`,
+    lockIn: answer,
   };
 }

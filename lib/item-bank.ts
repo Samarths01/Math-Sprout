@@ -4,8 +4,11 @@ import { catalogItem, ITEM_CATALOG } from "@/lib/item-catalog";
  * Item Bank misconception tags. The server assembles oneFocus from these.
  * The client catalog does not carry them.
  */
-const ITEM_TAGS: Record<string, { misconception: string }> = {
-  "ops-g2-add": { misconception: "regrouping when the ones pass nine" },
+const ITEM_TAGS: Record<string, { misconception: string; whyItWorks?: string }> = {
+  "ops-g2-add": {
+    misconception: "regrouping when the ones pass nine",
+    whyItWorks: "Add the ones first. 7 + 5 is 12, so write 2 and carry 1 ten.",
+  },
   "ops-g2-sub": { misconception: "regrouping when the top ones are smaller" },
   "ops-g3-mul": { misconception: "the product of the two factors" },
   "ops-g3-div": { misconception: "how many equal groups fit in the whole" },
@@ -59,14 +62,26 @@ export function gradeAnswer(itemId: string, answer: string): boolean {
 export function oneFocusForItem(itemId: string): string {
   const tag = ITEM_TAGS[itemId];
   if (!tag) throw new Error(`Item ${itemId} is missing a misconception tag.`);
-  return `Watch ${tag.misconception}.`;
+  const misconception = tag.misconception.trim();
+  if (!misconception) return "";
+  return `Watch ${misconception}.`;
+}
+
+/**
+ * Solidify line from the item bank. Empty when the bank has no whyItWorks string.
+ * Practice omits that beat. This is not filled in by a model.
+ */
+export function whyItWorksForItem(itemId: string): string {
+  return ITEM_TAGS[itemId]?.whyItWorks?.trim() ?? "";
 }
 
 /** Supporting beat, assembled from the same tag as oneFocus. */
 export function tryNextForItem(itemId: string): string {
   const tag = ITEM_TAGS[itemId];
   if (!tag) throw new Error(`Item ${itemId} is missing a misconception tag.`);
-  return `Try again and watch ${tag.misconception}.`;
+  const misconception = tag.misconception.trim();
+  if (!misconception) return "";
+  return `Try again and watch ${misconception}.`;
 }
 
 export function assertBankMatchesCatalog(): void {

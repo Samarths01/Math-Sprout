@@ -22,7 +22,13 @@ import {
 import { openDatabase } from "@/lib/db";
 import { DomainError, createChild, createGuardian, setConsent } from "@/lib/domain";
 import { ITEM_CATALOG } from "@/lib/item-catalog";
-import { assertBankMatchesCatalog, gradeAnswer, oneFocusForItem, tryNextForItem } from "@/lib/item-bank";
+import {
+  assertBankMatchesCatalog,
+  gradeAnswer,
+  oneFocusForItem,
+  tryNextForItem,
+  whyItWorksForItem,
+} from "@/lib/item-bank";
 import { readAttemptLog } from "@/lib/attempt-log";
 import { MasteryEstimator } from "@/lib/mastery";
 import { POLICY_VERSION } from "@/lib/policy";
@@ -857,7 +863,8 @@ describe("offline queue reconcile", () => {
     expect(synced.pending).toEqual([]);
     expect(synced.synced[0]?.clientView.bandLabel).toBe("Getting it");
     expect(synced.synced[0]?.celebrationTier).toBe(synced.synced[0]?.clientView.celebrationTier);
-    expect(synced.synced[0]?.oneFocus).toBe(oneFocusForItem(attempt.itemId));
+    expect(synced.synced[0]?.correct).toBe(true);
+    expect(synced.synced[0]?.oneFocus).toBe(whyItWorksForItem(attempt.itemId));
     expect(displayedOneFocus(synced.synced[0]!)).toBe(synced.synced[0]?.oneFocus);
     const stored = db
       .prepare(`SELECT band_label FROM learner_skill_state WHERE child_id = ?`)
@@ -933,9 +940,12 @@ describe("attempt response shape", () => {
     const result = submitAttempt(db, guardian.id, child.id, input(session.sessionId));
 
     expect(typeof result.correct).toBe("boolean");
+    expect(result.correct).toBe(true);
     for (const key of FOUR_BEAT_KEYS) {
-      expect(result[key].length).toBeGreaterThan(0);
+      expect(typeof result[key]).toBe("string");
     }
+    expect(result.lockIn).toBe("27 + 15 = 42");
+    expect(result.lockIn).not.toContain("That is the answer we were looking for");
     expect(Object.keys(result.clientView).sort()).toEqual([
       "bandLabel",
       "celebrationTier",
@@ -947,9 +957,9 @@ describe("attempt response shape", () => {
       celebrationTier: "full",
     });
     expect(result.celebrationTier).toBe(result.clientView.celebrationTier);
-    expect(result.oneFocus).toBe(oneFocusForItem("ops-g2-add"));
+    expect(result.oneFocus).toBe(whyItWorksForItem("ops-g2-add"));
     expect(displayedOneFocus(result)).toBe(result.oneFocus);
-    expect(result.oneFocus).toBe("Watch regrouping when the ones pass nine.");
+    expect(result.oneFocus).toBe("Add the ones first. 7 + 5 is 12, so write 2 and carry 1 ten.");
     expect(result.oneFocus).not.toMatch(/keep reading|look again|great job|awesome/i);
     const missed = submitAttempt(
       db,
@@ -957,7 +967,12 @@ describe("attempt response shape", () => {
       child.id,
       input(session.sessionId, { idempotencyKey: "focus-miss-0001", answer: "41" }),
     );
-    expect(missed.oneFocus).toBe(result.oneFocus);
+    expect(missed.correct).toBe(false);
+    expect(missed.oneFocus).toBe(oneFocusForItem("ops-g2-add"));
+    expect(displayedOneFocus(missed)).toBe(missed.oneFocus);
+    expect(missed.oneFocus).toBe("Watch regrouping when the ones pass nine.");
+    expect(missed.oneFocus).not.toBe(result.oneFocus);
+    expect(missed.lockIn).toBe("27 + 15 = 42");
     expect(missed.tryNext).toBe(tryNextForItem("ops-g2-add"));
     const blank = submitAttempt(
       db,
