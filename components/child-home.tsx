@@ -60,7 +60,10 @@ export function ChildHomeFrame({
             >
               {concept}
             </h1>
-            <p data-testid="focus-band" className="text-sm text-muted-foreground">
+            <p
+              data-testid="focus-band"
+              className="inline-flex w-fit items-center rounded-full bg-step-1 px-2.5 py-0.5 text-xs font-medium text-foreground"
+            >
               {bandLabel}
             </p>
           </div>

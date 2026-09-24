@@ -33,7 +33,7 @@ export default async function ChildHomePage({
 
   return (
     <Shell width="narrow">
-      <AppHeader eyebrow="Child home" action={<LogoutButton />} />
+      <AppHeader action={<LogoutButton />} />
       <main>
         <ChildHomeFrame
           childId={home.child.id}

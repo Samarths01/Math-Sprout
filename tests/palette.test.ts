@@ -1,7 +1,7 @@
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { flameClass, OLD_BRAND_GREEN, PALETTE, stepClass } from "@/lib/palette";
+import { flameClass, OLD_BRAND_GREEN, PALETTE, stepClass, tintOnWhite } from "@/lib/palette";
 
 function filesUnder(dir: string): string[] {
   const out: string[] = [];
@@ -15,6 +15,40 @@ function filesUnder(dir: string): string[] {
   }
   return out;
 }
+
+function channelByte(hex: string, index: number): number {
+  return Number.parseInt(hex.replace("#", "").slice(index, index + 2), 16);
+}
+
+function linearize(channel: number): number {
+  const srgb = channel / 255;
+  return srgb <= 0.04045 ? srgb / 12.92 : ((srgb + 0.055) / 1.055) ** 2.4;
+}
+
+function relativeLuminance(hex: string): number {
+  const red = linearize(channelByte(hex, 0));
+  const green = linearize(channelByte(hex, 2));
+  const blue = linearize(channelByte(hex, 4));
+  return 0.2126 * red + 0.7152 * green + 0.0722 * blue;
+}
+
+/** WCAG 2 contrast ratio for a text color on a background color. */
+function contrastRatio(text: string, background: string): number {
+  const lighter = Math.max(relativeLuminance(text), relativeLuminance(background));
+  const darker = Math.min(relativeLuminance(text), relativeLuminance(background));
+  return (lighter + 0.05) / (darker + 0.05);
+}
+
+const TEXT_ON_TINT = [
+  { name: "flame-hot", text: PALETTE.flameText.hot, color: PALETTE.flame.hot },
+  { name: "flame-warm", text: PALETTE.flameText.warm, color: PALETTE.flame.warm },
+  { name: "flame-ember", text: PALETTE.flameText.ember, color: PALETTE.flame.ember },
+  { name: "flame-resting", text: PALETTE.flameText.resting, color: PALETTE.flame.resting },
+  { name: "xp", text: PALETTE.xpText, color: PALETTE.xp },
+  { name: "piece", text: PALETTE.pieceText, color: PALETTE.piece },
+  { name: "steady", text: PALETTE.badgeText.steady, color: PALETTE.step[2] },
+  { name: "stretch", text: PALETTE.badgeText.stretch, color: PALETTE.step[4] },
+] as const;
 
 function isGreenHex(hex: string): boolean {
   const raw = hex.replace("#", "");
@@ -78,5 +112,16 @@ describe("shared palette", () => {
       }
     }
     expect(offenders).toEqual([]);
+  });
+
+  it("keeps chip and badge text at 4.5:1 on the 12% tint", () => {
+    const css = readFileSync(path.join(process.cwd(), "app/globals.css"), "utf8").toLowerCase();
+    for (const pair of TEXT_ON_TINT) {
+      const tint = tintOnWhite(pair.color);
+      expect(contrastRatio(pair.text, tint), pair.name).toBeGreaterThanOrEqual(4.5);
+      expect(css).toContain(pair.text.toLowerCase());
+      expect(css).toContain(tint.toLowerCase());
+    }
+    expect(contrastRatio(PALETTE.ink, PALETTE.step[0])).toBeGreaterThanOrEqual(4.5);
   });
 });
