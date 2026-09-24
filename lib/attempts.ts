@@ -35,9 +35,9 @@ import {
   planAttemptEconomy,
   readChildTimeZone,
 } from "@/lib/qualifying-bus";
-import { readAttemptLog } from "@/lib/attempt-log";
+import { formatAttemptLogLine, readAttemptLog } from "@/lib/attempt-log";
 import { fuelFromEvents } from "@/lib/fuel";
-import { APP_BUILD_SHA } from "@/lib/app-build";
+import { currentAppBuildSha } from "@/lib/app-build";
 import { POLICY_VERSION } from "@/lib/policy";
 import { takePendingPauseHold } from "@/lib/pause-hold";
 import { practiceGate } from "@/lib/practice-gate";
@@ -311,7 +311,7 @@ export function startPracticeSession(
       nowIso(),
       progress.nextLane,
       POLICY_VERSION,
-      APP_BUILD_SHA,
+      currentAppBuildSha(),
     );
     const created = readPracticeSession(db, childId, sessionId);
     if (!created) throw new DomainError("Practice session was not saved.", 500);
@@ -430,7 +430,7 @@ export function submitAttempt(
       client_view_json: JSON.stringify(economy.clientView),
       created_at: createdAt,
       policy_version: POLICY_VERSION,
-      build_sha: APP_BUILD_SHA,
+      build_sha: currentAppBuildSha(),
       resume_presentation: quietResume ? "quiet" : "live",
     });
     commitAttemptEconomy(db, {
@@ -458,6 +458,7 @@ export function submitAttempt(
     if (log.buildSha.trim().length === 0) {
       throw new DomainError("Attempt log is missing build_sha.", 500);
     }
+    console.info(formatAttemptLogLine(log));
     return resultFromRow(db, stored, false);
   });
 

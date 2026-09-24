@@ -66,6 +66,8 @@ export function readCompanion(
   observedAt: string,
 ): CompanionView {
   const timeZone = readChildTimeZone(db, childId);
+  // observeStreak writes the streak cache (an existing side effect).
+  // glance adds no mint and no new write path. This read is therefore NOT pure.
   observeStreak(db, childId, timeZone, observedAt);
   const days = loadQualifyingDays(db, childId);
   const streak = projectHeat(days, timeZone, observedAt);

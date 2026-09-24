@@ -18,6 +18,7 @@ import { currentGuardian } from "@/lib/http";
 import { interfaceCopy } from "@/lib/interface-copy";
 import { readOfflineCap } from "@/lib/offline-cap";
 import { readPauseHold } from "@/lib/pause-hold";
+import { ParentBuildFooter } from "@/components/build-footer";
 import { ParentOneBreathCard } from "@/components/parent-one-breath";
 import { readParentSummary } from "@/lib/parent-summary";
 import { formatTimeZone } from "@/lib/timezones";
@@ -157,6 +158,7 @@ export default async function ParentHomePage() {
           </ul>
         )}
       </main>
+      <ParentBuildFooter />
     </Shell>
   );
 }
