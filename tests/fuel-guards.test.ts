@@ -184,6 +184,16 @@ describe("fuel numbers are a server-side read", () => {
     expect(childPage).not.toContain("use client");
     expect(childPage).toContain("readCompanion");
     expect(source("../components/fuel-strip.tsx")).not.toContain("fetch(");
+    const strip = source("../components/fuel-strip.tsx");
+    const stripImports = [...strip.matchAll(/from "([^"]+)"/g)].map((match) => match[1]);
+    expect(stripImports).toContain("@/lib/fuel-strip-view");
+    for (const specifier of stripImports) {
+      expect(specifier).not.toMatch(
+        /learner-state|mastery|home-presentation|qualifying-bus|companion|attempts|fuel-guards|better-sqlite3|app-build/,
+      );
+    }
+    expect(source("../lib/fuel-strip-view.ts")).not.toMatch(/\bimport\b/);
+    expect(source("../components/child-home.tsx")).toContain("fuelStripText(");
     expect(source("../components/child-home.tsx")).not.toContain("fetch(");
   });
 

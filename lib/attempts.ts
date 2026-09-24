@@ -35,9 +35,9 @@ import {
   planAttemptEconomy,
   readChildTimeZone,
 } from "@/lib/qualifying-bus";
-import { formatAttemptLogLine, readAttemptLog } from "@/lib/attempt-log";
+import { formatAttemptLogLine, readAttemptLog, type AttemptLog } from "@/lib/attempt-log";
 import { fuelFromEvents } from "@/lib/fuel";
-import { currentAppBuildSha } from "@/lib/app-build";
+import * as appBuild from "@/lib/app-build";
 import { POLICY_VERSION } from "@/lib/policy";
 import { takePendingPauseHold } from "@/lib/pause-hold";
 import { practiceGate } from "@/lib/practice-gate";
@@ -262,6 +262,7 @@ export function startPracticeSession(
   const child = getChild(db, guardianId, childId);
   const gate = practiceGate(child.consentStatus);
   if (!gate.practiceAllowed) throw consentDenied(child.consentStatus);
+  const buildSha = appBuild.currentAppBuildSha();
   const open = db.transaction(() => {
     observeStreak(db, childId, readChildTimeZone(db, childId), nowIso());
     const practicing = db
@@ -311,7 +312,7 @@ export function startPracticeSession(
       nowIso(),
       progress.nextLane,
       POLICY_VERSION,
-      currentAppBuildSha(),
+      buildSha,
     );
     const created = readPracticeSession(db, childId, sessionId);
     if (!created) throw new DomainError("Practice session was not saved.", 500);
@@ -347,9 +348,10 @@ export function submitAttempt(
     throw new DomainError("That problem is not in this practice pack.", 400);
   }
 
-  const commit = db.transaction(() => {
+  const buildSha = appBuild.currentAppBuildSha();
+  const commit = db.transaction((): { result: AttemptResult; log: AttemptLog | null } => {
     const existing = findAttempt(db, childId, idempotencyKey);
-    if (existing) return resultFromRow(db, existing, true);
+    if (existing) return { result: resultFromRow(db, existing, true), log: null };
 
     const child = getChild(db, guardianId, childId);
     const gate = practiceGate(child.consentStatus);
@@ -430,7 +432,7 @@ export function submitAttempt(
       client_view_json: JSON.stringify(economy.clientView),
       created_at: createdAt,
       policy_version: POLICY_VERSION,
-      build_sha: currentAppBuildSha(),
+      build_sha: buildSha,
       resume_presentation: quietResume ? "quiet" : "live",
     });
     commitAttemptEconomy(db, {
@@ -458,12 +460,13 @@ export function submitAttempt(
     if (log.buildSha.trim().length === 0) {
       throw new DomainError("Attempt log is missing build_sha.", 500);
     }
-    console.info(formatAttemptLogLine(log));
-    return resultFromRow(db, stored, false);
+    return { result: resultFromRow(db, stored, false), log };
   });
 
   try {
-    return commit.immediate();
+    const saved = commit.immediate();
+    if (saved.log) console.info(formatAttemptLogLine(saved.log));
+    return saved.result;
   } catch (error) {
     if (isUniqueConstraint(error)) {
       const existing = findAttempt(db, childId, idempotencyKey);

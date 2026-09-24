@@ -3,9 +3,8 @@
 import { useEffect, useRef } from "react";
 import { FlameMark, PieceMark, StarMark } from "@/components/fuel-mark";
 import { consumeFuelPulse, releaseFuelPulse } from "@/lib/fuel-motion";
-import { fuelStripText } from "@/lib/home-presentation";
+import type { FuelStripView } from "@/lib/fuel-strip-view";
 import { FLAME_CLASS, FLAME_TEXT_CLASS, FLAME_TINT_CLASS } from "@/lib/palette";
-import type { StreakState } from "@/lib/streak";
 import { cn } from "@/lib/utils";
 
 /**
@@ -24,19 +23,7 @@ export function FuelStrip({
   heat,
   sourceEventId,
   forcePulse = false,
-}: {
-  childId: string;
-  text?: string;
-  xp: number;
-  dayCount: number | null;
-  pieces: number;
-  goal: number;
-  flame: "start" | "resting" | "lit";
-  /** Server heat state. Quiet, cooled, and dormant render as resting. */
-  heat?: StreakState;
-  sourceEventId: string | null;
-  forcePulse?: boolean;
-}) {
+}: FuelStripView) {
   const stripRef = useRef<HTMLParagraphElement>(null);
   useEffect(() => {
     if (forcePulse) return;
@@ -48,18 +35,8 @@ export function FuelStrip({
     return () => window.clearTimeout(timer);
   }, [childId, forcePulse]);
 
-  const started = flame !== "start";
-  const line =
-    text ??
-    fuelStripText({
-      started,
-      dayCount,
-      xp,
-      pieces,
-      goal,
-    });
-  const [flamePart, xpPart, piecePart] = line.split(" · ");
-  const heatState: StreakState = heat ?? (flame === "lit" ? "hot" : "dormant");
+  const [flamePart, xpPart, piecePart] = text.split(" · ");
+  const heatState = heat ?? (flame === "lit" ? "hot" : "dormant");
 
   return (
     <p

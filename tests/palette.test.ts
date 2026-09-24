@@ -123,5 +123,10 @@ describe("shared palette", () => {
       expect(css).toContain(tint.toLowerCase());
     }
     expect(contrastRatio(PALETTE.ink, PALETTE.step[0])).toBeGreaterThanOrEqual(4.5);
+    expect(PALETTE.destructive).toBe("#B3261E");
+    expect(PALETTE.destructive).not.toBe(PALETTE.verdict.miss);
+    expect(contrastRatio(PALETTE.destructive, "#ffffff")).toBeGreaterThanOrEqual(4.5);
+    expect(contrastRatio(PALETTE.destructive, PALETTE.paper)).toBeGreaterThanOrEqual(4.5);
+    expect(css).toContain(`--destructive: ${PALETTE.destructive.toLowerCase()}`);
   });
 });
