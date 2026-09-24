@@ -458,7 +458,7 @@ export function submitAnswer(
           | { provenance: string }
           | undefined;
         if (!meta) throw new DomainError("That problem is not in this practice pack.", 404);
-        const example = formatExampleFor(instance.canonicalAnswer);
+        const example = formatExampleFor(instance.answerKind, instance.canonicalAnswer);
         const seq = db
           .prepare(
             `SELECT COALESCE(MAX(reject_seq), 0) + 1 AS reject_seq

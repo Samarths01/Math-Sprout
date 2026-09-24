@@ -28,7 +28,7 @@ import {
   variantsForAssignedStep,
   type ItemInstance,
 } from "@/lib/templates/issue";
-import { formatExampleFor } from "@/lib/templates/format-example";
+import { answerKindForTemplate, formatExampleFor } from "@/lib/templates/format-example";
 import { itemAt } from "@/lib/item-catalog";
 import { answersMatch } from "@/lib/templates/rational";
 import { ISSUANCE_TEMPLATE_COLUMNS, issuanceTemplateSelect } from "@/lib/templates/store";
@@ -131,7 +131,7 @@ function examplesDiffer(canonical: string, example: string): boolean {
   return example !== canonical.trim();
 }
 
-function stubInstance(canonical: string): ItemInstance {
+function stubInstance(canonical: string, answerKind: "whole" | "fraction" = "whole"): ItemInstance {
   return {
     itemInstanceId: "inst-example",
     childId: "child",
@@ -163,6 +163,7 @@ function stubInstance(canonical: string): ItemInstance {
     bugHits: [],
     defaultFocus: null,
     whyItWorks: null,
+    answerKind,
   };
 }
 
@@ -454,6 +455,7 @@ describe("item templates and issuance", () => {
       bugHits: [],
       defaultFocus: column.defaultFocus ?? null,
       whyItWorks: null,
+      answerKind: "whole",
     };
     expect(cueText(column.defaultFocus)).toBe("");
     expect(focusForStoredAnswer(missed, "1").oneFocus).toBe("");
@@ -837,7 +839,7 @@ describe("item templates and issuance", () => {
     const beforeAttempts = attemptCount(db);
     const beforeDays = qualifyingDays(db, child.id);
     const raw = "banana";
-    const example = formatExampleFor(issued.canonicalAnswer);
+    const example = formatExampleFor(issued.answerKind, issued.canonicalAnswer);
     const rejected = submitAnswer(
       db,
       guardian.id,
@@ -1113,7 +1115,7 @@ describe("item templates and issuance", () => {
       expect(row.item_instance_id).toBe(issued.itemInstanceId);
       expect(row.template_version).toBe(issued.templateVersion);
       expect(row.provenance).toBe("seed");
-      expect(row.answer_kind).toBe(formatExampleFor(issued.canonicalAnswer).answerKind);
+      expect(row.answer_kind).toBe(issued.answerKind);
       expect(row.build_sha).toBe(currentAppBuildSha());
       expect(row.build_sha.length).toBeGreaterThan(0);
       expect(row.policy_version).toBe(POLICY_VERSION);
@@ -1133,14 +1135,16 @@ describe("item templates and issuance", () => {
     expect(FORMAT_HINT_COPY.fraction).toBe("Write it as a fraction, like {example}.");
     expect(formatHint("whole", "3")).toBe("Use numbers only, like 3.");
     expect(formatHint("fraction", "1/3")).toBe("Write it as a fraction, like 1/3.");
-    expect(formatExampleFor("42")).toEqual({ answerKind: "whole", formatExample: "3" });
-    expect(formatExampleFor("3")).toEqual({ answerKind: "whole", formatExample: "4" });
-    expect(formatExampleFor("1/3")).toEqual({ answerKind: "fraction", formatExample: "1/2" });
-    expect(formatExampleFor("1/2")).toEqual({ answerKind: "fraction", formatExample: "1/3" });
-    expect(formatExampleFor("2/4")).toEqual({ answerKind: "fraction", formatExample: "1/3" });
-    expect(formatExampleFor("3/6")).toEqual({ answerKind: "fraction", formatExample: "1/3" });
+    expect(formatExampleFor("whole", "42")).toEqual({ answerKind: "whole", formatExample: "3" });
+    expect(formatExampleFor("whole", "3")).toEqual({ answerKind: "whole", formatExample: "4" });
+    expect(formatExampleFor("fraction", "1/3")).toEqual({ answerKind: "fraction", formatExample: "1/2" });
+    expect(formatExampleFor("fraction", "1/2")).toEqual({ answerKind: "fraction", formatExample: "1/3" });
+    expect(formatExampleFor("fraction", "2/4")).toEqual({ answerKind: "fraction", formatExample: "1/3" });
+    expect(formatExampleFor("fraction", "3/6")).toEqual({ answerKind: "fraction", formatExample: "1/3" });
+    expect(answerKindForTemplate("add")).toBe("whole");
+    expect(answerKindForTemplate("frac_add")).toBe("fraction");
 
-    const swapped = toPublicItem(itemAt(0), stubInstance("2/4"));
+    const swapped = toPublicItem(itemAt(0), stubInstance("2/4", "fraction"));
     expect(swapped.answerKind).toBe("fraction");
     expect(swapped.formatExample).toBe("1/3");
     expect(swapped).not.toHaveProperty("canonicalAnswer");
@@ -1160,12 +1164,14 @@ describe("item templates and issuance", () => {
     });
     const catalog = itemAt(itemIndex(db, session.sessionId));
     const published = toPublicItem(catalog, issued);
-    const chosen = formatExampleFor(issued.canonicalAnswer);
+    const chosen = formatExampleFor(issued.answerKind, issued.canonicalAnswer);
     expect(published.answerKind).toBe(chosen.answerKind);
     expect(published.formatExample).toBe(chosen.formatExample);
     expect(examplesDiffer(issued.canonicalAnswer, published.formatExample ?? "")).toBe(true);
     expect(published).not.toHaveProperty("canonicalAnswer");
-    expect(session.item.answerKind).toBe(formatExampleFor(readItemInstance(db, session.item.itemInstanceId ?? "")?.canonicalAnswer ?? "").answerKind);
+    expect(session.item.answerKind).toBe(
+      readItemInstance(db, session.item.itemInstanceId ?? "")?.answerKind,
+    );
     expect(session.item.formatExample).toBeTruthy();
 
     const index = itemIndex(db, session.sessionId);
@@ -1180,10 +1186,114 @@ describe("item templates and issuance", () => {
     batch.forEach((instance, offset) => {
       const item = toPublicItem(itemAt(index + offset), instance);
       expect(item.answerKind === "whole" || item.answerKind === "fraction").toBe(true);
-      expect(item.formatExample).toBe(formatExampleFor(instance.canonicalAnswer).formatExample);
+      expect(item.formatExample).toBe(
+        formatExampleFor(instance.answerKind, instance.canonicalAnswer).formatExample,
+      );
       expect(examplesDiffer(instance.canonicalAnswer, item.formatExample ?? "")).toBe(true);
       expect(JSON.stringify(item)).not.toMatch(/canonicalAnswer|canonical_answer/);
     });
+  });
+
+  it("keeps a whole-valued fraction template on the fraction keyboard", () => {
+    const template = TEMPLATE_VERSIONS.find((item) => item.templateId === "frac-add-like-inline");
+    if (!template) throw new Error("missing fraction template");
+    expect(answerKindForTemplate(template.spec.family)).toBe("fraction");
+    let whole: string | null = null;
+    for (let seed = 1; seed <= 40; seed += 1) {
+      const drawn = drawAccepted(template, 2, seeded(seed), 40);
+      if (!drawn) continue;
+      const parsed = parseAnswer(drawn.canonicalAnswer);
+      if (parsed.kind === "rational" && parsed.form === "integer") {
+        whole = drawn.canonicalAnswer;
+        break;
+      }
+    }
+    expect(whole).toBe("1");
+    const hinted = formatExampleFor("fraction", whole ?? "");
+    expect(hinted).toEqual({ answerKind: "fraction", formatExample: "1/2" });
+    expect(examplesDiffer(whole ?? "", hinted.formatExample)).toBe(true);
+
+    const db = tempDb();
+    const { guardian, child, session } = granted(db);
+    const issued = issueForProgression(db, {
+      childId: child.id,
+      sessionId: session.sessionId,
+      skillId: SKILLS.addLike,
+      idempotencyKey: "whole-frac-slot",
+      now: WHEN,
+    });
+    expect(issued.answerKind).toBe("fraction");
+    db.prepare(
+      `UPDATE item_instances
+       SET canonical_answer = '1', compare_mode = 'rational', require_form = NULL
+       WHERE item_instance_id = ?`,
+    ).run(issued.itemInstanceId);
+    const held = readItemInstance(db, issued.itemInstanceId);
+    if (!held) throw new Error("missing instance");
+    expect(held.answerKind).toBe("fraction");
+    expect(held.canonicalAnswer).toBe("1");
+    const published = toPublicItem(itemAt(0), held);
+    expect(published.answerKind).toBe("fraction");
+    expect(published.formatExample).toBe("1/2");
+    expect(examplesDiffer("1", published.formatExample ?? "")).toBe(true);
+    expect(published).not.toHaveProperty("canonicalAnswer");
+
+    expect(gradeStoredAnswer(held, "1")).toBe("correct");
+    expect(gradeStoredAnswer(held, "4/4")).toBe("correct");
+    expect(gradeStoredAnswer({ ...held, requireForm: "lowest_terms" }, "1")).toBe("correct");
+    expect(gradeStoredAnswer({ ...held, requireForm: "lowest_terms" }, "4/4")).toBe("incorrect");
+    expect(gradeStoredAnswer({ ...held, requireForm: "improper" }, "1")).toBe("incorrect");
+    expect(gradeStoredAnswer({ ...held, requireForm: "mixed" }, "1")).toBe("incorrect");
+
+    const scored = submitAnswer(
+      db,
+      guardian.id,
+      child.id,
+      {
+        idempotencyKey: "whole-frac-score",
+        sessionId: session.sessionId,
+        itemId: session.item.id,
+        itemInstanceId: held.itemInstanceId,
+        answer: "1",
+        shownAt: shown(),
+        submittedAt: WHEN,
+      },
+      { now: WHEN },
+    );
+    if (isFormatRejected(scored)) throw new Error("a whole number on a fraction item was rejected");
+    expect(scored.correct).toBe(true);
+
+    const formed = issueForProgression(db, {
+      childId: child.id,
+      sessionId: session.sessionId,
+      skillId: SKILLS.addLike,
+      idempotencyKey: "whole-frac-form",
+      now: WHEN,
+    });
+    db.prepare(
+      `UPDATE item_instances
+       SET canonical_answer = '1', compare_mode = 'rational', require_form = 'improper'
+       WHERE item_instance_id = ?`,
+    ).run(formed.itemInstanceId);
+    const later = "2026-06-15T18:00:30.000Z";
+    const missed = submitAnswer(
+      db,
+      guardian.id,
+      child.id,
+      {
+        idempotencyKey: "whole-frac-form-score",
+        sessionId: session.sessionId,
+        itemId: session.item.id,
+        itemInstanceId: formed.itemInstanceId,
+        answer: "1",
+        shownAt: new Date(Date.parse(later) - 2_000).toISOString(),
+        submittedAt: later,
+      },
+      { now: later },
+    );
+    if (isFormatRejected(missed)) throw new Error("require_form marked a readable answer unreadable");
+    expect(missed.correct).toBe(false);
+    expect(readItemInstance(db, formed.itemInstanceId)?.answerKind).toBe("fraction");
   });
 
   it("renders the slate hint under the blank and picks the keyboard from answer kind", () => {

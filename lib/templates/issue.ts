@@ -12,7 +12,8 @@ import {
 } from "@/lib/templates/store";
 import type { BugHit, TemplateVersion } from "@/lib/templates/types";
 import { cueText, tryNextFromCue } from "@/lib/templates/cues";
-import { formatExampleFor } from "@/lib/templates/format-example";
+import { answerKindForTemplate, formatExampleFor } from "@/lib/templates/format-example";
+import type { AnswerKind } from "@/lib/unparseable";
 
 /** Progression stays rules-v0 and serves difficulty step 1 only. */
 export const PROGRESSION_DIFFICULTY_STEP = 1 as const;
@@ -55,6 +56,8 @@ export type ItemInstance = {
   bugHits: BugHit[];
   defaultFocus: string | null;
   whyItWorks: string | null;
+  /** From the template family, not from this draw's canonical answer. */
+  answerKind: AnswerKind;
 };
 
 type InstanceRow = {
@@ -135,7 +138,24 @@ function hashSeed(text: string): number {
   return hash >>> 0;
 }
 
-function mapInstance(row: InstanceRow): ItemInstance {
+function templateFamily(
+  db: Database.Database,
+  templateId: string,
+  templateVersion: number,
+): string {
+  const row = db
+    .prepare(
+      `SELECT spec_json FROM item_template_versions
+       WHERE template_id = ? AND template_version = ?`,
+    )
+    .get(templateId, templateVersion) as { spec_json: string } | undefined;
+  if (!row) throw new DomainError("That problem is not in this practice pack.", 404);
+  const spec = JSON.parse(row.spec_json) as { family?: string };
+  if (!spec.family) throw new DomainError("That problem is not in this practice pack.", 404);
+  return spec.family;
+}
+
+function mapInstance(db: Database.Database, row: InstanceRow): ItemInstance {
   return {
     itemInstanceId: row.item_instance_id,
     childId: row.child_id,
@@ -160,6 +180,7 @@ function mapInstance(row: InstanceRow): ItemInstance {
     bugHits: JSON.parse(row.bug_hits_json) as BugHit[],
     defaultFocus: row.default_focus,
     whyItWorks: row.why_it_works,
+    answerKind: answerKindForTemplate(templateFamily(db, row.template_id, row.template_version)),
   };
 }
 
@@ -177,7 +198,7 @@ export function readItemInstance(
   const row = db
     .prepare(`${INSTANCE_SELECT} WHERE item_instance_id = ?`)
     .get(itemInstanceId) as InstanceRow | undefined;
-  return row ? mapInstance(row) : null;
+  return row ? mapInstance(db, row) : null;
 }
 
 function readByIdempotency(
@@ -188,13 +209,13 @@ function readByIdempotency(
   const row = db
     .prepare(`${INSTANCE_SELECT} WHERE session_id = ? AND issue_idempotency_key = ?`)
     .get(sessionId, idempotencyKey) as InstanceRow | undefined;
-  return row ? mapInstance(row) : null;
+  return row ? mapInstance(db, row) : null;
 }
 
 export function toPublicItem(catalog: PublicItem, instance: ItemInstance): PublicItem {
   const inline =
     instance.presentation.leading.length > 0 || instance.presentation.trailing.length > 0;
-  const example = formatExampleFor(instance.canonicalAnswer);
+  const example = formatExampleFor(instance.answerKind, instance.canonicalAnswer);
   return {
     id: catalog.id,
     pack: catalog.pack,
@@ -404,7 +425,7 @@ function drawExhausted(
   if (!prior) return null;
   const current = input.templates.find((item) => item.template.templateId === picked.templateId);
   if (!current) return null;
-  const previous = mapInstance(prior);
+  const previous = mapInstance(db, prior);
   return {
     templateId: previous.templateId,
     templateVersion: previous.templateVersion,

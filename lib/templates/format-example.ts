@@ -6,11 +6,12 @@ const WHOLE_FALLBACK = "4";
 const FRACTION_EXAMPLE = "1/2";
 const FRACTION_FALLBACK = "1/3";
 
-/** Whole unless the stored answer is a fraction or mixed number. Symbols stay whole. */
-export function answerKindFor(canonical: string): AnswerKind {
-  const parsed = parseAnswer(canonical);
-  if (parsed.kind === "rational" && parsed.form !== "integer") return "fraction";
-  return "whole";
+/**
+ * Declared on the template family. A fraction template stays `fraction`
+ * even when one draw simplifies to a whole number such as 4/4.
+ */
+export function answerKindForTemplate(family: string): AnswerKind {
+  return family.startsWith("frac_") ? "fraction" : "whole";
 }
 
 function equivalent(canonical: string, example: string): boolean {
@@ -23,14 +24,17 @@ function equivalent(canonical: string, example: string): boolean {
 }
 
 /**
- * Server-chosen hint example. Never equal to the canonical answer, including
- * equivalent writings such as 2/4 and 1/2. The client receives only the result.
+ * Server-chosen hint example for a template's declared answer kind.
+ * Never equal to the canonical answer, including equivalent writings
+ * such as 2/4 and 1/2. The client receives only the result.
  */
-export function formatExampleFor(canonical: string): {
+export function formatExampleFor(
+  answerKind: AnswerKind,
+  canonical: string,
+): {
   answerKind: AnswerKind;
   formatExample: string;
 } {
-  const answerKind = answerKindFor(canonical);
   if (answerKind === "whole") {
     return {
       answerKind,

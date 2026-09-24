@@ -1,5 +1,5 @@
 import type Database from "better-sqlite3";
-import { answerKindFor } from "@/lib/templates/format-example";
+import { answerKindForTemplate } from "@/lib/templates/format-example";
 import { REPEAT_WINDOW_MS } from "@/lib/templates/issue";
 
 export type RepeatRate = {
@@ -77,7 +77,7 @@ export function formatRejectRates(db: Database.Database, childId: string): Forma
       `SELECT
          i.template_version AS templateVersion,
          t.provenance AS provenance,
-         i.canonical_answer AS canonicalAnswer
+         json_extract(t.spec_json, '$.family') AS family
        FROM attempts a
        JOIN item_instances i ON i.item_instance_id = a.item_instance_id
        JOIN item_template_versions t
@@ -87,7 +87,7 @@ export function formatRejectRates(db: Database.Database, childId: string): Forma
     .all(childId) as Array<{
     templateVersion: number;
     provenance: string;
-    canonicalAnswer: string;
+    family: string;
   }>;
   const buckets = new Map<string, FormatRejectRate>();
   const touch = (templateVersion: number, provenance: string, answerKind: string) => {
@@ -109,7 +109,7 @@ export function formatRejectRates(db: Database.Database, childId: string): Forma
     touch(row.templateVersion, row.provenance, row.answerKind).rejects += row.rejects;
   }
   for (const row of attempts) {
-    touch(row.templateVersion, row.provenance, answerKindFor(row.canonicalAnswer)).attempts += 1;
+    touch(row.templateVersion, row.provenance, answerKindForTemplate(row.family)).attempts += 1;
   }
   return [...buckets.values()]
     .sort(
