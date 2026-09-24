@@ -40,7 +40,8 @@ describe("shared palette", () => {
     expect(stepClass(2)).toBe("bg-step-1 text-foreground");
     expect(stepClass(3)).toBe("bg-step-2 text-foreground");
     expect(stepClass(4)).toBe("bg-step-3 text-foreground");
-    expect(stepClass(9)).toBe("bg-step-5 text-foreground");
+    expect(stepClass(5)).toBe("bg-step-4 text-white");
+    expect(stepClass(9)).toBe("bg-step-5 text-white");
     expect(PALETTE.verdict.correct).toBe(PALETTE.logo);
     expect(PALETTE.ink).not.toBe(PALETTE.verdict.correct);
   });

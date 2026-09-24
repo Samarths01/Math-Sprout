@@ -43,20 +43,20 @@ export function ChildHomeFrame({
     <div className="grid gap-4" data-testid="child-home">
       <Card>
         <CardContent className="grid gap-3">
-          <p data-testid="child-greeting" className="text-base">
+          <p data-testid="child-greeting" className="text-base leading-6">
             Hi, {displayName}
           </p>
           <div className="grid gap-1">
             <p
               data-testid="focus-label"
               data-copy-key="home.focus.kicker"
-              className="text-xs font-medium tracking-[0.14em] text-muted-foreground"
+              className="text-[13px] font-medium tracking-[0.14em] text-label uppercase"
             >
               {interfaceCopy("home.focus.kicker")}
             </p>
             <h1
               data-testid="focus-concept"
-              className="font-heading text-3xl tracking-tight"
+              className="font-heading text-[22px] leading-[28px] tracking-tight"
             >
               {concept}
             </h1>

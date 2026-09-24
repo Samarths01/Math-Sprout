@@ -31,7 +31,7 @@ export function PracticeCta({
       href={`/child/${childId}/practice`}
       data-testid="practice-cta"
       data-practice-allowed="true"
-      className={cn(buttonVariants(), "h-14 w-full text-base")}
+      className={cn(buttonVariants({ size: "primary" }))}
     >
       Start practice
     </Link>

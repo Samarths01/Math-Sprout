@@ -487,7 +487,7 @@ export function PracticeSession({
             <span
               data-testid="difficulty-badge"
               data-grade={item.grade}
-              className={`inline-flex w-fit items-center rounded-md px-2 py-0.5 text-xs font-medium ${stepClass(item.grade)}`}
+              className={`inline-flex w-fit items-center rounded-full px-2.5 py-0.5 text-xs font-medium ${stepClass(item.grade)}`}
             >
               Grade {item.grade}
             </span>
@@ -495,7 +495,7 @@ export function PracticeSession({
           </CardDescription>
           <CardTitle
             data-testid="practice-prompt"
-            className="font-heading text-3xl leading-tight"
+            className="font-heading text-[32px] leading-[40px] tracking-tight tabular-nums"
           >
             {item.prompt}
           </CardTitle>
@@ -507,7 +507,7 @@ export function PracticeSession({
               {offlineCapped ? null : (
                 <Button
                   type="button"
-                  className="h-12 text-base"
+                  size="primary"
                   onClick={() => showNext(nextFromFeedback ?? localNext)}
                 >
                   Next problem
@@ -535,9 +535,9 @@ export function PracticeSession({
               {error ? <p className="text-sm text-destructive">{error}</p> : null}
               <Button
                 type="submit"
+                size="primary"
                 data-testid="practice-submit"
                 disabled={busy || offlineCapped}
-                className="h-12 text-base"
               >
                 {busy ? "Checking…" : "Check answer"}
               </Button>

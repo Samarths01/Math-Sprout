@@ -1,15 +1,17 @@
 "use client";
 
 import { useEffect, useRef } from "react";
+import { FlameMark, PieceMark, StarMark } from "@/components/fuel-mark";
 import { consumeFuelPulse, releaseFuelPulse } from "@/lib/fuel-motion";
 import { fuelStripText } from "@/lib/home-presentation";
-import { flameClass } from "@/lib/palette";
+import { FLAME_CHIP_CLASS } from "@/lib/palette";
 import type { StreakState } from "@/lib/streak";
 import { cn } from "@/lib/utils";
 
 /**
- * Numeric fuel line under the practice control.
+ * Three fuel chips under the practice control.
  * Not a link. Pulses once when practice just stored a mint-toast flag.
+ * Icons are drawn. The words stay the data-driven strip sentence.
  */
 export function FuelStrip({
   childId,
@@ -74,21 +76,40 @@ export function FuelStrip({
       ref={stripRef}
       data-pulse={forcePulse ? "once" : "false"}
       className={cn(
-        "flex h-11 items-center overflow-hidden rounded-lg bg-muted px-3 font-sans text-sm font-medium tracking-tight whitespace-nowrap",
+        "flex h-11 items-center gap-1.5 overflow-hidden rounded-[12px] bg-muted px-1.5 font-sans text-[13px] font-semibold tracking-tight whitespace-nowrap",
         forcePulse && "fuel-strip-pulse",
       )}
     >
-      <span data-testid="fuel-flame" className={flameClass(heatState)}>
-        {flamePart}
+      <span
+        data-testid="fuel-flame"
+        className={cn(
+          "inline-flex h-7 min-w-0 items-center gap-1 rounded-full px-2 tabular-nums",
+          FLAME_CHIP_CLASS[heatState],
+        )}
+      >
+        <FlameMark />
+        {chipLabel(flamePart)}
       </span>
-      <span className="text-muted-foreground"> · </span>
-      <span data-testid="fuel-xp-count" className="text-xp">
-        {xpPart}
+      <span className="sr-only"> · </span>
+      <span
+        data-testid="fuel-xp-count"
+        className="inline-flex h-7 min-w-0 items-center gap-1 rounded-full bg-xp/12 px-2 text-xp tabular-nums"
+      >
+        <StarMark />
+        {chipLabel(xpPart)}
       </span>
-      <span className="text-muted-foreground"> · </span>
-      <span data-testid="fuel-pieces-count" className="text-piece">
-        {piecePart}
+      <span className="sr-only"> · </span>
+      <span
+        data-testid="fuel-pieces-count"
+        className="inline-flex h-7 min-w-0 items-center gap-1 rounded-full bg-piece/12 px-2 text-piece tabular-nums"
+      >
+        <PieceMark />
+        {chipLabel(piecePart)}
       </span>
     </p>
   );
+}
+
+function chipLabel(part: string | undefined): string {
+  return (part ?? "").replace(/^[🔥⭐🧩]\s*/u, "").trim();
 }
