@@ -22,6 +22,7 @@ export function ChildHomeFrame({
   started,
   sourceEventId,
   heat,
+  fuelText,
 }: {
   childId: string;
   displayName: string;
@@ -33,6 +34,8 @@ export function ChildHomeFrame({
   sourceEventId: string | null;
   /** Existing server heat state. Omitted only paints a display fallback. */
   heat?: StreakState;
+  /** Preview fixtures only. Live homes leave this unset and stay data-driven. */
+  fuelText?: string;
 }) {
   const flame = !started ? "start" : glance.dayCount === null ? "resting" : "lit";
   const heatState: StreakState =
@@ -74,6 +77,7 @@ export function ChildHomeFrame({
             flame={flame}
             heat={heatState}
             sourceEventId={sourceEventId}
+            text={fuelText}
           />
         </CardContent>
       </Card>
