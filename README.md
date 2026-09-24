@@ -22,6 +22,8 @@ This derived total supersedes the earlier line that the companion carried no XP 
 
 Each attempt and practice session stores `policy_version` (`rules-v0`). The server attempt log carries that same string with the concept, item, difficulty, lanes, correctness, latency, integrity flags, session id, and idempotency key. Kids still receive only `ClientView`. Production scoring stays the rules `MasteryEstimator`. The eval harness that baselines later policies against `rules-v0` is Signal-owned and offline. This app does not run a second scorer.
 
+New attempts and practice sessions also store `build_sha` beside `policy_version`. The server resolves it once at startup: `APP_BUILD_SHA` when that variable is set, otherwise `git rev-parse HEAD`, otherwise the literal `unknown`. It is never empty on a new row. Rows from before the column stay null. The server attempt log line includes the tag next to `policy_version`. The child client does not receive it.
+
 Architecture §21 supersedes treating those integrity fixtures as a Slice 2 exit. Full XP, a badge, and a build piece are not minted for an empty answer, a too-fast answer, a duplicate key, or identical spam. `ClientView` stays free of a score percent, confidence, and judgment copy.
 
 ## Run locally
@@ -151,6 +153,7 @@ Slice 4 adds:
 - review sessions per week are capped at the mint, and review cannot mint LevelUpSlight, a badge, or a build piece
 - QualifyingPracticeDay heats Warm on the first qualifying day, and Hot on the next calendar day while the flame is still alive, using `child.timezone`
 - attempts and sessions store `policy_version` `rules-v0`, and the server attempt log includes it
+- new attempts and sessions store a non-empty `build_sha` beside `policy_version`, the server log line includes it, older rows may leave it null, and the child client does not receive it
 - empty, too-fast, duplicate-key, and identical-spam responses keep `ClientView` free of score, confidence, and judgment copy, and do not mint full XP, a badge, or a build piece
 
 Slice 5 adds:

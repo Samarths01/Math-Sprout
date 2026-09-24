@@ -14,6 +14,8 @@ import type { PracticeLane } from "@/lib/mastery";
  */
 export type AttemptLog = {
   policyVersion: string;
+  /** App build that stored this attempt. Never empty; older rows read as unknown. */
+  buildSha: string;
   attemptId: string;
   sessionId: string;
   idempotencyKey: string;
@@ -40,6 +42,7 @@ type LogRow = {
   shown_at: string;
   submitted_at: string;
   attempt_policy: string;
+  build_sha: string | null;
   practice_lane: PracticeLane;
   session_policy: string;
 };
@@ -52,7 +55,7 @@ export function readAttemptLog(
     .prepare(
       `SELECT a.id, a.session_id, a.idempotency_key, a.item_id, a.correct,
               a.lane, a.flags_json, a.client_view_json, a.shown_at, a.submitted_at,
-              a.policy_version AS attempt_policy,
+              a.policy_version AS attempt_policy, a.build_sha,
               s.practice_lane, s.policy_version AS session_policy
        FROM attempts a
        JOIN practice_sessions s ON s.id = a.session_id
@@ -73,8 +76,10 @@ export function readAttemptLog(
     showConceptChip: parsed.showConceptChip === true,
     celebrationTier: parsed.celebrationTier ?? "none",
   };
+  const buildSha = row.build_sha?.trim() ?? "";
   return {
     policyVersion: row.attempt_policy,
+    buildSha: buildSha.length > 0 ? buildSha : "unknown",
     attemptId: row.id,
     sessionId: row.session_id,
     idempotencyKey: row.idempotency_key,
@@ -88,4 +93,23 @@ export function readAttemptLog(
     flags: JSON.parse(row.flags_json) as IntegrityFlag[],
     clientView,
   };
+}
+
+/** One server line for a stored try. The build tag sits next to policy_version. */
+export function formatAttemptLogLine(log: AttemptLog): string {
+  const flags = log.flags.length > 0 ? log.flags.join(",") : "none";
+  return [
+    `policy_version=${log.policyVersion}`,
+    `build_sha=${log.buildSha}`,
+    `concept=${log.concept}`,
+    `item=${log.itemId}`,
+    `difficulty=${log.difficulty}`,
+    `practice_lane=${log.practiceLane}`,
+    `integrity_lane=${log.integrityLane}`,
+    `correct=${log.correct ? "true" : "false"}`,
+    `latency_ms=${log.latencyMs}`,
+    `flags=${flags}`,
+    `session=${log.sessionId}`,
+    `idempotency_key=${log.idempotencyKey}`,
+  ].join(" ");
 }

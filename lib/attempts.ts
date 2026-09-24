@@ -37,6 +37,7 @@ import {
 } from "@/lib/qualifying-bus";
 import { readAttemptLog } from "@/lib/attempt-log";
 import { fuelFromEvents } from "@/lib/fuel";
+import { APP_BUILD_SHA } from "@/lib/app-build";
 import { POLICY_VERSION } from "@/lib/policy";
 import { takePendingPauseHold } from "@/lib/pause-hold";
 import { practiceGate } from "@/lib/practice-gate";
@@ -301,9 +302,17 @@ export function startPracticeSession(
     db.prepare(
       `INSERT INTO practice_sessions (
          id, child_id, status, item_index, started_at, practice_lane, phase,
-         policy_version
-       ) VALUES (?, ?, 'active', ?, ?, ?, 'practicing', ?)`,
-    ).run(sessionId, childId, itemIndex, nowIso(), progress.nextLane, POLICY_VERSION);
+         policy_version, build_sha
+       ) VALUES (?, ?, 'active', ?, ?, ?, 'practicing', ?, ?)`,
+    ).run(
+      sessionId,
+      childId,
+      itemIndex,
+      nowIso(),
+      progress.nextLane,
+      POLICY_VERSION,
+      APP_BUILD_SHA,
+    );
     const created = readPracticeSession(db, childId, sessionId);
     if (!created) throw new DomainError("Practice session was not saved.", 500);
     return created;
@@ -398,11 +407,11 @@ export function submitAttempt(
       `INSERT INTO attempts (
          id, child_id, session_id, idempotency_key, item_id, answer, shown_at,
          submitted_at, correct, lane, celebration_tier, flags_json, beats_json,
-         client_view_json, created_at, policy_version, resume_presentation
+         client_view_json, created_at, policy_version, build_sha, resume_presentation
        ) VALUES (
          @id, @child_id, @session_id, @idempotency_key, @item_id, @answer, @shown_at,
          @submitted_at, @correct, @lane, @celebration_tier, @flags_json, @beats_json,
-         @client_view_json, @created_at, @policy_version, @resume_presentation
+         @client_view_json, @created_at, @policy_version, @build_sha, @resume_presentation
        )`,
     ).run({
       id: attemptId,
@@ -421,6 +430,7 @@ export function submitAttempt(
       client_view_json: JSON.stringify(economy.clientView),
       created_at: createdAt,
       policy_version: POLICY_VERSION,
+      build_sha: APP_BUILD_SHA,
       resume_presentation: quietResume ? "quiet" : "live",
     });
     commitAttemptEconomy(db, {
@@ -444,6 +454,9 @@ export function submitAttempt(
     const log = readAttemptLog(db, stored.id);
     if (log.policyVersion !== POLICY_VERSION) {
       throw new DomainError("Attempt log is missing policy_version.", 500);
+    }
+    if (log.buildSha.trim().length === 0) {
+      throw new DomainError("Attempt log is missing build_sha.", 500);
     }
     return resultFromRow(db, stored, false);
   });
