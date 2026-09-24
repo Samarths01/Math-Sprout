@@ -35,11 +35,11 @@ export function HifiFrames() {
             concept="Adding two-digit numbers"
             bandLabel="Getting it"
             consentStatus="granted"
-            glance={{ xp: 120, dayCount: 4, pieces: 2, goal: 5 }}
+            glance={{ xp: 120, dayCount: 3, pieces: 2, goal: 5 }}
             started
             sourceEventId="preview-day"
-            heat="hot"
-            fuelText="4-day flame · 120 XP · 2/5"
+            heat="warm"
+            fuelText="3-day flame · 120 XP · 2/5"
           />
         </div>
       </Phone>
@@ -49,8 +49,6 @@ export function HifiFrames() {
           heat="warm"
           badge="Steady"
           grade={3}
-          showHome
-          concept="Adding two-digit numbers"
         >
           <Equation />
           <Button type="button" size="primary">
@@ -207,8 +205,8 @@ function PracticeCard({
   xp = BEFORE_XP,
   pieces = 2,
   dayCount = 3,
-  showHome = false,
-  concept,
+  showHome = true,
+  concept = "Adding two-digit numbers",
   children,
 }: {
   fuel: string;
