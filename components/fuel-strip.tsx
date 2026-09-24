@@ -4,7 +4,7 @@ import { useEffect, useRef } from "react";
 import { FlameMark, PieceMark, StarMark } from "@/components/fuel-mark";
 import { consumeFuelPulse, releaseFuelPulse } from "@/lib/fuel-motion";
 import { fuelStripText } from "@/lib/home-presentation";
-import { FLAME_CHIP_CLASS } from "@/lib/palette";
+import { FLAME_CLASS, FLAME_TEXT_CLASS, FLAME_TINT_CLASS } from "@/lib/palette";
 import type { StreakState } from "@/lib/streak";
 import { cn } from "@/lib/utils";
 
@@ -84,27 +84,33 @@ export function FuelStrip({
         data-testid="fuel-flame"
         className={cn(
           "inline-flex h-7 min-w-0 items-center gap-1 rounded-full px-2 tabular-nums",
-          FLAME_CHIP_CLASS[heatState],
+          FLAME_TINT_CLASS[heatState],
         )}
       >
-        <FlameMark />
-        {chipLabel(flamePart)}
+        <span className={FLAME_CLASS[heatState]}>
+          <FlameMark />
+        </span>
+        <span className={FLAME_TEXT_CLASS[heatState]}>{chipLabel(flamePart)}</span>
       </span>
       <span className="sr-only"> · </span>
       <span
         data-testid="fuel-xp-count"
-        className="inline-flex h-7 min-w-0 items-center gap-1 rounded-full bg-xp/12 px-2 text-xp tabular-nums"
+        className="inline-flex h-7 min-w-0 items-center gap-1 rounded-full bg-xp-tint px-2 tabular-nums"
       >
-        <StarMark />
-        {chipLabel(xpPart)}
+        <span className="text-xp">
+          <StarMark />
+        </span>
+        <span className="text-xp-text">{xpChipLabel(xpPart)}</span>
       </span>
       <span className="sr-only"> · </span>
       <span
         data-testid="fuel-pieces-count"
-        className="inline-flex h-7 min-w-0 items-center gap-1 rounded-full bg-piece/12 px-2 text-piece tabular-nums"
+        className="inline-flex h-7 min-w-0 items-center gap-1 rounded-full bg-piece-tint px-2 tabular-nums"
       >
-        <PieceMark />
-        {chipLabel(piecePart)}
+        <span className="text-piece">
+          <PieceMark />
+        </span>
+        <span className="text-piece-text">{chipLabel(piecePart)}</span>
       </span>
     </p>
   );
@@ -112,4 +118,11 @@ export function FuelStrip({
 
 function chipLabel(part: string | undefined): string {
   return (part ?? "").replace(/^[🔥⭐🧩]\s*/u, "").trim();
+}
+
+/** The XP chip always shows the unit, including when a fixture passes a bare number. */
+function xpChipLabel(part: string | undefined): string {
+  const label = chipLabel(part);
+  if (/\bXP\b/i.test(label)) return label;
+  return label ? `${label} XP` : "XP";
 }

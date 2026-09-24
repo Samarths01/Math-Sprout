@@ -12,8 +12,25 @@ export const PALETTE = {
     ember: "#B5651D",
     resting: "#9AA0A6",
   },
+  /**
+   * Chip and badge words. Darker than the icon color so they clear 4.5:1
+   * on a 12% white tint of that color. Icons keep the full color above.
+   */
+  flameText: {
+    hot: "#AE4022",
+    warm: "#A45610",
+    ember: "#965214",
+    resting: "#5F6368",
+  },
   xp: "#E8B923",
+  xpText: "#8A6500",
   piece: "#7C5CBF",
+  pieceText: "#6E51AC",
+  /** Steady and Stretch words, darker shades of the middle and last slate steps. */
+  badgeText: {
+    steady: "#5D687A",
+    stretch: "#3E4654",
+  },
   verdict: {
     correct: "#2E9E5B",
     miss: "#4A7FC1",
@@ -27,6 +44,14 @@ export const PALETTE = {
   step: ["#E4E7EC", "#C5CAD3", "#9AA3B2", "#6B7382", "#3E4654"] as const,
 } as const;
 
+/** 12% of `hex` mixed onto white. Chip and badge fills use this tint. */
+export function tintOnWhite(hex: string): string {
+  const raw = hex.replace("#", "");
+  const channel = (index: number) =>
+    Math.round(Number.parseInt(raw.slice(index, index + 2), 16) * 0.12 + 255 * 0.88);
+  return `#${[0, 2, 4].map((index) => channel(index).toString(16).padStart(2, "0")).join("")}`;
+}
+
 /** Former forest-green primary. Buttons and progress must not use it. */
 export const OLD_BRAND_GREEN = "oklch(0.42 0.09 155)";
 
@@ -37,12 +62,20 @@ export const FLAME_CLASS: Record<StreakState, string> = {
   dormant: "text-flame-resting",
 };
 
-/** 12% tint chip plus the full heat color on the icon and the words. */
-export const FLAME_CHIP_CLASS: Record<StreakState, string> = {
-  hot: "bg-flame-hot/12 text-flame-hot",
-  warm: "bg-flame-warm/12 text-flame-warm",
-  ember: "bg-flame-ember/12 text-flame-ember",
-  dormant: "bg-flame-resting/12 text-flame-resting",
+/** Opaque 12% tint behind the flame chip. The icon keeps FLAME_CLASS. */
+export const FLAME_TINT_CLASS: Record<StreakState, string> = {
+  hot: "bg-flame-hot-tint",
+  warm: "bg-flame-warm-tint",
+  ember: "bg-flame-ember-tint",
+  dormant: "bg-flame-resting-tint",
+};
+
+/** Darker flame words on the tint. */
+export const FLAME_TEXT_CLASS: Record<StreakState, string> = {
+  hot: "text-flame-hot-text",
+  warm: "text-flame-warm-text",
+  ember: "text-flame-ember-text",
+  dormant: "text-flame-resting-text",
 };
 
 /**

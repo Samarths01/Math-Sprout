@@ -6,7 +6,7 @@ export function AppHeader({
   eyebrow,
   action,
 }: {
-  eyebrow: string;
+  eyebrow?: string;
   action?: ReactNode;
 }) {
   return (
@@ -17,7 +17,9 @@ export function AppHeader({
           <span className="block font-heading text-xl leading-none tracking-tight">
             Math Sprout
           </span>
-          <span className="mt-1 block text-sm text-muted-foreground">{eyebrow}</span>
+          {eyebrow ? (
+            <span className="mt-1 block text-sm text-muted-foreground">{eyebrow}</span>
+          ) : null}
         </span>
       </Link>
       {action}
