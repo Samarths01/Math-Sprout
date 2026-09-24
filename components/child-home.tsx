@@ -3,7 +3,7 @@ import { FuelStrip } from "@/components/fuel-strip";
 import { PracticeCta } from "@/components/practice-cta";
 import { Card, CardContent } from "@/components/ui/card";
 import type { CompanionGlance } from "@/lib/companion";
-import { childBlockCopyKey } from "@/lib/home-presentation";
+import { childBlockCopyKey, fuelStripText } from "@/lib/home-presentation";
 import { interfaceCopy } from "@/lib/interface-copy";
 import type { ConsentViewStatus } from "@/lib/practice-gate";
 import type { BandLabel } from "@/lib/attempt-contract";
@@ -38,6 +38,13 @@ export function ChildHomeFrame({
   const heatState: StreakState =
     heat ?? (started && glance.dayCount !== null ? "hot" : "dormant");
   const blockKey = childBlockCopyKey(consentStatus);
+  const fuelLine = fuelStripText({
+    started,
+    dayCount: glance.dayCount,
+    xp: glance.xp,
+    pieces: glance.pieces,
+    goal: glance.goal,
+  });
 
   return (
     <div className="grid gap-4" data-testid="child-home">
@@ -74,6 +81,7 @@ export function ChildHomeFrame({
             dayCount={glance.dayCount}
             pieces={glance.pieces}
             goal={glance.goal}
+            text={fuelLine}
             flame={flame}
             heat={heatState}
             sourceEventId={sourceEventId}

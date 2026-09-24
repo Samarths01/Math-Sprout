@@ -35,6 +35,8 @@ export const PALETTE = {
     correct: "#2E9E5B",
     miss: "#4A7FC1",
   },
+  /** Destructive text on white or light surfaces. Not the Not-yet blue. */
+  destructive: "#B3261E",
   ink: "#1F2A44",
   logo: "#2E9E5B",
   /** Beat labels and quiet captions. */

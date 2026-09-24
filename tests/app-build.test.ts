@@ -5,8 +5,10 @@ import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import Database from "better-sqlite3";
+import * as appBuild from "@/lib/app-build";
 import {
   buildCommands,
+  cachedAppBuildSha,
   createBuildResolver,
   currentAppBuildSha,
   formatParentBuildLabel,
@@ -19,6 +21,7 @@ import {
 import { formatAttemptLogLine, readAttemptLog } from "@/lib/attempt-log";
 import { startPracticeSession, submitAttempt } from "@/lib/attempts";
 import { ParentBuildFooter } from "@/components/build-footer";
+import { ChildHomeFrame } from "@/components/child-home";
 import { readCompanion } from "@/lib/companion";
 import { openDatabase } from "@/lib/db";
 import { createChild, createGuardian, getChildHome, setConsent } from "@/lib/domain";
@@ -523,8 +526,7 @@ describe("app build tag", () => {
     const log = readAttemptLog(db, result.attemptId);
     const line = emitted.find((entry) => entry.includes("build_sha="));
     expect(line).toBe(formatAttemptLogLine(log));
-    expect(line).toContain(`policy_version=${log.policyVersion}`);
-    expect(line).toContain(`build_sha=${attempt.build_sha}`);
+    expect(line).toContain(`policy_version=${log.policyVersion} build_sha=${attempt.build_sha}`);
     expect(line).not.toContain("build_sha= ");
 
     expect(result).not.toHaveProperty("buildSha");
@@ -533,19 +535,65 @@ describe("app build tag", () => {
     assertChildPayloadSealed(result);
     assertChildPayloadSealed(result.clientView);
     assertChildPayloadSealed(session);
-    assertChildPayloadSealed(getChildHome(db, guardian.id, child.id));
-    assertChildPayloadSealed(readCompanion(db, child.id, WHEN));
-    expect(JSON.stringify(result)).not.toContain(attempt.build_sha as string);
-    expect(JSON.stringify(session)).not.toContain(storedSession.build_sha as string);
+    const home = getChildHome(db, guardian.id, child.id);
+    const companion = readCompanion(db, child.id, WHEN);
+    assertChildPayloadSealed(home);
+    assertChildPayloadSealed(companion);
+    const sha = attempt.build_sha as string;
+    expect(JSON.stringify(result)).not.toContain(sha);
+    expect(JSON.stringify(session)).not.toContain(sha);
+    expect(JSON.stringify(home)).not.toContain(sha);
+    expect(JSON.stringify(companion)).not.toContain(sha);
+    expect(JSON.stringify(home)).not.toContain("Build ");
+    expect(JSON.stringify(companion)).not.toContain("Build ");
+    const homeHtml = renderToStaticMarkup(
+      createElement(ChildHomeFrame, {
+        childId: home.child.id,
+        displayName: home.child.displayName,
+        concept: "Adding two-digit numbers",
+        bandLabel: "Getting it",
+        consentStatus: home.child.consentStatus,
+        glance: companion.glance,
+        started: companion.streak.lastQualifyingDay !== null,
+        sourceEventId: companion.streak.sourceEventId,
+        heat: companion.streak.state,
+      }),
+    );
+    expect(homeHtml).not.toContain(sha);
+    expect(homeHtml).not.toContain("Build ");
   });
 
-  it("renders the build footer on the parent home and keeps it off child routes", async () => {
-    await primeAppBuildSha();
-    const html = renderToStaticMarkup(createElement(ParentBuildFooter));
-    expect(html).toContain('data-testid="parent-build-footer"');
-    expect(html).toContain(`Build ${formatParentBuildLabel(currentAppBuildSha()).replace(/^Build /, "")}`);
+  it("renders the build footer from the cache and keeps it off child routes", async () => {
+    let gitCalls = 0;
+    const restore = installGit((_file, args, _options, callback) => {
+      gitCalls += 1;
+      callback(null, args[0] === "rev-parse" ? ".git\n" : "aaa111bbb222\n", "");
+    });
+    try {
+      await primeAppBuildSha();
+      expect(cachedAppBuildSha()).toBe("aaa111bbb222");
+      gitCalls = 0;
+      vi.useFakeTimers({ toFake: ["Date"] });
+      vi.setSystemTime(Date.now() + 10_000);
+      const label = formatParentBuildLabel(cachedAppBuildSha());
+      expect(gitCalls).toBe(0);
+      expect(label).toBe("Build aaa111bbb222");
+      const html = renderToStaticMarkup(createElement(ParentBuildFooter, { label }));
+      expect(gitCalls).toBe(0);
+      expect(html).toContain('data-testid="parent-build-footer"');
+      expect(html).toContain(label);
+      currentAppBuildSha();
+      expect(gitCalls).toBe(1);
+    } finally {
+      vi.useRealTimers();
+      restore();
+    }
     const parentPage = readFileSync(path.join(process.cwd(), "app/parent/page.tsx"), "utf8");
-    expect(parentPage).toContain("<ParentBuildFooter />");
+    const footerSource = readFileSync(path.join(process.cwd(), "components/build-footer.tsx"), "utf8");
+    expect(parentPage).toContain("cachedAppBuildSha()");
+    expect(parentPage).toContain("<ParentBuildFooter");
+    expect(parentPage).not.toContain("currentAppBuildSha");
+    expect(footerSource).not.toMatch(/currentAppBuildSha|cachedAppBuildSha|execFile|readGitDescribe/);
     const childRoot = path.join(process.cwd(), "app/child");
     const childFiles: string[] = [];
     const walk = (dir: string) => {
@@ -561,6 +609,113 @@ describe("app build tag", () => {
       const source = readFileSync(file, "utf8");
       expect(source).not.toContain("ParentBuildFooter");
       expect(source).not.toContain("parent-build-footer");
+    }
+  });
+
+  it("reads the build SHA before the write transaction and passes it in as a plain value", () => {
+    const events: string[] = [];
+    const spy = vi.spyOn(appBuild, "currentAppBuildSha").mockImplementation(() => {
+      events.push("sha");
+      return "plain-sha-value";
+    });
+    const db = tempDb();
+    const { guardian, child } = seedPractice(db);
+    const original = db.transaction;
+    db.transaction = ((fn: (...args: never[]) => unknown) => {
+      events.push("register");
+      return original.call(db, () => {
+        const seen = events.filter((event) => event === "sha").length;
+        events.push("body");
+        try {
+          return fn();
+        } finally {
+          expect(events.filter((event) => event === "sha")).toHaveLength(seen);
+        }
+      });
+    }) as typeof db.transaction;
+    try {
+      const session = startPracticeSession(db, guardian.id, child.id);
+      const result = submitAttempt(db, guardian.id, child.id, attemptInput(session.sessionId), {
+        now: WHEN,
+      });
+      const attempt = db
+        .prepare(`SELECT build_sha FROM attempts WHERE id = ?`)
+        .get(result.attemptId) as { build_sha: string };
+      const storedSession = db
+        .prepare(`SELECT build_sha FROM practice_sessions WHERE id = ?`)
+        .get(session.sessionId) as { build_sha: string };
+      expect(attempt.build_sha).toBe("plain-sha-value");
+      expect(storedSession.build_sha).toBe("plain-sha-value");
+      expect(events.indexOf("sha")).toBeLessThan(events.indexOf("body"));
+      expect(events.filter((event) => event === "sha")).toHaveLength(2);
+      expect(events.filter((event) => event === "body")).toHaveLength(2);
+    } finally {
+      db.transaction = original;
+      spy.mockRestore();
+    }
+  });
+
+  it("keeps the resolver and git out of the write transaction callbacks", () => {
+    const source = readFileSync(path.join(process.cwd(), "lib/attempts.ts"), "utf8");
+    const bodies: string[] = [];
+    let from = 0;
+    while (from < source.length) {
+      const at = source.indexOf("db.transaction(", from);
+      if (at < 0) break;
+      const open = source.indexOf("{", at);
+      let depth = 0;
+      let end = -1;
+      for (let index = open; index < source.length; index += 1) {
+        if (source[index] === "{") depth += 1;
+        else if (source[index] === "}") {
+          depth -= 1;
+          if (depth === 0) {
+            end = index;
+            break;
+          }
+        }
+      }
+      expect(end).toBeGreaterThan(open);
+      bodies.push(source.slice(open, end + 1));
+      from = end + 1;
+    }
+    expect(bodies).toHaveLength(2);
+    for (const body of bodies) {
+      expect(body).not.toMatch(
+        /currentAppBuildSha|cachedAppBuildSha|readGitDescribe|execFile|buildCommands|primeAppBuildSha|refreshAppBuildSha/,
+      );
+    }
+    expect(source.match(/appBuild\.currentAppBuildSha\(\)/g)).toHaveLength(2);
+  });
+
+  it("does not emit the attempt log when the write transaction rolls back", () => {
+    const db = tempDb();
+    const { guardian, child } = seedPractice(db);
+    const session = startPracticeSession(db, guardian.id, child.id);
+    const emitted: string[] = [];
+    const spy = vi.spyOn(console, "info").mockImplementation((message) => {
+      emitted.push(String(message));
+    });
+    const original = db.transaction;
+    db.transaction = ((fn: (...args: never[]) => unknown) => {
+      return original.call(db, () => {
+        fn();
+        throw new Error("forced rollback");
+      });
+    }) as typeof db.transaction;
+    try {
+      expect(() =>
+        submitAttempt(db, guardian.id, child.id, attemptInput(session.sessionId), { now: WHEN }),
+      ).toThrow(/forced rollback/);
+      expect(emitted.filter((entry) => entry.includes("policy_version="))).toEqual([]);
+      expect(emitted.filter((entry) => entry.includes("build_sha="))).toEqual([]);
+      const row = db
+        .prepare(`SELECT id FROM attempts WHERE session_id = ?`)
+        .get(session.sessionId);
+      expect(row).toBeUndefined();
+    } finally {
+      db.transaction = original;
+      spy.mockRestore();
     }
   });
 

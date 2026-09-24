@@ -97,6 +97,12 @@ export function createBuildResolver(deps: BuildResolverDeps) {
       if (stale(deps.now())) void refresh();
       return cache?.value ?? "unknown";
     },
+    /** Cache only. Does not read HEAD and does not start git. */
+    cached(): string {
+      const pinned = pinnedEnv();
+      if (pinned) return pinned;
+      return cache?.value ?? "unknown";
+    },
     refresh,
     clear() {
       generation += 1;
@@ -226,6 +232,14 @@ const live = createBuildResolver({
 /** Tag to store on a new attempt or practice session. Never waits on git. */
 export function currentAppBuildSha(): string {
   return live.current();
+}
+
+/**
+ * Cached tag for render. Same value as currentAppBuildSha(), without a refresh.
+ * A parent-page render must not spawn git.
+ */
+export function cachedAppBuildSha(): string {
+  return live.cached();
 }
 
 /**
