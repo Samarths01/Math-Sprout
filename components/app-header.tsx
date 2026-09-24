@@ -11,8 +11,8 @@ export function AppHeader({
 }) {
   return (
     <header className="flex items-center justify-between gap-3">
-      <Link href="/" className="flex items-center gap-3 text-primary">
-        <SproutMark className="size-11 shrink-0" />
+      <Link href="/" className="flex items-center gap-3 text-foreground">
+        <SproutMark className="size-11 shrink-0 text-logo" />
         <span>
           <span className="block font-heading text-xl leading-none tracking-tight">
             Math Sprout

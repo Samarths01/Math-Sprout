@@ -3,10 +3,11 @@ import { FuelStrip } from "@/components/fuel-strip";
 import { PracticeCta } from "@/components/practice-cta";
 import { Card, CardContent } from "@/components/ui/card";
 import type { CompanionGlance } from "@/lib/companion";
-import { fuelStripText, childBlockCopyKey } from "@/lib/home-presentation";
+import { childBlockCopyKey } from "@/lib/home-presentation";
 import { interfaceCopy } from "@/lib/interface-copy";
 import type { ConsentViewStatus } from "@/lib/practice-gate";
 import type { BandLabel } from "@/lib/attempt-contract";
+import type { StreakState } from "@/lib/streak";
 
 /**
  * Child home frame. Greeting, focus, band, one practice control, fuel strip, badges link.
@@ -20,6 +21,7 @@ export function ChildHomeFrame({
   glance,
   started,
   sourceEventId,
+  heat,
 }: {
   childId: string;
   displayName: string;
@@ -29,15 +31,12 @@ export function ChildHomeFrame({
   glance: CompanionGlance;
   started: boolean;
   sourceEventId: string | null;
+  /** Existing server heat state. Omitted only paints a display fallback. */
+  heat?: StreakState;
 }) {
-  const text = fuelStripText({
-    started,
-    dayCount: glance.dayCount,
-    xp: glance.xp,
-    pieces: glance.pieces,
-    goal: glance.goal,
-  });
   const flame = !started ? "start" : glance.dayCount === null ? "resting" : "lit";
+  const heatState: StreakState =
+    heat ?? (started && glance.dayCount !== null ? "hot" : "dormant");
   const blockKey = childBlockCopyKey(consentStatus);
 
   return (
@@ -68,12 +67,12 @@ export function ChildHomeFrame({
           <PracticeCta childId={childId} blockKey={blockKey} />
           <FuelStrip
             childId={childId}
-            text={text}
             xp={glance.xp}
             dayCount={glance.dayCount}
             pieces={glance.pieces}
             goal={glance.goal}
             flame={flame}
+            heat={heatState}
             sourceEventId={sourceEventId}
           />
         </CardContent>

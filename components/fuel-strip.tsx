@@ -2,6 +2,9 @@
 
 import { useEffect, useRef } from "react";
 import { consumeFuelPulse, releaseFuelPulse } from "@/lib/fuel-motion";
+import { fuelStripText } from "@/lib/home-presentation";
+import { flameClass } from "@/lib/palette";
+import type { StreakState } from "@/lib/streak";
 import { cn } from "@/lib/utils";
 
 /**
@@ -16,16 +19,19 @@ export function FuelStrip({
   pieces,
   goal,
   flame,
+  heat,
   sourceEventId,
   forcePulse = false,
 }: {
   childId: string;
-  text: string;
+  text?: string;
   xp: number;
   dayCount: number | null;
   pieces: number;
   goal: number;
   flame: "start" | "resting" | "lit";
+  /** Server heat state. Quiet, cooled, and dormant render as resting. */
+  heat?: StreakState;
   sourceEventId: string | null;
   forcePulse?: boolean;
 }) {
@@ -40,6 +46,19 @@ export function FuelStrip({
     return () => window.clearTimeout(timer);
   }, [childId, forcePulse]);
 
+  const started = flame !== "start";
+  const line =
+    text ??
+    fuelStripText({
+      started,
+      dayCount,
+      xp,
+      pieces,
+      goal,
+    });
+  const [flamePart, xpPart, piecePart] = line.split(" · ");
+  const heatState: StreakState = heat ?? (flame === "lit" ? "hot" : "dormant");
+
   return (
     <p
       data-testid="fuel-strip"
@@ -50,15 +69,26 @@ export function FuelStrip({
       data-pieces={pieces}
       data-goal={goal}
       data-flame={flame}
+      data-heat={heatState}
       data-heat-event-id={sourceEventId ?? ""}
       ref={stripRef}
       data-pulse={forcePulse ? "once" : "false"}
       className={cn(
-        "flex h-11 items-center overflow-hidden rounded-lg bg-secondary/70 px-3 font-sans text-sm font-medium tracking-tight text-secondary-foreground whitespace-nowrap",
+        "flex h-11 items-center overflow-hidden rounded-lg bg-muted px-3 font-sans text-sm font-medium tracking-tight whitespace-nowrap",
         forcePulse && "fuel-strip-pulse",
       )}
     >
-      {text}
+      <span data-testid="fuel-flame" className={flameClass(heatState)}>
+        {flamePart}
+      </span>
+      <span className="text-muted-foreground"> · </span>
+      <span data-testid="fuel-xp-count" className="text-xp">
+        {xpPart}
+      </span>
+      <span className="text-muted-foreground"> · </span>
+      <span data-testid="fuel-pieces-count" className="text-piece">
+        {piecePart}
+      </span>
     </p>
   );
 }

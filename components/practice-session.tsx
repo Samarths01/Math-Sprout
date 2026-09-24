@@ -18,6 +18,7 @@ import {
 import { markFuelPulse } from "@/lib/fuel-motion";
 import { showResumeCelebration } from "@/lib/pause-hold";
 import { postPauseHoldUntilVisible } from "@/lib/pause-hold-receipt";
+import { stepClass } from "@/lib/palette";
 import { Button } from "@/components/ui/button";
 import {
   Card,
@@ -482,8 +483,15 @@ export function PracticeSession({
       ) : (
       <Card>
         <CardHeader>
-          <CardDescription>
-            Grade {item.grade} · {item.pack === "fractions" ? "Fractions" : "Operations"}
+          <CardDescription className="flex items-center gap-2">
+            <span
+              data-testid="difficulty-badge"
+              data-grade={item.grade}
+              className={`inline-flex w-fit items-center rounded-md px-2 py-0.5 text-xs font-medium ${stepClass(item.grade)}`}
+            >
+              Grade {item.grade}
+            </span>
+            <span>{item.pack === "fractions" ? "Fractions" : "Operations"}</span>
           </CardDescription>
           <CardTitle
             data-testid="practice-prompt"

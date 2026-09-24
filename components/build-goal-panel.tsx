@@ -48,7 +48,7 @@ export function BuildGoalPanel({ build }: { build: BuildGoalProjection }) {
               data-event-id={piece?.eventId ?? ""}
               className={
                 piece
-                  ? "rounded-lg bg-secondary px-3 py-2 text-sm"
+                  ? "rounded-lg bg-piece/15 px-3 py-2 text-sm text-piece"
                   : "rounded-lg border border-dashed border-border px-3 py-2 text-sm text-muted-foreground"
               }
             >

@@ -44,6 +44,7 @@ export default async function ChildHomePage({
           glance={companion.glance}
           started={companion.streak.lastQualifyingDay !== null}
           sourceEventId={companion.streak.sourceEventId}
+          heat={companion.streak.state}
         />
       </main>
     </Shell>

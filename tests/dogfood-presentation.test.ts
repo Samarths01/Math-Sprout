@@ -279,7 +279,7 @@ describe("dogfood fuel glance", () => {
     );
     expect(earned).toContain('data-testid="fuel-strip"');
     expect(earned).toContain('data-fuel-source="qualifying-event"');
-    expect(earned).toContain("🔥 3-day flame · ⭐ 120 XP · 🧩 2/5");
+    expect(visibleText(earned)).toContain("🔥 3-day flame · ⭐ 120 XP · 🧩 2/5");
     expect(earned).not.toContain("<a ");
     expect(earned).not.toContain("<button");
     expect(earned).not.toMatch(/score|confidence/i);
@@ -353,6 +353,10 @@ describe("dogfood fuel glance", () => {
   });
 });
 
+function visibleText(html: string): string {
+  return html.replace(/<[^>]*>/g, "");
+}
+
 function orderOf(html: string, testId: string): number {
   const at = html.indexOf(`data-testid="${testId}"`);
   expect(at, testId).toBeGreaterThan(-1);
@@ -366,7 +370,7 @@ describe("child home presentation", () => {
     expect(html.match(/Start practice/g)).toHaveLength(1);
     expect(html).not.toContain("ember-recovery");
     expect(html).not.toContain("Practice today to warm the flame");
-    expect(html).toContain("🔥 3-day flame · ⭐ 120 XP · 🧩 2/5");
+    expect(visibleText(html)).toContain("🔥 3-day flame · ⭐ 120 XP · 🧩 2/5");
     expect(orderOf(html, "child-greeting")).toBeLessThan(orderOf(html, "focus-label"));
     expect(orderOf(html, "focus-label")).toBeLessThan(orderOf(html, "focus-concept"));
     expect(orderOf(html, "focus-concept")).toBeLessThan(orderOf(html, "focus-band"));
@@ -392,7 +396,7 @@ describe("child home presentation", () => {
       started: true,
       sourceEventId: null,
     });
-    expect(resting).toContain("🔥 Flame resting · ⭐ 5 XP · 🧩 0/3");
+    expect(visibleText(resting)).toContain("🔥 Flame resting · ⭐ 5 XP · 🧩 0/3");
     expect(resting).not.toContain("0-day");
     expect(resting).not.toMatch(/🔥 0/);
 
@@ -402,7 +406,7 @@ describe("child home presentation", () => {
       sourceEventId: null,
       bandLabel: "Still learning",
     });
-    expect(fresh).toContain("🔥 Start your flame · ⭐ 0 XP · 🧩 0/3");
+    expect(visibleText(fresh)).toContain("🔥 Start your flame · ⭐ 0 XP · 🧩 0/3");
     expect(fresh).toContain('data-testid="fuel-strip"');
   });
 
@@ -435,7 +439,7 @@ describe("child home presentation", () => {
     expect(html).not.toContain('data-testid="practice-cta"');
     expect(html).not.toContain("Start practice");
     expect(html).toContain("Practice is paused for now — ask your grown-up.");
-    expect(html).toContain("🔥 1-day flame · ⭐ 5 XP · 🧩 0/3");
+    expect(visibleText(html)).toContain("🔥 1-day flame · ⭐ 5 XP · 🧩 0/3");
     expect(orderOf(html, "practice-blocked")).toBeLessThan(orderOf(html, "fuel-strip"));
 
     const revoked = homeHtml({ consentStatus: "revoked" });
