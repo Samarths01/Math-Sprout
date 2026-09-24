@@ -1,4 +1,5 @@
 import type { ReactNode } from "react";
+import Link from "next/link";
 import { AppHeader } from "@/components/app-header";
 import { ChildHomeFrame } from "@/components/child-home";
 import { FlameMark, PieceMark, StarMark } from "@/components/fuel-mark";
@@ -6,11 +7,20 @@ import { FuelStrip } from "@/components/fuel-strip";
 import { VerdictStrip } from "@/components/verdict-strip";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
+import { XP_AMOUNT } from "@/lib/attempt-contract";
 import { feedbackFrames } from "@/lib/feedback-frame";
-import { FLAME_CHIP_CLASS, stepClass } from "@/lib/palette";
+import { FLAME_CLASS, FLAME_TEXT_CLASS, FLAME_TINT_CLASS, stepClass } from "@/lib/palette";
 import type { StreakState } from "@/lib/streak";
 
 const CHILD = "preview-leo";
+
+/**
+ * A review lane mints `XP_AMOUNT.quietXp`.
+ * `lib/economy-config.ts` sets how many review sessions fit in a week.
+ * It does not set an XP amount, so this frame does not treat that cap as XP.
+ */
+const REVIEW_XP = XP_AMOUNT.quietXp;
+const BEFORE_XP = 120;
 
 export function HifiFrames() {
   return (
@@ -18,7 +28,7 @@ export function HifiFrames() {
       <style>{`@keyframes hifi-fade{from{opacity:0}to{opacity:1}}`}</style>
       <Phone id="home" title="Child home">
         <div className="grid gap-6">
-          <AppHeader eyebrow="Child home" />
+          <AppHeader />
           <ChildHomeFrame
             childId={CHILD}
             displayName="Leo"
@@ -29,16 +39,18 @@ export function HifiFrames() {
             started
             sourceEventId="preview-day"
             heat="hot"
-            fuelText="4-day flame · 120 · 2/5"
+            fuelText="4-day flame · 120 XP · 2/5"
           />
         </div>
       </Phone>
       <Phone id="question" title="Practice question">
         <PracticeCard
-          fuel="3-day flame · 120 · 2/5"
-          heat="hot"
+          fuel="3-day flame · 120 XP · 2/5"
+          heat="warm"
           badge="Steady"
           grade={3}
+          showHome
+          concept="Adding two-digit numbers"
         >
           <Equation />
           <Button type="button" size="primary">
@@ -48,12 +60,13 @@ export function HifiFrames() {
       </Phone>
       <Phone id="correct-mint" title="Correct with a mint">
         <PracticeCard
-          fuel="3-day flame · 130 · 3/5"
+          fuel="4-day flame · 130 XP · 3/5"
           heat="hot"
           badge="Steady"
           grade={3}
           xp={130}
           pieces={3}
+          dayCount={4}
         >
           <VerdictStrip correct />
           <RewardLine />
@@ -69,14 +82,18 @@ export function HifiFrames() {
           </Button>
         </PracticeCard>
       </Phone>
-      <Phone id="correct-review" title="Correct without a mint">
+      <Phone id="correct-review" title="Review">
         <PracticeCard
-          fuel="3-day flame · 120 · 2/5"
-          heat="hot"
+          fuel={`3-day flame · ${BEFORE_XP + REVIEW_XP} XP · 2/5`}
+          heat="warm"
           badge="Steady"
           grade={3}
+          xp={BEFORE_XP + REVIEW_XP}
         >
           <VerdictStrip correct />
+          <p data-testid="review-xp" className="text-[13px] font-semibold text-xp-text">
+            +{REVIEW_XP} XP
+          </p>
           <Beats
             correct
             whatWentWell="You counted up from 27 to find the missing number."
@@ -91,8 +108,8 @@ export function HifiFrames() {
       </Phone>
       <Phone id="not-yet" title="Not yet">
         <PracticeCard
-          fuel="3-day flame · 120 · 2/5"
-          heat="hot"
+          fuel="3-day flame · 120 XP · 2/5"
+          heat="warm"
           badge="Steady"
           grade={3}
         >
@@ -126,18 +143,27 @@ export function HifiFrames() {
           <CardContent className="grid gap-4">
             <h1 className="font-heading text-[22px] leading-[28px]">Nice practice today</h1>
             <div className="flex flex-wrap gap-2">
-              <Chip className={FLAME_CHIP_CLASS.hot}>
-                <FlameMark />
-                4-day flame
-              </Chip>
-              <Chip className="bg-xp/12 text-xp">
-                <StarMark />
-                +30 XP today
-              </Chip>
-              <Chip className="bg-piece/12 text-piece">
-                <PieceMark />
-                Piece 3 of 5
-              </Chip>
+              <ToneChip
+                tint={FLAME_TINT_CLASS.hot}
+                icon={FLAME_CLASS.hot}
+                text={FLAME_TEXT_CLASS.hot}
+                mark={<FlameMark />}
+                label="4-day flame"
+              />
+              <ToneChip
+                tint="bg-xp-tint"
+                icon="text-xp"
+                text="text-xp-text"
+                mark={<StarMark />}
+                label="+30 XP today"
+              />
+              <ToneChip
+                tint="bg-piece-tint"
+                icon="text-piece"
+                text="text-piece-text"
+                mark={<PieceMark />}
+                label="Piece 3 of 5"
+              />
             </div>
             <Button type="button" size="primary">
               Back home
@@ -178,8 +204,11 @@ function PracticeCard({
   heat,
   badge,
   grade,
-  xp = 120,
+  xp = BEFORE_XP,
   pieces = 2,
+  dayCount = 3,
+  showHome = false,
+  concept,
   children,
 }: {
   fuel: string;
@@ -188,15 +217,31 @@ function PracticeCard({
   grade: number;
   xp?: number;
   pieces?: number;
+  dayCount?: number;
+  showHome?: boolean;
+  concept?: string;
   children: ReactNode;
 }) {
+  const badgeNode = (
+    <span
+      data-testid="difficulty-badge"
+      className={`inline-flex w-fit items-center rounded-full px-2.5 py-0.5 text-xs font-medium ${badgeClass(badge, grade)}`}
+    >
+      {badge}
+    </span>
+  );
   return (
     <div className="grid gap-3">
+      {showHome ? (
+        <Link href={`/child/${CHILD}`} className="w-fit text-sm text-label">
+          Home
+        </Link>
+      ) : null}
       <FuelStrip
         childId={CHILD}
         text={fuel}
         xp={xp}
-        dayCount={3}
+        dayCount={dayCount}
         pieces={pieces}
         goal={5}
         flame="lit"
@@ -205,12 +250,14 @@ function PracticeCard({
       />
       <Card>
         <CardContent className="grid gap-4">
-          <span
-            data-testid="difficulty-badge"
-            className={`inline-flex w-fit items-center rounded-full px-2.5 py-0.5 text-xs font-medium ${badgeClass(badge, grade)}`}
-          >
-            {badge}
-          </span>
+          {concept ? (
+            <div className="flex items-center gap-2">
+              <p className="font-heading text-sm leading-5">{concept}</p>
+              {badgeNode}
+            </div>
+          ) : (
+            badgeNode
+          )}
           {children}
         </CardContent>
       </Card>
@@ -218,20 +265,20 @@ function PracticeCard({
   );
 }
 
-/** Warm-up is the light slate, Steady the middle, Stretch the darkest with white text. */
+/** Warm-up is the light slate. Steady and Stretch use a darker word on the 12% tint. */
 function badgeClass(badge: string, grade: number): string {
   if (badge === "Warm-up") return "bg-step-1 text-foreground";
-  if (badge === "Steady") return "bg-step-3 text-foreground";
-  if (badge === "Stretch") return "bg-step-5 text-white";
+  if (badge === "Steady") return "bg-steady-tint text-steady-text";
+  if (badge === "Stretch") return "bg-stretch-tint text-stretch-text";
   return stepClass(grade);
 }
 
 function Equation() {
   return (
-    <p className="font-heading text-[32px] leading-[40px] tabular-nums">
-      27 +{" "}
-      <span className="mx-1 inline-block h-[52px] w-16 rounded-[10px] border-2 border-step-3 align-baseline" />{" "}
-      = 42
+    <p className="flex items-center gap-2 font-heading text-[32px] leading-[40px] tabular-nums">
+      <span>27 +</span>
+      <span className="inline-block h-[52px] w-16 shrink-0 rounded-[10px] border-2 border-step-3" />
+      <span>= 42</span>
     </p>
   );
 }
@@ -266,19 +313,34 @@ function Beats({
 
 function RewardLine() {
   return (
-    <div className="flex flex-wrap gap-2" style={{ animation: "hifi-fade 700ms ease both" }}>
-      <Chip className="bg-xp/12 text-xp">
-        <StarMark />
-        +10 XP
-      </Chip>
-      <Chip className={FLAME_CHIP_CLASS.hot}>
-        <FlameMark />
-        Flame lit today
-      </Chip>
-      <Chip className="bg-piece/12 text-piece">
-        <PieceMark />
-        Piece 3 of 5
-      </Chip>
+    <div
+      className="flex flex-nowrap items-center gap-1"
+      style={{ animation: "hifi-fade 700ms ease both" }}
+    >
+      <ToneChip
+        tight
+        tint="bg-xp-tint"
+        icon="text-xp"
+        text="text-xp-text"
+        mark={<StarMark />}
+        label="+10 XP"
+      />
+      <ToneChip
+        tight
+        tint={FLAME_TINT_CLASS.hot}
+        icon={FLAME_CLASS.hot}
+        text={FLAME_TEXT_CLASS.hot}
+        mark={<FlameMark />}
+        label="Flame lit"
+      />
+      <ToneChip
+        tight
+        tint="bg-piece-tint"
+        icon="text-piece"
+        text="text-piece-text"
+        mark={<PieceMark />}
+        label="Piece 3/5"
+      />
     </div>
   );
 }
@@ -294,21 +356,39 @@ function FlameState({
 }) {
   return (
     <li className="grid gap-1">
-      <Chip className={FLAME_CHIP_CLASS[heat]}>
-        <FlameMark />
-        {label}
-      </Chip>
+      <ToneChip
+        tint={FLAME_TINT_CLASS[heat]}
+        icon={FLAME_CLASS[heat]}
+        text={FLAME_TEXT_CLASS[heat]}
+        mark={<FlameMark />}
+        label={label}
+      />
       <p className="text-base leading-6 text-label">{caption}</p>
     </li>
   );
 }
 
-function Chip({ className, children }: { className: string; children: ReactNode }) {
+function ToneChip({
+  tint,
+  icon,
+  text,
+  mark,
+  label,
+  tight = false,
+}: {
+  tint: string;
+  icon: string;
+  text: string;
+  mark: ReactNode;
+  label: string;
+  tight?: boolean;
+}) {
   return (
     <span
-      className={`inline-flex h-7 w-fit items-center gap-1 rounded-full px-2 text-[13px] font-semibold tabular-nums ${className}`}
+      className={`inline-flex h-7 w-fit items-center rounded-full text-[13px] font-semibold tabular-nums ${tight ? "gap-1 px-1.5" : "gap-1 px-2"} ${tint}`}
     >
-      {children}
+      <span className={icon}>{mark}</span>
+      <span className={text}>{label}</span>
     </span>
   );
 }

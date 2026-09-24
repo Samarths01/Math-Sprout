@@ -13,8 +13,12 @@ describe("hi-fi preview", () => {
     expect(page).toContain("hifiPreviewAllowed()");
     const frames = readFileSync(path.join(process.cwd(), "app/preview/hifi/frames.tsx"), "utf8");
     expect(frames).not.toMatch(/getDb|submitAttempt|qualifying-bus|from "@\/lib\/fuel"|from "@\/lib\/build-goal"/);
-    expect(frames).toContain('fuelText="4-day flame · 120 · 2/5"');
+    expect(frames).toContain('fuelText="4-day flame · 120 XP · 2/5"');
+    expect(frames).toContain("XP_AMOUNT.quietXp");
+    expect(frames).toContain("Flame lit");
+    expect(frames).toContain("Piece 3/5");
     expect(frames).toContain("Not yet");
     expect(frames).toContain("Flame resting");
+    expect(frames).not.toContain('eyebrow="Child home"');
   });
 });
