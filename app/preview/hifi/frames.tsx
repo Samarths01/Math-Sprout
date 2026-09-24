@@ -207,7 +207,7 @@ function PracticeCard({
         <CardContent className="grid gap-4">
           <span
             data-testid="difficulty-badge"
-            className={`inline-flex w-fit items-center rounded-full px-2.5 py-0.5 text-xs font-medium ${stepClass(grade)}`}
+            className={`inline-flex w-fit items-center rounded-full px-2.5 py-0.5 text-xs font-medium ${badgeClass(badge, grade)}`}
           >
             {badge}
           </span>
@@ -218,11 +218,19 @@ function PracticeCard({
   );
 }
 
+/** Warm-up is the light slate, Steady the middle, Stretch the darkest with white text. */
+function badgeClass(badge: string, grade: number): string {
+  if (badge === "Warm-up") return "bg-step-1 text-foreground";
+  if (badge === "Steady") return "bg-step-3 text-foreground";
+  if (badge === "Stretch") return "bg-step-5 text-white";
+  return stepClass(grade);
+}
+
 function Equation() {
   return (
     <p className="font-heading text-[32px] leading-[40px] tabular-nums">
       27 +{" "}
-      <span className="mx-1 inline-block h-[52px] w-16 translate-y-1 rounded-[10px] border-2 border-step-3 align-middle" />{" "}
+      <span className="mx-1 inline-block h-[52px] w-16 rounded-[10px] border-2 border-step-3 align-baseline" />{" "}
       = 42
     </p>
   );
