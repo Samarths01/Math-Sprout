@@ -1,9 +1,14 @@
 import { mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { createElement } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
 import { afterEach, describe, expect, it } from "vitest";
 import type Database from "better-sqlite3";
+import { currentAppBuildSha } from "@/lib/app-build";
+import { parseAnswer, rationalsEqual } from "@/lib/answer-parser";
 import { parseSubmitAttempt, startPracticeSession, submitAnswer, submitAttempt } from "@/lib/attempts";
+import { AnswerBlank } from "@/components/answer-blank";
 import { openDatabase } from "@/lib/db";
 import { DomainError, createChild, createGuardian, setConsent } from "@/lib/domain";
 import { SKILLS, TEMPLATE_VERSIONS, generatedTemplates } from "@/lib/templates/catalog";
@@ -19,17 +24,25 @@ import {
   issueItemBatch,
   pickOldestExposure,
   readItemInstance,
+  toPublicItem,
   variantsForAssignedStep,
   type ItemInstance,
 } from "@/lib/templates/issue";
+import { formatExampleFor } from "@/lib/templates/format-example";
+import { itemAt } from "@/lib/item-catalog";
 import { answersMatch } from "@/lib/templates/rational";
 import { ISSUANCE_TEMPLATE_COLUMNS, issuanceTemplateSelect } from "@/lib/templates/store";
 import type { TemplateVersion } from "@/lib/templates/types";
-import { evidenceForSkill } from "@/lib/learner-state";
+import { evidenceForSkill, readSkillClientView } from "@/lib/learner-state";
 import { createAttemptQueue, memoryQueueStore } from "@/lib/offline-queue";
 import { provisionalVerdict } from "@/lib/provisional-verdict";
 import { POLICY_VERSION } from "@/lib/policy";
-import { isFormatRejected, UNPARSEABLE_BEHAVIOR, UNPARSEABLE_HINT } from "@/lib/unparseable";
+import {
+  FORMAT_HINT_COPY,
+  formatHint,
+  isFormatRejected,
+  UNPARSEABLE_BEHAVIOR,
+} from "@/lib/unparseable";
 
 const cleanups: Array<() => void> = [];
 const WHEN = "2026-06-15T18:00:00.000Z";
@@ -107,6 +120,50 @@ function qualifyingDays(db: Database.Database, childId: string): number {
        WHERE child_id = ? AND kind = 'QualifyingPracticeDay'`,
     ).get(childId) as { count: number }
   ).count;
+}
+
+function examplesDiffer(canonical: string, example: string): boolean {
+  const left = parseAnswer(canonical);
+  const right = parseAnswer(example);
+  if (left.kind === "rational" && right.kind === "rational") {
+    return !rationalsEqual(left.value, right.value);
+  }
+  return example !== canonical.trim();
+}
+
+function stubInstance(canonical: string): ItemInstance {
+  return {
+    itemInstanceId: "inst-example",
+    childId: "child",
+    sessionId: "session",
+    templateId: "add-2d-inline",
+    templateVersion: 1,
+    difficultyStep: 1,
+    operands: {},
+    operandKey: "",
+    canonicalAnswer: canonical,
+    answerLine: canonical,
+    prompt: "prompt",
+    presentation: {
+      layout: "inline",
+      blank: "result",
+      leading: "",
+      trailing: "",
+      column: [],
+      stepWord: "Warm-up",
+    },
+    evidenceEligible: true,
+    repeatForced: false,
+    issueIdempotencyKey: "issue-key",
+    issuedAt: WHEN,
+    consumedAt: null,
+    consumedByAttemptKey: null,
+    requireForm: null,
+    compareMode: "exact",
+    bugHits: [],
+    defaultFocus: null,
+    whyItWorks: null,
+  };
 }
 
 function instanceCount(db: Database.Database, childId: string): number {
@@ -770,12 +827,17 @@ describe("item templates and issuance", () => {
       now: WHEN,
     });
     const before = evidenceForSkill(db, child.id, skill);
+    const beforeBand = readSkillClientView(db, child.id, skill);
     const beforeXp = xpCount(db);
+    const beforeFuel = (
+      db.prepare(`SELECT COUNT(*) AS count FROM qualifying_events`).get() as { count: number }
+    ).count;
     const beforeStreak = streakState(db, child.id);
     const beforeIndex = itemIndex(db, session.sessionId);
     const beforeAttempts = attemptCount(db);
     const beforeDays = qualifyingDays(db, child.id);
     const raw = "banana";
+    const example = formatExampleFor(issued.canonicalAnswer);
     const rejected = submitAnswer(
       db,
       guardian.id,
@@ -797,11 +859,15 @@ describe("item templates and issuance", () => {
     expect(rejected).toEqual({
       type: "format_rejected",
       behavior: "retry",
-      hint: UNPARSEABLE_HINT,
+      hint: formatHint(example.answerKind, example.formatExample),
     });
-    expect(rejected.hint).toBe("Type a number like 3 or 1/2.");
-    expect(rejected.hint).not.toContain(issued.canonicalAnswer);
+    expect(rejected.hint).toBe(
+      example.answerKind === "fraction"
+        ? `Write it as a fraction, like ${example.formatExample}.`
+        : `Use numbers only, like ${example.formatExample}.`,
+    );
     expect(rejected.hint).not.toContain(raw);
+    expect(examplesDiffer(issued.canonicalAnswer, example.formatExample)).toBe(true);
     expect(rejected).not.toHaveProperty("fuel");
     expect(rejected).not.toHaveProperty("correct");
     expect(rejected).not.toHaveProperty("attemptId");
@@ -811,6 +877,10 @@ describe("item templates and issuance", () => {
     expect(xpCount(db)).toBe(beforeXp);
     expect(qualifyingDays(db, child.id)).toBe(beforeDays);
     expect(evidenceForSkill(db, child.id, skill)).toEqual(before);
+    expect(readSkillClientView(db, child.id, skill)).toEqual(beforeBand);
+    expect((db.prepare(`SELECT COUNT(*) AS count FROM qualifying_events`).get() as { count: number }).count).toBe(
+      beforeFuel,
+    );
     expect(streakState(db, child.id)).toBe(beforeStreak);
     expect(itemIndex(db, session.sessionId)).toBe(beforeIndex);
     const held = readItemInstance(db, issued.itemInstanceId);
@@ -826,15 +896,15 @@ describe("item templates and issuance", () => {
     expect(JSON.stringify(rejects)).not.toContain(raw);
     const shape = db
       .prepare(
-        `SELECT prompt_shape AS promptType, provenance FROM item_template_versions
+        `SELECT provenance FROM item_template_versions
          WHERE template_id = ? AND template_version = ?`,
       )
-      .get(issued.templateId, issued.templateVersion) as { promptType: string; provenance: string };
+      .get(issued.templateId, issued.templateVersion) as { provenance: string };
     expect(formatRejectRates(db, child.id)).toEqual([
       {
         templateVersion: issued.templateVersion,
         provenance: "seed",
-        promptType: shape.promptType,
+        answerKind: example.answerKind,
         rejects: 1,
         attempts: 0,
         rate: 1,
@@ -869,7 +939,7 @@ describe("item templates and issuance", () => {
       {
         templateVersion: issued.templateVersion,
         provenance: "seed",
-        promptType: shape.promptType,
+        answerKind: example.answerKind,
         rejects: 1,
         attempts: 1,
         rate: 0.5,
@@ -938,6 +1008,12 @@ describe("item templates and issuance", () => {
     const offline = readFileSync(new URL("lib/offline-queue.ts", root), "utf8");
     expect(client).toContain('from "@/lib/answer-parser"');
     expect(offline).toContain('from "@/lib/answer-parser"');
+    expect(client).not.toContain("format-example");
+    expect(client).not.toContain("formatExampleFor");
+    expect(client).not.toContain("canonicalAnswer");
+    expect(readFileSync(new URL("components/answer-blank.tsx", root), "utf8")).not.toContain(
+      "formatExampleFor",
+    );
     expect(readFileSync(new URL("lib/templates/rational.ts", root), "utf8")).not.toMatch(
       /function parseAnswer\b/,
     );
@@ -957,6 +1033,200 @@ describe("item templates and issuance", () => {
     }
     walk(new URL("lib/", root));
     walk(new URL("components/", root));
+  });
+
+  it("stores sequenced reject events that never feed bands or fuel", () => {
+    const db = tempDb();
+    const { guardian, child, session } = granted(db);
+    const skill = session.item.skill;
+    const issued = issueForProgression(db, {
+      childId: child.id,
+      sessionId: session.sessionId,
+      skillId: skill,
+      idempotencyKey: "format-seq-slot",
+      now: WHEN,
+    });
+    const beforeEvidence = evidenceForSkill(db, child.id, skill);
+    const beforeBand = readSkillClientView(db, child.id, skill);
+    const beforeXp = xpCount(db);
+    const beforeFuel = (
+      db.prepare(`SELECT COUNT(*) AS count FROM qualifying_events`).get() as { count: number }
+    ).count;
+    const raw = "banana";
+    const hints: string[] = [];
+    for (let seq = 1; seq <= 3; seq += 1) {
+      const submittedAt = new Date(Date.parse(WHEN) + seq * 1000).toISOString();
+      const rejected = submitAnswer(
+        db,
+        guardian.id,
+        child.id,
+        {
+          idempotencyKey: `format-seq-000${seq}`,
+          sessionId: session.sessionId,
+          itemId: session.item.id,
+          itemInstanceId: issued.itemInstanceId,
+          answer: raw,
+          shownAt: shown(),
+          submittedAt,
+        },
+        { now: submittedAt },
+      );
+      if (!isFormatRejected(rejected)) throw new Error("expected format_rejected");
+      hints.push(rejected.hint);
+    }
+    expect(hints[0]).toBe(hints[1]);
+    expect(hints[1]).toBe(hints[2]);
+    expect(attemptCount(db)).toBe(0);
+    const columns = (db.pragma("table_info(answer_format_rejects)") as Array<{ name: string }>).map(
+      (column) => column.name,
+    );
+    expect(columns.sort()).toEqual(
+      [
+        "answer_kind",
+        "build_sha",
+        "item_instance_id",
+        "policy_version",
+        "provenance",
+        "reject_seq",
+        "rejected_at",
+        "template_version",
+      ].sort(),
+    );
+    const rows = db
+      .prepare(
+        `SELECT item_instance_id, template_version, provenance, answer_kind, build_sha,
+                policy_version, reject_seq, rejected_at
+         FROM answer_format_rejects ORDER BY reject_seq ASC`,
+      )
+      .all() as Array<{
+      item_instance_id: string;
+      template_version: number;
+      provenance: string;
+      answer_kind: string;
+      build_sha: string;
+      policy_version: string;
+      reject_seq: number;
+      rejected_at: string;
+    }>;
+    expect(rows.map((row) => row.reject_seq)).toEqual([1, 2, 3]);
+    for (const row of rows) {
+      expect(row.item_instance_id).toBe(issued.itemInstanceId);
+      expect(row.template_version).toBe(issued.templateVersion);
+      expect(row.provenance).toBe("seed");
+      expect(row.answer_kind).toBe(formatExampleFor(issued.canonicalAnswer).answerKind);
+      expect(row.build_sha).toBe(currentAppBuildSha());
+      expect(row.build_sha.length).toBeGreaterThan(0);
+      expect(row.policy_version).toBe(POLICY_VERSION);
+      expect(row.rejected_at).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+    }
+    expect(JSON.stringify(rows)).not.toContain(raw);
+    expect(evidenceForSkill(db, child.id, skill)).toEqual(beforeEvidence);
+    expect(readSkillClientView(db, child.id, skill)).toEqual(beforeBand);
+    expect(xpCount(db)).toBe(beforeXp);
+    expect(
+      (db.prepare(`SELECT COUNT(*) AS count FROM qualifying_events`).get() as { count: number }).count,
+    ).toBe(beforeFuel);
+  });
+
+  it("picks a format example that is never the answer", () => {
+    expect(FORMAT_HINT_COPY.whole).toBe("Use numbers only, like {example}.");
+    expect(FORMAT_HINT_COPY.fraction).toBe("Write it as a fraction, like {example}.");
+    expect(formatHint("whole", "3")).toBe("Use numbers only, like 3.");
+    expect(formatHint("fraction", "1/3")).toBe("Write it as a fraction, like 1/3.");
+    expect(formatExampleFor("42")).toEqual({ answerKind: "whole", formatExample: "3" });
+    expect(formatExampleFor("3")).toEqual({ answerKind: "whole", formatExample: "4" });
+    expect(formatExampleFor("1/3")).toEqual({ answerKind: "fraction", formatExample: "1/2" });
+    expect(formatExampleFor("1/2")).toEqual({ answerKind: "fraction", formatExample: "1/3" });
+    expect(formatExampleFor("2/4")).toEqual({ answerKind: "fraction", formatExample: "1/3" });
+    expect(formatExampleFor("3/6")).toEqual({ answerKind: "fraction", formatExample: "1/3" });
+
+    const swapped = toPublicItem(itemAt(0), stubInstance("2/4"));
+    expect(swapped.answerKind).toBe("fraction");
+    expect(swapped.formatExample).toBe("1/3");
+    expect(swapped).not.toHaveProperty("canonicalAnswer");
+    expect(JSON.stringify(swapped)).not.toContain("2/4");
+    expect(JSON.stringify(swapped)).not.toMatch(
+      /build_sha|policy_version|provenance|evidence_eligible|template_version|canonical_answer|canonicalAnswer/,
+    );
+
+    const db = tempDb();
+    const { child, session } = granted(db);
+    const issued = issueForProgression(db, {
+      childId: child.id,
+      sessionId: session.sessionId,
+      skillId: session.item.skill,
+      idempotencyKey: "example-slot-01",
+      now: WHEN,
+    });
+    const catalog = itemAt(itemIndex(db, session.sessionId));
+    const published = toPublicItem(catalog, issued);
+    const chosen = formatExampleFor(issued.canonicalAnswer);
+    expect(published.answerKind).toBe(chosen.answerKind);
+    expect(published.formatExample).toBe(chosen.formatExample);
+    expect(examplesDiffer(issued.canonicalAnswer, published.formatExample ?? "")).toBe(true);
+    expect(published).not.toHaveProperty("canonicalAnswer");
+    expect(session.item.answerKind).toBe(formatExampleFor(readItemInstance(db, session.item.itemInstanceId ?? "")?.canonicalAnswer ?? "").answerKind);
+    expect(session.item.formatExample).toBeTruthy();
+
+    const index = itemIndex(db, session.sessionId);
+    const batch = issueItemBatch(db, {
+      childId: child.id,
+      sessionId: session.sessionId,
+      idempotencyKey: "example-batch-01",
+      count: 3,
+      itemIndex: index,
+      now: WHEN,
+    });
+    batch.forEach((instance, offset) => {
+      const item = toPublicItem(itemAt(index + offset), instance);
+      expect(item.answerKind === "whole" || item.answerKind === "fraction").toBe(true);
+      expect(item.formatExample).toBe(formatExampleFor(instance.canonicalAnswer).formatExample);
+      expect(examplesDiffer(instance.canonicalAnswer, item.formatExample ?? "")).toBe(true);
+      expect(JSON.stringify(item)).not.toMatch(/canonicalAnswer|canonical_answer/);
+    });
+  });
+
+  it("renders the slate hint under the blank and picks the keyboard from answer kind", () => {
+    const whole = renderToStaticMarkup(
+      createElement(AnswerBlank, {
+        value: "banana",
+        hint: "Use numbers only, like 3.",
+        answerKind: "whole",
+        onValueChange: () => undefined,
+      }),
+    );
+    expect(whole).toContain('data-testid="format-hint"');
+    expect(whole).toContain("Use numbers only, like 3.");
+    expect(whole).toContain('value="banana"');
+    expect(whole).toMatch(/inputmode="numeric"/i);
+    expect(whole).toContain("text-label");
+    expect(whole).not.toMatch(/shake|toast|VerdictStrip|text-destructive|text-primary|MintToast/);
+
+    const fraction = renderToStaticMarkup(
+      createElement(AnswerBlank, {
+        value: "2/4",
+        hint: "Write it as a fraction, like 1/3.",
+        answerKind: "fraction",
+        onValueChange: () => undefined,
+      }),
+    );
+    expect(fraction).toContain("Write it as a fraction, like 1/3.");
+    expect(fraction).toContain('value="2/4"');
+    expect(fraction).toMatch(/inputmode="text"/i);
+    expect(fraction).toContain('pattern="[0-9]+/[0-9]+"');
+    expect(fraction.indexOf('data-testid="practice-answer"')).toBeLessThan(
+      fraction.indexOf('data-testid="format-hint"'),
+    );
+    const cleared = renderToStaticMarkup(
+      createElement(AnswerBlank, {
+        value: "banana",
+        hint: null,
+        answerKind: "whole",
+        onValueChange: () => undefined,
+      }),
+    );
+    expect(cleared).toContain('value="banana"');
+    expect(cleared).not.toContain("format-hint");
   });
 
   it("does not queue an unreadable answer as an offline attempt", () => {

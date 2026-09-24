@@ -17,10 +17,16 @@ import {
 import { markFuelPulse } from "@/lib/fuel-motion";
 import { showResumeCelebration } from "@/lib/pause-hold";
 import { postPauseHoldUntilVisible } from "@/lib/pause-hold-receipt";
+import { AnswerBlank } from "@/components/answer-blank";
 import { PracticeProblem } from "@/components/practice-problem";
 import { parseAnswer } from "@/lib/answer-parser";
 import { provisionalVerdict } from "@/lib/provisional-verdict";
-import { isFormatRejected, UNPARSEABLE_HINT } from "@/lib/unparseable";
+import {
+  FORMAT_EXAMPLE_DEFAULTS,
+  formatHint as formatHintCopy,
+  isFormatRejected,
+  type AnswerKind,
+} from "@/lib/unparseable";
 import { Button } from "@/components/ui/button";
 import {
   Card,
@@ -29,8 +35,16 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
-import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+
+function answerKindOf(item: PublicItem): AnswerKind {
+  return item.answerKind === "fraction" ? "fraction" : "whole";
+}
+
+function offlineFormatHint(item: PublicItem): string {
+  const kind = answerKindOf(item);
+  return formatHintCopy(kind, item.formatExample ?? FORMAT_EXAMPLE_DEFAULTS[kind]);
+}
 
 const PROGRESS_COPY: Record<BoundaryOptions["progression"], string> = {
   stay: "Recommended stays the usual next step.",
@@ -233,6 +247,11 @@ export function PracticeSession({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [childId]);
 
+  function editAnswer(next: string) {
+    setAnswer(next);
+    if (next !== answer) setFormatHint(null);
+  }
+
   function showNext(next: PublicItem) {
     waitingKey.current = null;
     setItem(next);
@@ -299,6 +318,8 @@ export function PracticeSession({
       setBoundary(null);
       setFeedback(null);
       setAnswer("");
+      setFormatHint(null);
+      setFormatLocked(false);
       setShownAt(new Date().toISOString());
       setSavedOffline(false);
     } catch {
@@ -334,7 +355,7 @@ export function PracticeSession({
           return;
         }
       }
-      setFormatHint(UNPARSEABLE_HINT);
+      setFormatHint(offlineFormatHint(item));
       setFeedback(null);
       setSavedOffline(false);
       setBusy(false);
@@ -526,16 +547,15 @@ export function PracticeSession({
             item={item}
             answerSlot={
               item.blankInline && !feedback ? (
-                <Input
-                  id="practice-answer"
-                  form="practice-form"
-                  data-testid="practice-answer"
+                <AnswerBlank
                   value={answer}
-                  onChange={(event) => setAnswer(event.target.value)}
-                  autoComplete="off"
+                  hint={formatHint}
+                  answerKind={answerKindOf(item)}
+                  locked={formatLocked}
                   disabled={formatLocked}
+                  onValueChange={editAnswer}
+                  form="practice-form"
                   className="h-12 w-24 text-center font-heading text-2xl tabular-nums"
-                  aria-label="Your answer"
                 />
               ) : undefined
             }
@@ -558,7 +578,7 @@ export function PracticeSession({
               )}
             </div>
           ) : (
-            <form id="practice-form" className="grid gap-3" onSubmit={onSubmit}>
+            <form id="practice-form" className="grid gap-3" noValidate onSubmit={onSubmit}>
               {savedOffline && !offlineCapped ? (
                 <p
                   role="status"
@@ -574,27 +594,17 @@ export function PracticeSession({
               {item.blankInline ? null : (
                 <div className="grid gap-2">
                   <Label htmlFor="practice-answer">Your answer</Label>
-                  <Input
-                    id="practice-answer"
-                    data-testid="practice-answer"
+                  <AnswerBlank
                     value={answer}
-                    onChange={(event) => setAnswer(event.target.value)}
-                    autoComplete="off"
+                    hint={formatHint}
+                    answerKind={answerKindOf(item)}
+                    locked={formatLocked}
                     disabled={formatLocked}
+                    onValueChange={editAnswer}
                     className="h-12 text-lg"
                   />
                 </div>
               )}
-              {formatHint ? (
-                <p
-                  role="status"
-                  data-testid="format-hint"
-                  data-format-locked={formatLocked ? "true" : "false"}
-                  className="text-sm leading-6"
-                >
-                  {formatHint}
-                </p>
-              ) : null}
               {error ? <p className="text-sm text-destructive">{error}</p> : null}
               <Button
                 type="submit"

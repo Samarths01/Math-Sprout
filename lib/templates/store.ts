@@ -86,17 +86,16 @@ CREATE INDEX IF NOT EXISTS item_instances_child_template
   ON item_instances(child_id, template_id, operand_key);
 
 CREATE TABLE IF NOT EXISTS answer_format_rejects (
-  id TEXT PRIMARY KEY,
   item_instance_id TEXT NOT NULL,
   template_version INTEGER NOT NULL,
   provenance TEXT NOT NULL CHECK (provenance IN ('seed', 'parent', 'ai_assisted')),
-  prompt_type TEXT NOT NULL,
-  answer_type TEXT NOT NULL,
-  rejected_at TEXT NOT NULL
+  answer_kind TEXT NOT NULL CHECK (answer_kind IN ('whole', 'fraction')),
+  build_sha TEXT NOT NULL,
+  policy_version TEXT NOT NULL,
+  reject_seq INTEGER NOT NULL CHECK (reject_seq >= 1),
+  rejected_at TEXT NOT NULL,
+  PRIMARY KEY (item_instance_id, reject_seq)
 );
-
-CREATE INDEX IF NOT EXISTS answer_format_rejects_version
-  ON answer_format_rejects(template_version, provenance, prompt_type);
 `;
 
 function addAttemptColumn(db: Database.Database, name: string, ddl: string): void {
@@ -107,8 +106,30 @@ function addAttemptColumn(db: Database.Database, name: string, ddl: string): voi
   db.exec(`ALTER TABLE attempts ADD COLUMN ${ddl}`);
 }
 
+function rebuildFormatRejects(db: Database.Database): void {
+  const columns = new Set(
+    (db.pragma("table_info(answer_format_rejects)") as Array<{ name: string }>).map((row) => row.name),
+  );
+  if (columns.size === 0 || columns.has("reject_seq")) return;
+  db.exec(`DROP TABLE answer_format_rejects`);
+  db.exec(`
+CREATE TABLE answer_format_rejects (
+  item_instance_id TEXT NOT NULL,
+  template_version INTEGER NOT NULL,
+  provenance TEXT NOT NULL CHECK (provenance IN ('seed', 'parent', 'ai_assisted')),
+  answer_kind TEXT NOT NULL CHECK (answer_kind IN ('whole', 'fraction')),
+  build_sha TEXT NOT NULL,
+  policy_version TEXT NOT NULL,
+  reject_seq INTEGER NOT NULL CHECK (reject_seq >= 1),
+  rejected_at TEXT NOT NULL,
+  PRIMARY KEY (item_instance_id, reject_seq)
+);
+`);
+}
+
 export function migrateItemTemplates(db: Database.Database): void {
   db.exec(TEMPLATE_DDL);
+  rebuildFormatRejects(db);
   addAttemptColumn(db, "item_instance_id", "item_instance_id TEXT");
   addAttemptColumn(db, "template_id", "template_id TEXT");
   addAttemptColumn(db, "difficulty_step", "difficulty_step INTEGER");

@@ -8,8 +8,24 @@ export type UnparseableBehavior = (typeof UNPARSEABLE_BEHAVIORS)[number];
 
 export const UNPARSEABLE_BEHAVIOR: UnparseableBehavior = "retry";
 
-/** Placeholder until Interface confirms the child line. */
-export const UNPARSEABLE_HINT = "Type a number like 3 or 1/2.";
+export const ANSWER_KINDS = ["whole", "fraction"] as const;
+export type AnswerKind = (typeof ANSWER_KINDS)[number];
+
+/** Display defaults used only when an issued payload omitted `formatExample`. */
+export const FORMAT_EXAMPLE_DEFAULTS: Record<AnswerKind, string> = {
+  whole: "3",
+  fraction: "1/2",
+};
+
+/** Child hint copy. The server fills `{example}` with a non-answer example. */
+export const FORMAT_HINT_COPY = {
+  whole: "Use numbers only, like {example}.",
+  fraction: "Write it as a fraction, like {example}.",
+} as const;
+
+export function formatHint(answerKind: AnswerKind, example: string): string {
+  return FORMAT_HINT_COPY[answerKind].replaceAll("{example}", example);
+}
 
 const UNPARSEABLE_LOCK_LINE = "That answer stays quiet.";
 
@@ -19,8 +35,12 @@ export type FormatRejected = {
   hint: string;
 };
 
-export function unparseableChildLine(behavior: UnparseableBehavior): string {
-  return behavior === "retry" ? UNPARSEABLE_HINT : UNPARSEABLE_LOCK_LINE;
+export function unparseableChildLine(
+  behavior: UnparseableBehavior,
+  answerKind: AnswerKind,
+  example: string,
+): string {
+  return behavior === "retry" ? formatHint(answerKind, example) : UNPARSEABLE_LOCK_LINE;
 }
 
 export function isFormatRejected(value: unknown): value is FormatRejected {

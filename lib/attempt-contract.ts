@@ -45,6 +45,10 @@ export type PublicItem = {
   layout?: "inline" | "column";
   blankInline?: { leading: string; trailing: string };
   columnLines?: string[];
+  /** Server-chosen. The client does not compute this from the answer. */
+  answerKind?: "whole" | "fraction";
+  /** A hint example that is not the canonical answer. */
+  formatExample?: string;
 };
 
 /**

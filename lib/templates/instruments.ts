@@ -1,4 +1,5 @@
 import type Database from "better-sqlite3";
+import { answerKindFor } from "@/lib/templates/format-example";
 import { REPEAT_WINDOW_MS } from "@/lib/templates/issue";
 
 export type RepeatRate = {
@@ -41,7 +42,7 @@ export type StepPractice = {
 export type FormatRejectRate = {
   templateVersion: number;
   provenance: string;
-  promptType: string;
+  answerKind: string;
   rejects: number;
   attempts: number;
   rate: number;
@@ -49,65 +50,78 @@ export type FormatRejectRate = {
 
 /**
  * Rejects divided by rejects plus scored attempts, per template version,
- * provenance, and prompt type. The child's text is not in this table.
+ * provenance, and answer kind. The child's text is not in this table.
+ * These rows are a rate only. They are not estimator, band, or fuel input.
  */
 export function formatRejectRates(db: Database.Database, childId: string): FormatRejectRate[] {
-  const rows = db
+  const rejects = db
     .prepare(
       `SELECT
-         version AS templateVersion,
-         provenance AS provenance,
-         prompt_type AS promptType,
-         SUM(rejects) AS rejects,
-         SUM(attempts) AS attempts
-       FROM (
-         SELECT
-           r.template_version AS version,
-           r.provenance AS provenance,
-           r.prompt_type AS prompt_type,
-           COUNT(*) AS rejects,
-           0 AS attempts
-         FROM answer_format_rejects r
-         JOIN item_instances i ON i.item_instance_id = r.item_instance_id
-         WHERE i.child_id = ?
-         GROUP BY r.template_version, r.provenance, r.prompt_type
-         UNION ALL
-         SELECT
-           i.template_version AS version,
-           t.provenance AS provenance,
-           t.prompt_shape AS prompt_type,
-           0 AS rejects,
-           COUNT(*) AS attempts
-         FROM attempts a
-         JOIN item_instances i ON i.item_instance_id = a.item_instance_id
-         JOIN item_template_versions t
-           ON t.template_id = i.template_id AND t.template_version = i.template_version
-         WHERE a.child_id = ?
-         GROUP BY i.template_version, t.provenance, t.prompt_shape
-       )
-       GROUP BY version, provenance, prompt_type
-       ORDER BY version ASC, provenance ASC, prompt_type ASC`,
+         r.template_version AS templateVersion,
+         r.provenance AS provenance,
+         r.answer_kind AS answerKind,
+         COUNT(*) AS rejects
+       FROM answer_format_rejects r
+       JOIN item_instances i ON i.item_instance_id = r.item_instance_id
+       WHERE i.child_id = ?
+       GROUP BY r.template_version, r.provenance, r.answer_kind`,
     )
-    .all(childId, childId) as Array<{
+    .all(childId) as Array<{
     templateVersion: number;
     provenance: string;
-    promptType: string;
-    rejects: number | null;
-    attempts: number | null;
+    answerKind: string;
+    rejects: number;
   }>;
-  return rows.map((row) => {
-    const rejects = row.rejects ?? 0;
-    const attempts = row.attempts ?? 0;
-    const total = rejects + attempts;
-    return {
-      templateVersion: row.templateVersion,
-      provenance: row.provenance,
-      promptType: row.promptType,
-      rejects,
-      attempts,
-      rate: total === 0 ? 0 : rejects / total,
+  const attempts = db
+    .prepare(
+      `SELECT
+         i.template_version AS templateVersion,
+         t.provenance AS provenance,
+         i.canonical_answer AS canonicalAnswer
+       FROM attempts a
+       JOIN item_instances i ON i.item_instance_id = a.item_instance_id
+       JOIN item_template_versions t
+         ON t.template_id = i.template_id AND t.template_version = i.template_version
+       WHERE a.child_id = ?`,
+    )
+    .all(childId) as Array<{
+    templateVersion: number;
+    provenance: string;
+    canonicalAnswer: string;
+  }>;
+  const buckets = new Map<string, FormatRejectRate>();
+  const touch = (templateVersion: number, provenance: string, answerKind: string) => {
+    const id = `${templateVersion}\0${provenance}\0${answerKind}`;
+    const existing = buckets.get(id);
+    if (existing) return existing;
+    const created: FormatRejectRate = {
+      templateVersion,
+      provenance,
+      answerKind,
+      rejects: 0,
+      attempts: 0,
+      rate: 0,
     };
-  });
+    buckets.set(id, created);
+    return created;
+  };
+  for (const row of rejects) {
+    touch(row.templateVersion, row.provenance, row.answerKind).rejects += row.rejects;
+  }
+  for (const row of attempts) {
+    touch(row.templateVersion, row.provenance, answerKindFor(row.canonicalAnswer)).attempts += 1;
+  }
+  return [...buckets.values()]
+    .sort(
+      (left, right) =>
+        left.templateVersion - right.templateVersion ||
+        left.provenance.localeCompare(right.provenance) ||
+        left.answerKind.localeCompare(right.answerKind),
+    )
+    .map((row) => {
+      const total = row.rejects + row.attempts;
+      return { ...row, rate: total === 0 ? 0 : row.rejects / total };
+    });
 }
 
 /** Difficulty step practiced per skill, from issued instances. */

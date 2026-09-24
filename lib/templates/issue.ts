@@ -12,6 +12,7 @@ import {
 } from "@/lib/templates/store";
 import type { BugHit, TemplateVersion } from "@/lib/templates/types";
 import { cueText, tryNextFromCue } from "@/lib/templates/cues";
+import { formatExampleFor } from "@/lib/templates/format-example";
 
 /** Progression stays rules-v0 and serves difficulty step 1 only. */
 export const PROGRESSION_DIFFICULTY_STEP = 1 as const;
@@ -193,6 +194,7 @@ function readByIdempotency(
 export function toPublicItem(catalog: PublicItem, instance: ItemInstance): PublicItem {
   const inline =
     instance.presentation.leading.length > 0 || instance.presentation.trailing.length > 0;
+  const example = formatExampleFor(instance.canonicalAnswer);
   return {
     id: catalog.id,
     pack: catalog.pack,
@@ -201,6 +203,8 @@ export function toPublicItem(catalog: PublicItem, instance: ItemInstance): Publi
     prompt: instance.prompt,
     stepWord: instance.presentation.stepWord,
     itemInstanceId: instance.itemInstanceId,
+    answerKind: example.answerKind,
+    formatExample: example.formatExample,
     layout: instance.presentation.layout,
     ...(inline
       ? {

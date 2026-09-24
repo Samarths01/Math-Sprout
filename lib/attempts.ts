@@ -41,7 +41,6 @@ import * as appBuild from "@/lib/app-build";
 import { POLICY_VERSION } from "@/lib/policy";
 import { takePendingPauseHold } from "@/lib/pause-hold";
 import { practiceGate } from "@/lib/practice-gate";
-import { expectedAnswerType } from "@/lib/answer-parser";
 import {
   consumeItemInstance,
   focusForStoredAnswer,
@@ -49,6 +48,7 @@ import {
   presentIssuedItem,
   readItemInstance,
 } from "@/lib/templates/issue";
+import { formatExampleFor } from "@/lib/templates/format-example";
 import {
   isFormatRejected,
   UNPARSEABLE_BEHAVIOR,
@@ -451,26 +451,36 @@ export function submitAnswer(
         const unparseableBehavior = options?.unparseableBehavior ?? UNPARSEABLE_BEHAVIOR;
         const meta = db
           .prepare(
-            `SELECT provenance, prompt_shape FROM item_template_versions
+            `SELECT provenance FROM item_template_versions
              WHERE template_id = ? AND template_version = ?`,
           )
           .get(instance.templateId, instance.templateVersion) as
-          | { provenance: string; prompt_shape: string }
+          | { provenance: string }
           | undefined;
         if (!meta) throw new DomainError("That problem is not in this practice pack.", 404);
+        const example = formatExampleFor(instance.canonicalAnswer);
+        const seq = db
+          .prepare(
+            `SELECT COALESCE(MAX(reject_seq), 0) + 1 AS reject_seq
+             FROM answer_format_rejects WHERE item_instance_id = ?`,
+          )
+          .get(instance.itemInstanceId) as { reject_seq: number };
         db.prepare(
           `INSERT INTO answer_format_rejects (
-             id, item_instance_id, template_version, provenance, prompt_type, answer_type, rejected_at
+             item_instance_id, template_version, provenance, answer_kind,
+             build_sha, policy_version, reject_seq, rejected_at
            ) VALUES (
-             @id, @item_instance_id, @template_version, @provenance, @prompt_type, @answer_type, @rejected_at
+             @item_instance_id, @template_version, @provenance, @answer_kind,
+             @build_sha, @policy_version, @reject_seq, @rejected_at
            )`,
         ).run({
-          id: randomUUID(),
           item_instance_id: instance.itemInstanceId,
           template_version: instance.templateVersion,
           provenance: meta.provenance,
-          prompt_type: meta.prompt_shape,
-          answer_type: expectedAnswerType(instance.canonicalAnswer),
+          answer_kind: example.answerKind,
+          build_sha: buildSha,
+          policy_version: POLICY_VERSION,
+          reject_seq: seq.reject_seq,
           rejected_at: submittedAt,
         });
         if (unparseableBehavior === "lock") {
@@ -484,7 +494,11 @@ export function submitAnswer(
           result: {
             type: "format_rejected",
             behavior: unparseableBehavior,
-            hint: unparseableChildLine(unparseableBehavior),
+            hint: unparseableChildLine(
+              unparseableBehavior,
+              example.answerKind,
+              example.formatExample,
+            ),
           },
           log: null,
         };
