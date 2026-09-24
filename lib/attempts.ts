@@ -56,6 +56,12 @@ import {
   type FormatRejected,
   type UnparseableBehavior,
 } from "@/lib/unparseable";
+import {
+  normalizedTypedAnswer,
+  readWrongFormReason,
+  wrongFormCopy,
+  type WrongFormReason,
+} from "@/lib/wrong-form-copy";
 
 const KEY_PATTERN = /^[A-Za-z0-9_-]{8,80}$/;
 
@@ -268,6 +274,7 @@ function resultFromRow(
     .get(row.session_id) as { slot_seq: number } | undefined;
   if (!session) throw new DomainError("Practice session not found.", 404);
   const beats = readBeats(row.beats_json);
+  const reason = readWrongFormReason(JSON.parse(row.beats_json) as unknown);
   if (row.celebration_tier === "full" && credits.length === 0) {
     throw new DomainError("full celebration requires a mint.", 500);
   }
@@ -291,6 +298,7 @@ function resultFromRow(
     clientView,
     nextItem: presentIssuedItem(db, row.child_id, row.session_id, session.slot_seq),
     ...(row.resume_presentation === "quiet" ? { resumePresentation: "quiet" as const } : {}),
+    ...(reason ? { reason } : {}),
   };
 }
 
@@ -436,6 +444,7 @@ export function submitAnswer(
     let difficultyStep: number | null = null;
     let estimatorEvidence: number | null = null;
     let attemptOutcome: "correct" | "incorrect" | "form_mismatch" = "incorrect";
+    let childReason: WrongFormReason | undefined;
     let skipEconomy = false;
 
     const issuedOnSession = db
@@ -521,10 +530,24 @@ export function submitAnswer(
         };
       }
       correct = verdict === "correct";
-        const formMiss = verdict === "form_mismatch";
-        const valueMiss = verdict === "incorrect" || formMiss;
-        attemptOutcome = formMiss ? "form_mismatch" : correct ? "correct" : "incorrect";
-        estimatorEvidence = instance.evidenceEligible ? 1 : 0;
+      const formMiss = verdict === "form_mismatch";
+      const valueMiss = verdict === "incorrect" || formMiss;
+      attemptOutcome = formMiss ? "form_mismatch" : correct ? "correct" : "incorrect";
+      estimatorEvidence = instance.evidenceEligible ? 1 : 0;
+      if (formMiss && flags.length === 0 && instance.requireForm) {
+        const copy = wrongFormCopy({
+          typed: normalizedTypedAnswer(input.answer),
+          canonical: instance.canonicalAnswer,
+          required: instance.requireForm,
+        });
+        beats = {
+          whatWentWell: copy.whatWentWell,
+          oneFocus: copy.oneFocus,
+          tryNext: copy.tryNext,
+          lockIn: copy.lockIn,
+        };
+        childReason = copy.reason;
+      } else {
         const focus = valueMiss ? focusForStoredAnswer(instance, input.answer) : null;
         beats = buildFourBeat({
           correct,
@@ -537,22 +560,31 @@ export function submitAnswer(
             : {}),
           ...(flags.length === 0 && correct ? { solidify: instance.whyItWorks ?? "" } : {}),
         });
-        economy = planAttemptEconomy(db, {
-          childId,
-          sessionId,
-          idempotencyKey,
-          timeZone: child.timezone,
-          submittedAt,
-          skill: skillItem.skill,
-          correct,
-          flags,
-          practiceLane: session.practice_lane,
-          history: evidenceForSkill(db, childId, skillItem.skill),
-          previousBand: readSkillClientView(db, childId, skillItem.skill)?.bandLabel ?? null,
-        });
-        if (instance.evidenceEligible) {
-          saveSkillState(db, childId, skillItem.skill, economy.clientView);
-        }
+      }
+      economy = planAttemptEconomy(db, {
+        childId,
+        sessionId,
+        idempotencyKey,
+        timeZone: child.timezone,
+        submittedAt,
+        skill: skillItem.skill,
+        correct,
+        flags,
+        practiceLane: session.practice_lane,
+        history: evidenceForSkill(db, childId, skillItem.skill),
+        previousBand: readSkillClientView(db, childId, skillItem.skill)?.bandLabel ?? null,
+      });
+      if (formMiss) {
+        economy = {
+          lane: economy.lane,
+          celebrationTier: "none",
+          mints: [],
+          clientView: { ...economy.clientView, celebrationTier: "none" },
+        };
+      }
+      if (instance.evidenceEligible) {
+        saveSkillState(db, childId, skillItem.skill, economy.clientView);
+      }
       consumeItemInstance(db, instance, idempotencyKey, submittedAt);
     } else {
       correct = gradeAnswer(itemId, input.answer);
@@ -606,7 +638,7 @@ export function submitAnswer(
       lane: economy.lane,
       celebration_tier: economy.celebrationTier,
       flags_json: JSON.stringify(flags),
-      beats_json: JSON.stringify(beats),
+      beats_json: JSON.stringify(childReason ? { ...beats, reason: childReason } : beats),
       client_view_json: JSON.stringify(economy.clientView),
       created_at: createdAt,
       policy_version: POLICY_VERSION,

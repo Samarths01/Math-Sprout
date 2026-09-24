@@ -17,19 +17,26 @@ export function PracticeFeedback({
     <>
       <VerdictStrip correct={feedback.correct} />
       <dl className="grid gap-3">
-        {frames.map((frame) => (
-          <div key={frame.key} className="grid gap-1">
-            <dt
-              className="text-[13px] font-medium tracking-[0.04em] text-label uppercase"
-              data-beat-label={frame.label}
-            >
-              {frame.label}
-            </dt>
-            <dd data-testid={`beat-${frame.key}`} className="text-sm leading-6">
-              {frame.text}
-            </dd>
-          </div>
-        ))}
+        {frames.map((frame) => {
+          const bodyInk = frame.key === "whatWentWell" && feedback.reason?.kind === "wrong_form";
+          return (
+            <div key={frame.key} className="grid gap-1">
+              <dt
+                className="text-[13px] font-medium tracking-[0.04em] text-label uppercase"
+                data-beat-label={frame.label}
+              >
+                {frame.label}
+              </dt>
+              <dd
+                data-testid={`beat-${frame.key}`}
+                {...(bodyInk ? { "data-ink": "body" } : {})}
+                className={bodyInk ? "text-sm leading-6 text-foreground" : "text-sm leading-6"}
+              >
+                {frame.text}
+              </dd>
+            </div>
+          );
+        })}
       </dl>
       {showResumeCelebration(feedback) ? (
         <MintToast

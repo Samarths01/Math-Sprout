@@ -87,6 +87,17 @@ function assertChildPayloadSealed(value: unknown) {
   expect(dumped).not.toMatch(
     /build_sha|policy_version|buildSha|policyVersion|provenance|evidence_eligible|evidenceEligible|computed_step|computedStep|assigned_step|assignedStep|parent_prior|parentPrior|template_version|templateVersion|canonical_answer|canonicalAnswer|form_mismatch/,
   );
+  if (value && typeof value === "object" && "reason" in value) {
+    const reason = (value as { reason?: unknown }).reason;
+    expect(reason && typeof reason === "object" ? Object.keys(reason).sort() : []).toEqual([
+      "kind",
+      "required",
+    ]);
+    expect(reason).toEqual({
+      kind: "wrong_form",
+      required: expect.stringMatching(/^(lowest_terms|improper|mixed)$/),
+    });
+  }
 }
 
 type GitExec = typeof buildCommands.execFile;
@@ -643,6 +654,35 @@ describe("app build tag", () => {
     }
     expect(practiceHtml).toContain("Warm-up");
     expect(practiceHtml).not.toMatch(/Step 1|step 1/);
+
+    const nextId = result.nextItem.itemInstanceId;
+    if (!nextId) throw new Error("missing next issued item");
+    db.prepare(
+      `UPDATE item_instances
+       SET canonical_answer = '1/2', answer_line = '1/2', require_form = 'lowest_terms', compare_mode = 'rational'
+       WHERE item_instance_id = ?`,
+    ).run(nextId);
+    const formResult = submitAttempt(
+      db,
+      guardian.id,
+      child.id,
+      {
+        idempotencyKey: "build-wrong-form-0001",
+        sessionId: session.sessionId,
+        itemId: result.nextItem.id,
+        itemInstanceId: nextId,
+        answer: "2/4",
+        shownAt: new Date(Date.parse(WHEN) - 2_000).toISOString(),
+        submittedAt: WHEN,
+      },
+      { now: WHEN },
+    );
+    expect(formResult.reason).toEqual({ kind: "wrong_form", required: "lowest_terms" });
+    assertChildPayloadSealed(formResult);
+    const formSealed = JSON.stringify(formResult);
+    expect(formSealed).toContain('"kind":"wrong_form"');
+    expect(formSealed).toContain('"required":"lowest_terms"');
+    expect(formSealed).not.toContain("form_mismatch");
   });
 
   it("renders the build footer from the cache and keeps it off child routes", async () => {
