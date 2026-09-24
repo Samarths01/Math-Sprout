@@ -13,6 +13,7 @@ import {
   primeAppBuildSha,
   refreshAppBuildSha,
   resetBuildCacheForTests,
+  stopBuildShaRefresh,
   warnIfBuildUnknown,
 } from "@/lib/app-build";
 import { formatAttemptLogLine, readAttemptLog } from "@/lib/attempt-log";
@@ -26,6 +27,7 @@ const cleanups: Array<() => void> = [];
 const WHEN = "2026-06-15T18:00:00.000Z";
 
 afterEach(() => {
+  stopBuildShaRefresh();
   while (cleanups.length > 0) cleanups.pop()?.();
 });
 
@@ -376,6 +378,75 @@ describe("app build tag", () => {
       expect(currentAppBuildSha()).toBe("abc123def456");
       expect(describes).toBe(1);
     } finally {
+      restore();
+    }
+  });
+
+  it("swallows a refresh rejection so unhandledRejection never fires", async () => {
+    const seen: unknown[] = [];
+    const onRejection = (reason: unknown) => {
+      seen.push(reason);
+    };
+    process.on("unhandledRejection", onRejection);
+    const restore = installGit(() => {
+      throw new Error("git exploded");
+    });
+    const previous = process.env.APP_BUILD_SHA;
+    delete process.env.APP_BUILD_SHA;
+    try {
+      currentAppBuildSha();
+      await new Promise((resolve) => setImmediate(resolve));
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(seen).toEqual([]);
+      expect(currentAppBuildSha()).toBe("unknown");
+    } finally {
+      process.off("unhandledRejection", onRejection);
+      if (previous === undefined) delete process.env.APP_BUILD_SHA;
+      else process.env.APP_BUILD_SHA = previous;
+      restore();
+    }
+  });
+
+  it("does no git or stamp work when APP_BUILD_SHA is set, even across the TTL", async () => {
+    const previous = process.env.APP_BUILD_SHA;
+    delete process.env.APP_BUILD_SHA;
+    let gitCalls = 0;
+    let statCalls = 0;
+    const restore = installGit((file, args, options, callback) => {
+      gitCalls += 1;
+      if (args[0] === "rev-parse") {
+        callback(null, ".git\n", "");
+        return;
+      }
+      callback(null, "from-git\n", "");
+      void file;
+      void options;
+    });
+    buildCommands.statSync = ((..._args: Parameters<typeof statSync>) => {
+      statCalls += 1;
+      return { mtimeMs: 10 } as ReturnType<typeof statSync>;
+    }) as typeof buildCommands.statSync;
+    buildCommands.readFileSync = (() => "ref: refs/heads/main") as typeof buildCommands.readFileSync;
+    try {
+      await primeAppBuildSha();
+      gitCalls = 0;
+      statCalls = 0;
+      process.env.APP_BUILD_SHA = "deployed-sha";
+      vi.useFakeTimers({ toFake: ["Date"] });
+      vi.setSystemTime(new Date("2026-06-15T18:00:00.000Z"));
+      expect(currentAppBuildSha()).toBe("deployed-sha");
+      expect(currentAppBuildSha()).toBe("deployed-sha");
+      vi.setSystemTime(new Date("2026-06-15T18:00:06.000Z"));
+      expect(currentAppBuildSha()).toBe("deployed-sha");
+      vi.setSystemTime(new Date("2026-06-15T18:00:12.000Z"));
+      expect(currentAppBuildSha()).toBe("deployed-sha");
+      await Promise.resolve();
+      expect(gitCalls).toBe(0);
+      expect(statCalls).toBe(0);
+    } finally {
+      vi.useRealTimers();
+      if (previous === undefined) delete process.env.APP_BUILD_SHA;
+      else process.env.APP_BUILD_SHA = previous;
       restore();
     }
   });

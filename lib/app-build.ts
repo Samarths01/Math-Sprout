@@ -4,9 +4,13 @@ import path from "node:path";
 
 /**
  * Build tag stamped beside policy_version.
- * APP_BUILD_SHA, when set at startup, is kept for the process and git is never spawned.
- * Otherwise a background refresh runs `git describe --always --dirty --abbrev=12`.
- * The request path only reads the cache. A refresh that fails keeps the last known tag.
+ * APP_BUILD_SHA, when set, wins for the process and git is never spawned.
+ * Otherwise a save reads the cache. currentAppBuildSha() starts a background
+ * refresh only when the HEAD stamp changed or the TTL expired. There is no
+ * standing timer.
+ *
+ * A save made within about 5 seconds of a git pull may record the previous SHA.
+ * That lag is accepted: the refresh stays lazy and a save never waits on git.
  */
 const DIRTY_TTL_MS = 5_000;
 const GIT_TIMEOUT_MS = 1_500;
@@ -27,11 +31,14 @@ export type BuildResolverDeps = {
 };
 
 export function createBuildResolver(deps: BuildResolverDeps) {
-  const startupEnv = nonempty(deps.env());
   const ttl = deps.ttlMs ?? DIRTY_TTL_MS;
   let cache: { value: string; stamp: string | null; at: number } | null = null;
   let inflight: Promise<void> | null = null;
   let generation = 0;
+
+  function pinnedEnv(): string | null {
+    return nonempty(deps.env());
+  }
 
   function snapshotStamp(): string | null {
     try {
@@ -47,25 +54,30 @@ export function createBuildResolver(deps: BuildResolverDeps) {
     return now - cache.at >= ttl;
   }
 
+  function rememberFailure(gen: number) {
+    if (gen !== generation) return;
+    cache = {
+      value: cache?.value ?? "unknown",
+      stamp: snapshotStamp(),
+      at: deps.now(),
+    };
+  }
+
   function refresh(): Promise<void> {
-    if (startupEnv) return Promise.resolve();
+    if (pinnedEnv()) return Promise.resolve();
     if (inflight) return inflight;
     if (!stale(deps.now())) return Promise.resolve();
     const gen = generation;
-    inflight = (async () => {
+    const work = (async () => {
       const stamp = snapshotStamp();
       const at = deps.now();
-      let next: string | null = null;
-      try {
-        next = nonempty(await deps.describe());
-      } catch {
-        next = null;
-      }
+      const next = nonempty(await deps.describe());
       if (gen !== generation) return;
       cache = { value: next ?? cache?.value ?? "unknown", stamp, at };
-    })()
+    })();
+    inflight = work
       .catch(() => {
-        /* A refresh never rejects. The last known tag stays in place. */
+        rememberFailure(gen);
       })
       .finally(() => {
         if (gen === generation) inflight = null;
@@ -74,9 +86,14 @@ export function createBuildResolver(deps: BuildResolverDeps) {
   }
 
   return {
-    /** Cached tag. Starts at most one background refresh and never waits on it. */
+    /**
+     * Cached tag. A changed HEAD stamp or an expired TTL starts one background
+     * refresh and this returns immediately. A save within about 5 seconds of a
+     * git pull may still record the previous SHA. That lag is accepted.
+     */
     current(): string {
-      if (startupEnv) return startupEnv;
+      const pinned = pinnedEnv();
+      if (pinned) return pinned;
       if (stale(deps.now())) void refresh();
       return cache?.value ?? "unknown";
     },
@@ -115,16 +132,30 @@ export const buildCommands = {
   readFileSync: fs.readFileSync.bind(fs) as typeof fs.readFileSync,
 };
 
+const gitTimers = new Set<ReturnType<typeof setTimeout>>();
+const gitCancels = new Set<() => void>();
+
 function gitOutput(args: string[]): Promise<string | null> {
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     let settled = false;
-    const finish = (value: string | null) => {
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const finish = (error: Error | null, value: string | null) => {
       if (settled) return;
       settled = true;
-      clearTimeout(timer);
-      resolve(value);
+      gitCancels.delete(cancel);
+      if (timer) {
+        clearTimeout(timer);
+        gitTimers.delete(timer);
+        timer = null;
+      }
+      if (error) reject(error);
+      else resolve(value);
     };
-    const timer = setTimeout(() => finish(null), GIT_TIMEOUT_MS);
+    const cancel = () => finish(null, null);
+    gitCancels.add(cancel);
+    timer = setTimeout(() => finish(null, null), GIT_TIMEOUT_MS);
+    timer.unref();
+    gitTimers.add(timer);
     try {
       buildCommands.execFile(
         "git",
@@ -137,11 +168,11 @@ function gitOutput(args: string[]): Promise<string | null> {
           encoding: "utf8",
         },
         (error, stdout) => {
-          finish(error ? null : nonempty(stdout));
+          finish(error, error ? null : nonempty(stdout));
         },
       );
-    } catch {
-      finish(null);
+    } catch (error) {
+      finish(error instanceof Error ? error : new Error(String(error)), null);
     }
   });
 }
@@ -213,10 +244,19 @@ export function refreshAppBuildSha(): Promise<void> {
   return live.refresh().catch(() => undefined);
 }
 
-export function resetBuildCacheForTests(): void {
+/** Drop in-flight git work so a test does not leave Node or Vitest waiting. */
+export function stopBuildShaRefresh(): void {
+  live.clear();
+  for (const timer of gitTimers) clearTimeout(timer);
+  gitTimers.clear();
+  for (const cancel of [...gitCancels]) cancel();
+  gitCancels.clear();
   gitDirPath = null;
   gitDirPromise = null;
-  live.clear();
+}
+
+export function resetBuildCacheForTests(): void {
+  stopBuildShaRefresh();
 }
 
 /**
