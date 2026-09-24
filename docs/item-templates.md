@@ -10,6 +10,10 @@ A template version is immutable. Changing a spec means adding a new version. `te
 
 `parent_prior_grade` and `parent_prior_difficulty` are nullable columns on the template version. Every seed leaves them null. Issuance does not read them.
 
-An unparseable answer is its own path. The attempt row is kept with `outcome = 'unparseable'`. It records no estimator evidence, mints no qualifying event, XP, or streak, and is not a miss. Blank answers are unchanged: an `empty_answer` review-lane try mints no XP, is not a celebrate miss, and still occupies a slot in the mastery window.
+An unreadable answer is not an attempt (Architecture §29). The server writes no attempt row, mints nothing, and returns `format_rejected` with no verdict and no fuel line. The idempotency key is not consumed, so the next readable answer on that issued item scores normally. The item stays in the 7-day no-repeat window because it was already issued. Rejects are logged in `answer_format_rejects` (template version, provenance, prompt type, answer type, timestamp) with no raw child text, and they never enter the attempt log.
 
-Whether the child is locked out or shown “Type a number like 3 or 1/2” and allowed to retry is not decided. `UNPARSEABLE_BEHAVIOR` in `lib/unparseable.ts` is the only switch (`'lock' | 'retry'`). It defaults to `'lock'`. `'retry'` leaves the instance unconsumed and still writes the attempt row. Changing that one constant is the whole decision.
+`parseAnswer` lives in `lib/answer-parser.ts`, which imports nothing. The client and the offline queue use that same function. The server is the only scorer.
+
+Blank answers are unchanged: an `empty_answer` review-lane try mints no XP, is not a celebrate miss, and still occupies a slot in the mastery window.
+
+`UNPARSEABLE_BEHAVIOR` in `lib/unparseable.ts` is the only switch (`'retry' | 'lock'`). It defaults to `'retry'`: the item stays open and the child sees `UNPARSEABLE_HINT` (`Type a number like 3 or 1/2.`). `'lock'` consumes the instance and does not write an attempt. Changing that one constant is the whole decision.

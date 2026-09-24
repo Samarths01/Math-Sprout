@@ -1,5 +1,7 @@
 import type { AttemptResult } from "@/lib/attempt-contract";
 import { foldRewards } from "@/lib/attempt-contract";
+import { parseAnswer } from "@/lib/answer-parser";
+import type { FormatRejected } from "@/lib/unparseable";
 
 export type QueuedAttempt = {
   idempotencyKey: string;
@@ -39,6 +41,7 @@ export type SyncPost =
   | { ok: false; reason: "offline" }
   | { ok: false; reason: "hold"; message: string }
   | { ok: false; reason: "drop"; message: string }
+  | { ok: false; reason: "format_rejected"; rejected: FormatRejected }
   | { ok: false; reason: "error"; message: string };
 
 export type QueueSnapshot = QueueData & {
@@ -49,6 +52,8 @@ export type QueueSnapshot = QueueData & {
   held?: number;
   /** A new try was refused because the unsynced queue is already at the cap. */
   capped?: boolean;
+  /** An unreadable answer was not queued. It is not an attempt. */
+  formatRejected?: boolean;
 };
 
 const SYNCED_CAP = 40;
@@ -156,6 +161,9 @@ export function createAttemptQueue(store: QueueStore) {
       return foldRewards(store.load().synced);
     },
     enqueue(attempt: QueuedAttempt): QueueSnapshot {
+      if (parseAnswer(attempt.answer).kind === "unparseable") {
+        return { ...store.load(), formatRejected: true };
+      }
       const data = store.load();
       const known =
         data.pending.some((item) => item.idempotencyKey === attempt.idempotencyKey) ||
@@ -208,6 +216,9 @@ export function createAttemptQueue(store: QueueStore) {
         }
         if (!posted.ok && posted.reason === "drop") {
           data.dropped.push(anonymize(attempt));
+          continue;
+        }
+        if (!posted.ok && posted.reason === "format_rejected") {
           continue;
         }
         if (!posted.ok) {

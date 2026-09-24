@@ -38,53 +38,74 @@ export type StepPractice = {
   count: number;
 };
 
-export type UnparseableRate = {
-  templateId: string;
+export type FormatRejectRate = {
   templateVersion: number;
   provenance: string;
-  unparseable: number;
+  promptType: string;
+  rejects: number;
   attempts: number;
   rate: number;
 };
 
 /**
- * Unparseable attempts divided by attempts on that template version.
- * Provenance stays on the template row and is joined, not copied onto the child payload.
+ * Rejects divided by rejects plus scored attempts, per template version,
+ * provenance, and prompt type. The child's text is not in this table.
  */
-export function unparseableRates(db: Database.Database, childId: string): UnparseableRate[] {
+export function formatRejectRates(db: Database.Database, childId: string): FormatRejectRate[] {
   const rows = db
     .prepare(
       `SELECT
-         i.template_id AS templateId,
-         i.template_version AS templateVersion,
-         t.provenance AS provenance,
-         SUM(CASE WHEN a.outcome = 'unparseable' THEN 1 ELSE 0 END) AS unparseable,
-         COUNT(*) AS attempts
-       FROM attempts a
-       JOIN item_instances i ON i.item_instance_id = a.item_instance_id
-       JOIN item_template_versions t
-         ON t.template_id = i.template_id AND t.template_version = i.template_version
-       WHERE a.child_id = ?
-       GROUP BY i.template_id, i.template_version, t.provenance
-       ORDER BY i.template_id ASC, i.template_version ASC, t.provenance ASC`,
+         version AS templateVersion,
+         provenance AS provenance,
+         prompt_type AS promptType,
+         SUM(rejects) AS rejects,
+         SUM(attempts) AS attempts
+       FROM (
+         SELECT
+           r.template_version AS version,
+           r.provenance AS provenance,
+           r.prompt_type AS prompt_type,
+           COUNT(*) AS rejects,
+           0 AS attempts
+         FROM answer_format_rejects r
+         JOIN item_instances i ON i.item_instance_id = r.item_instance_id
+         WHERE i.child_id = ?
+         GROUP BY r.template_version, r.provenance, r.prompt_type
+         UNION ALL
+         SELECT
+           i.template_version AS version,
+           t.provenance AS provenance,
+           t.prompt_shape AS prompt_type,
+           0 AS rejects,
+           COUNT(*) AS attempts
+         FROM attempts a
+         JOIN item_instances i ON i.item_instance_id = a.item_instance_id
+         JOIN item_template_versions t
+           ON t.template_id = i.template_id AND t.template_version = i.template_version
+         WHERE a.child_id = ?
+         GROUP BY i.template_version, t.provenance, t.prompt_shape
+       )
+       GROUP BY version, provenance, prompt_type
+       ORDER BY version ASC, provenance ASC, prompt_type ASC`,
     )
-    .all(childId) as Array<{
-    templateId: string;
+    .all(childId, childId) as Array<{
     templateVersion: number;
     provenance: string;
-    unparseable: number | null;
-    attempts: number;
+    promptType: string;
+    rejects: number | null;
+    attempts: number | null;
   }>;
   return rows.map((row) => {
-    const unparseable = row.unparseable ?? 0;
-    const attempts = row.attempts;
+    const rejects = row.rejects ?? 0;
+    const attempts = row.attempts ?? 0;
+    const total = rejects + attempts;
     return {
-      templateId: row.templateId,
       templateVersion: row.templateVersion,
       provenance: row.provenance,
-      unparseable,
+      promptType: row.promptType,
+      rejects,
       attempts,
-      rate: attempts === 0 ? 0 : unparseable / attempts,
+      rate: total === 0 ? 0 : rejects / total,
     };
   });
 }

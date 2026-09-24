@@ -18,7 +18,9 @@ import { markFuelPulse } from "@/lib/fuel-motion";
 import { showResumeCelebration } from "@/lib/pause-hold";
 import { postPauseHoldUntilVisible } from "@/lib/pause-hold-receipt";
 import { PracticeProblem } from "@/components/practice-problem";
+import { parseAnswer } from "@/lib/answer-parser";
 import { provisionalVerdict } from "@/lib/provisional-verdict";
+import { isFormatRejected, UNPARSEABLE_HINT } from "@/lib/unparseable";
 import { Button } from "@/components/ui/button";
 import {
   Card,
@@ -58,6 +60,9 @@ async function postAttempt(childId: string, attempt: QueuedAttempt): Promise<Syn
     const body = (await response.json().catch(() => null)) as
       | (AttemptResult & { error?: string; queueDisposition?: unknown })
       | null;
+    if (isFormatRejected(body)) {
+      return { ok: false, reason: "format_rejected", rejected: body };
+    }
     if (response.status === 403) {
       if (body?.queueDisposition === "hold") {
         // Receipt retries stay on hold. A failed POST never becomes a drop.
@@ -113,6 +118,8 @@ export function PracticeSession({
   const [quietResume, setQuietResume] = useState(false);
   const [pending, setPending] = useState(0);
   const [error, setError] = useState<string | null>(null);
+  const [formatHint, setFormatHint] = useState<string | null>(null);
+  const [formatLocked, setFormatLocked] = useState(false);
   const [busy, setBusy] = useState(false);
   const [ready, setReady] = useState(false);
   const [boundary, setBoundary] = useState<BoundaryOptions | null>(null);
@@ -232,6 +239,8 @@ export function PracticeSession({
     setShownAt(new Date().toISOString());
     setAnswer("");
     setFeedback(null);
+    setFormatHint(null);
+    setFormatLocked(false);
     setSavedOffline(false);
     setError(null);
   }
@@ -300,9 +309,38 @@ export function PracticeSession({
 
   async function onSubmit(event: FormEvent) {
     event.preventDefault();
-    if (!sessionId || !item || !shownAt || busy) return;
+    if (!sessionId || !item || !shownAt || busy || formatLocked) return;
     setBusy(true);
     setError(null);
+    if (parseAnswer(answer).kind === "unparseable") {
+      const offline = typeof navigator !== "undefined" && navigator.onLine === false;
+      if (!offline && item.itemInstanceId) {
+        const posted = await postAttempt(childId, {
+          idempotencyKey: crypto.randomUUID(),
+          childId,
+          sessionId,
+          itemId: item.id,
+          answer,
+          shownAt,
+          submittedAt: new Date().toISOString(),
+          itemInstanceId: item.itemInstanceId,
+        });
+        if (!posted.ok && posted.reason === "format_rejected") {
+          setFormatHint(posted.rejected.hint);
+          setFormatLocked(posted.rejected.behavior === "lock");
+          setFeedback(null);
+          setSavedOffline(false);
+          setBusy(false);
+          return;
+        }
+      }
+      setFormatHint(UNPARSEABLE_HINT);
+      setFeedback(null);
+      setSavedOffline(false);
+      setBusy(false);
+      return;
+    }
+    setFormatHint(null);
     if (queue().snapshot().pending.length >= OFFLINE_QUEUE_CAP) {
       setPending(OFFLINE_QUEUE_CAP);
       await publishOfflineCap(OFFLINE_QUEUE_CAP);
@@ -495,6 +533,7 @@ export function PracticeSession({
                   value={answer}
                   onChange={(event) => setAnswer(event.target.value)}
                   autoComplete="off"
+                  disabled={formatLocked}
                   className="h-12 w-24 text-center font-heading text-2xl tabular-nums"
                   aria-label="Your answer"
                 />
@@ -541,16 +580,27 @@ export function PracticeSession({
                     value={answer}
                     onChange={(event) => setAnswer(event.target.value)}
                     autoComplete="off"
+                    disabled={formatLocked}
                     className="h-12 text-lg"
                   />
                 </div>
               )}
+              {formatHint ? (
+                <p
+                  role="status"
+                  data-testid="format-hint"
+                  data-format-locked={formatLocked ? "true" : "false"}
+                  className="text-sm leading-6"
+                >
+                  {formatHint}
+                </p>
+              ) : null}
               {error ? <p className="text-sm text-destructive">{error}</p> : null}
               <Button
                 type="submit"
                 size="primary"
                 data-testid="practice-submit"
-                disabled={busy || offlineCapped}
+                disabled={busy || offlineCapped || formatLocked}
               >
                 {busy ? "Checking…" : "Check answer"}
               </Button>

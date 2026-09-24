@@ -1,15 +1,15 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import type Database from "better-sqlite3";
-import { parseSubmitAttempt, startPracticeSession, submitAttempt } from "@/lib/attempts";
+import { parseSubmitAttempt, startPracticeSession, submitAnswer, submitAttempt } from "@/lib/attempts";
 import { openDatabase } from "@/lib/db";
 import { DomainError, createChild, createGuardian, setConsent } from "@/lib/domain";
 import { SKILLS, TEMPLATE_VERSIONS, generatedTemplates } from "@/lib/templates/catalog";
 import { ambiguousBugs, drawAccepted, drawOnce, seeded, validateTemplate } from "@/lib/templates/engine";
 import { cueText } from "@/lib/templates/cues";
-import { exactRepeatRate, stepsPracticed, unparseableRates } from "@/lib/templates/instruments";
+import { exactRepeatRate, formatRejectRates, stepsPracticed } from "@/lib/templates/instruments";
 import {
   ISSUE_BATCH_CAP,
   PROGRESSION_DIFFICULTY_STEP,
@@ -25,10 +25,11 @@ import {
 import { answersMatch } from "@/lib/templates/rational";
 import { ISSUANCE_TEMPLATE_COLUMNS, issuanceTemplateSelect } from "@/lib/templates/store";
 import type { TemplateVersion } from "@/lib/templates/types";
-import { ITEM_CATALOG } from "@/lib/item-catalog";
 import { evidenceForSkill } from "@/lib/learner-state";
+import { createAttemptQueue, memoryQueueStore } from "@/lib/offline-queue";
 import { provisionalVerdict } from "@/lib/provisional-verdict";
 import { POLICY_VERSION } from "@/lib/policy";
+import { isFormatRejected, UNPARSEABLE_BEHAVIOR, UNPARSEABLE_HINT } from "@/lib/unparseable";
 
 const cleanups: Array<() => void> = [];
 const WHEN = "2026-06-15T18:00:00.000Z";
@@ -93,6 +94,19 @@ function streakState(db: Database.Database, childId: string): string | null {
     .prepare(`SELECT streak_state FROM learner_progress WHERE child_id = ?`)
     .get(childId) as { streak_state: string } | undefined;
   return row?.streak_state ?? null;
+}
+
+function attemptCount(db: Database.Database): number {
+  return (db.prepare(`SELECT COUNT(*) AS count FROM attempts`).get() as { count: number }).count;
+}
+
+function qualifyingDays(db: Database.Database, childId: string): number {
+  return (
+    db.prepare(
+      `SELECT COUNT(*) AS count FROM qualifying_events
+       WHERE child_id = ? AND kind = 'QualifyingPracticeDay'`,
+    ).get(childId) as { count: number }
+  ).count;
 }
 
 function instanceCount(db: Database.Database, childId: string): number {
@@ -722,7 +736,7 @@ describe("item templates and issuance", () => {
     expect(POLICY_VERSION).toBe("rules-v0");
   });
 
-  it("locks an unparseable answer with no evidence, no mint, and no miss", () => {
+  it("rejects an unreadable answer with no attempt, no mint, and no fuel line", () => {
     const db = tempDb();
     const { guardian, child, session } = granted(db);
     const skill = session.item.skill;
@@ -744,11 +758,6 @@ describe("item templates and issuance", () => {
     expect(blank.lane).toBe("review");
     expect(blank.flags).toContain("empty_answer");
     expect(blank.lockIn).toBe("A blank answer stays quiet.");
-    const blankRow = db
-      .prepare(`SELECT outcome, estimator_evidence FROM attempts WHERE id = ?`)
-      .get(blank.attemptId) as { outcome: string | null; estimator_evidence: number | null };
-    expect(blankRow.outcome).toBeNull();
-    expect(blankRow.estimator_evidence).toBeNull();
     const blankEvidence = evidenceForSkill(db, child.id, skill);
     expect(blankEvidence.some((row) => row.correct === false && row.lane === "review")).toBe(true);
     expect(blankEvidence.some((row) => row.correct === false && row.lane === "celebrate")).toBe(false);
@@ -757,161 +766,89 @@ describe("item templates and issuance", () => {
       childId: child.id,
       sessionId: session.sessionId,
       skillId: skill,
-      idempotencyKey: "unparse-slot-01",
+      idempotencyKey: "format-slot-01",
       now: WHEN,
     });
     const before = evidenceForSkill(db, child.id, skill);
     const beforeXp = xpCount(db);
     const beforeStreak = streakState(db, child.id);
     const beforeIndex = itemIndex(db, session.sessionId);
-    const locked = submitAttempt(
+    const beforeAttempts = attemptCount(db);
+    const beforeDays = qualifyingDays(db, child.id);
+    const raw = "banana";
+    const rejected = submitAnswer(
       db,
       guardian.id,
       child.id,
       {
-        idempotencyKey: "unparse-key-01",
+        idempotencyKey: "format-key-0001",
         sessionId: session.sessionId,
         itemId: session.item.id,
         itemInstanceId: issued.itemInstanceId,
-        answer: "banana",
+        answer: raw,
         shownAt: shown(),
         submittedAt: WHEN,
       },
       { now: WHEN },
     );
-    expect(gradeStoredAnswer(issued, "banana")).toBe("unparseable");
-    expect(locked.correct).toBe(false);
-    expect(locked.flags).toEqual(["unparseable"]);
-    expect(locked.xpAmount).toBe(0);
-    expect(locked.eventIds).toEqual([]);
-    expect(locked.lockIn).toBe("That answer stays quiet.");
-    expect(locked.lockIn).not.toContain(issued.canonicalAnswer);
-    expect(qeCount(db, locked.attemptId)).toBe(0);
-    expect(xpCount(db, locked.attemptId)).toBe(0);
-    expect(xpCount(db)).toBe(beforeXp);
-    const after = evidenceForSkill(db, child.id, skill);
-    expect(after).toEqual(before);
-    const row = db
-      .prepare(
-        `SELECT estimator_evidence, lane, correct, outcome FROM attempts WHERE id = ?`,
-      )
-      .get(locked.attemptId) as {
-      estimator_evidence: number;
-      lane: string;
-      correct: number;
-      outcome: string | null;
-    };
-    expect(row.estimator_evidence).toBe(0);
-    expect(row.lane).toBe("review");
-    expect(row.correct).toBe(0);
-    expect(row.outcome).toBe("unparseable");
-    expect(row.lane).not.toBe("celebrate");
-    expect(streakState(db, child.id)).toBe(beforeStreak);
-    expect(itemIndex(db, session.sessionId)).toBe((beforeIndex + 1) % ITEM_CATALOG.length);
-    const consumed = readItemInstance(db, issued.itemInstanceId);
-    expect(consumed?.consumedByAttemptKey).toBe("unparse-key-01");
-    expect(unparseableRates(db, child.id)).toEqual([
-      {
-        templateId: issued.templateId,
-        templateVersion: issued.templateVersion,
-        provenance: "seed",
-        unparseable: 1,
-        attempts: 1,
-        rate: 1,
-      },
-    ]);
-
-    const replay = submitAttempt(db, guardian.id, child.id, {
-      idempotencyKey: "unparse-key-01",
-      sessionId: session.sessionId,
-      itemId: session.item.id,
-      itemInstanceId: issued.itemInstanceId,
-      answer: "banana",
-      shownAt: shown(),
-      submittedAt: WHEN,
+    expect(UNPARSEABLE_BEHAVIOR).toBe("retry");
+    expect(isFormatRejected(rejected)).toBe(true);
+    if (!isFormatRejected(rejected)) throw new Error("expected format_rejected");
+    expect(rejected).toEqual({
+      type: "format_rejected",
+      behavior: "retry",
+      hint: UNPARSEABLE_HINT,
     });
-    expect(replay.replayed).toBe(true);
-    expect(replay.lockIn).toBe(locked.lockIn);
-    expect(() =>
-      submitAttempt(db, guardian.id, child.id, {
-        idempotencyKey: "unparse-key-02",
-        sessionId: session.sessionId,
-        itemId: session.item.id,
-        itemInstanceId: issued.itemInstanceId,
-        answer: "banana",
-        shownAt: shown(),
-        submittedAt: WHEN,
-      }),
-    ).toThrow(DomainError);
-    expect(evidenceForSkill(db, child.id, skill)).toEqual(before);
-  });
-
-  it("retries an unparseable answer without consuming the instance", () => {
-    const db = tempDb();
-    const { guardian, child, session } = granted(db);
-    const skill = session.item.skill;
-    const issued = issueForProgression(db, {
-      childId: child.id,
-      sessionId: session.sessionId,
-      skillId: skill,
-      idempotencyKey: "unparse-retry-slot",
-      now: WHEN,
-    });
-    const before = evidenceForSkill(db, child.id, skill);
-    const beforeXp = xpCount(db);
-    const beforeStreak = streakState(db, child.id);
-    const beforeIndex = itemIndex(db, session.sessionId);
-    const hinted = submitAttempt(
-      db,
-      guardian.id,
-      child.id,
-      {
-        idempotencyKey: "unparse-retry-01",
-        sessionId: session.sessionId,
-        itemId: session.item.id,
-        itemInstanceId: issued.itemInstanceId,
-        answer: "banana",
-        shownAt: shown(),
-        submittedAt: WHEN,
-      },
-      { now: WHEN, unparseableBehavior: "retry" },
-    );
-    expect(hinted.correct).toBe(false);
-    expect(hinted.flags).toEqual(["unparseable"]);
-    expect(hinted.xpAmount).toBe(0);
-    expect(hinted.eventIds).toEqual([]);
-    expect(hinted.lockIn).toBe("Type a number like 3 or 1/2.");
-    expect(hinted.lockIn).not.toContain(issued.canonicalAnswer);
-    expect(hinted.oneFocus).not.toContain(issued.canonicalAnswer);
-    expect(qeCount(db, hinted.attemptId)).toBe(0);
-    expect(xpCount(db, hinted.attemptId)).toBe(0);
+    expect(rejected.hint).toBe("Type a number like 3 or 1/2.");
+    expect(rejected.hint).not.toContain(issued.canonicalAnswer);
+    expect(rejected.hint).not.toContain(raw);
+    expect(rejected).not.toHaveProperty("fuel");
+    expect(rejected).not.toHaveProperty("correct");
+    expect(rejected).not.toHaveProperty("attemptId");
+    expect(rejected).not.toHaveProperty("xpAmount");
+    expect(attemptCount(db)).toBe(beforeAttempts);
+    expect(db.prepare(`SELECT id FROM attempts WHERE idempotency_key = ?`).get("format-key-0001")).toBeUndefined();
     expect(xpCount(db)).toBe(beforeXp);
+    expect(qualifyingDays(db, child.id)).toBe(beforeDays);
     expect(evidenceForSkill(db, child.id, skill)).toEqual(before);
     expect(streakState(db, child.id)).toBe(beforeStreak);
     expect(itemIndex(db, session.sessionId)).toBe(beforeIndex);
     const held = readItemInstance(db, issued.itemInstanceId);
     expect(held?.consumedAt).toBeNull();
-    expect(held?.consumedByAttemptKey).toBeNull();
-    const row = db
-      .prepare(`SELECT outcome, estimator_evidence, lane, correct FROM attempts WHERE id = ?`)
-      .get(hinted.attemptId) as {
-      outcome: string | null;
-      estimator_evidence: number;
-      lane: string;
-      correct: number;
-    };
-    expect(row.outcome).toBe("unparseable");
-    expect(row.estimator_evidence).toBe(0);
-    expect(row.lane).toBe("review");
-    expect(row.correct).toBe(0);
+    expect(held?.issuedAt).toBe(WHEN);
+    expect(exactRepeatRate(db, child.id, WHEN).issued).toBeGreaterThan(0);
+    const rejectColumns = (db.pragma("table_info(answer_format_rejects)") as Array<{ name: string }>).map(
+      (column) => column.name,
+    );
+    expect(rejectColumns).not.toContain("answer");
+    const rejects = db.prepare(`SELECT * FROM answer_format_rejects`).all() as Array<Record<string, unknown>>;
+    expect(rejects).toHaveLength(1);
+    expect(JSON.stringify(rejects)).not.toContain(raw);
+    const shape = db
+      .prepare(
+        `SELECT prompt_shape AS promptType, provenance FROM item_template_versions
+         WHERE template_id = ? AND template_version = ?`,
+      )
+      .get(issued.templateId, issued.templateVersion) as { promptType: string; provenance: string };
+    expect(formatRejectRates(db, child.id)).toEqual([
+      {
+        templateVersion: issued.templateVersion,
+        provenance: "seed",
+        promptType: shape.promptType,
+        rejects: 1,
+        attempts: 0,
+        rate: 1,
+      },
+    ]);
+    expect(shape.provenance).toBe("seed");
 
     const later = "2026-06-15T18:00:20.000Z";
-    const scored = submitAttempt(
+    const scored = submitAnswer(
       db,
       guardian.id,
       child.id,
       {
-        idempotencyKey: "unparse-retry-02",
+        idempotencyKey: "format-key-0001",
         sessionId: session.sessionId,
         itemId: session.item.id,
         itemInstanceId: issued.itemInstanceId,
@@ -919,27 +856,125 @@ describe("item templates and issuance", () => {
         shownAt: new Date(Date.parse(later) - 2_000).toISOString(),
         submittedAt: later,
       },
-      { now: later, unparseableBehavior: "retry" },
+      { now: later },
     );
+    if (isFormatRejected(scored)) throw new Error("a readable answer was rejected");
     expect(scored.correct).toBe(true);
-    expect(scored.flags).toEqual([]);
-    const consumed = readItemInstance(db, issued.itemInstanceId);
-    expect(consumed?.consumedByAttemptKey).toBe("unparse-retry-02");
-    const kept = db
-      .prepare(`SELECT id, outcome FROM attempts WHERE outcome = 'unparseable'`)
-      .all() as Array<{ id: string; outcome: string }>;
-    expect(kept).toEqual([{ id: hinted.attemptId, outcome: "unparseable" }]);
-    expect(unparseableRates(db, child.id)).toEqual([
+    expect(scored.idempotencyKey).toBe("format-key-0001");
+    expect(scored.fuel).toBeDefined();
+    expect(scored.xpAmount).toBeGreaterThan(0);
+    expect(qeCount(db, scored.attemptId)).toBeGreaterThan(0);
+    expect(readItemInstance(db, issued.itemInstanceId)?.consumedByAttemptKey).toBe("format-key-0001");
+    expect(formatRejectRates(db, child.id)).toEqual([
       {
-        templateId: issued.templateId,
         templateVersion: issued.templateVersion,
         provenance: "seed",
-        unparseable: 1,
-        attempts: 2,
+        promptType: shape.promptType,
+        rejects: 1,
+        attempts: 1,
         rate: 0.5,
       },
     ]);
-    expect(evidenceForSkill(db, child.id, skill).some((entry) => entry.correct)).toBe(true);
+  });
+
+  it("locks an unreadable answer without writing an attempt", () => {
+    const db = tempDb();
+    const { guardian, child, session } = granted(db);
+    const issued = issueForProgression(db, {
+      childId: child.id,
+      sessionId: session.sessionId,
+      skillId: session.item.skill,
+      idempotencyKey: "format-lock-slot",
+      now: WHEN,
+    });
+    const beforeAttempts = attemptCount(db);
+    const beforeXp = xpCount(db);
+    const raw = "banana";
+    const rejected = submitAnswer(
+      db,
+      guardian.id,
+      child.id,
+      {
+        idempotencyKey: "format-lock-0001",
+        sessionId: session.sessionId,
+        itemId: session.item.id,
+        itemInstanceId: issued.itemInstanceId,
+        answer: raw,
+        shownAt: shown(),
+        submittedAt: WHEN,
+      },
+      { now: WHEN, unparseableBehavior: "lock" },
+    );
+    if (!isFormatRejected(rejected)) throw new Error("expected format_rejected");
+    expect(rejected.behavior).toBe("lock");
+    expect(rejected.hint).toBe("That answer stays quiet.");
+    expect(rejected).not.toHaveProperty("fuel");
+    expect(attemptCount(db)).toBe(beforeAttempts);
+    expect(xpCount(db)).toBe(beforeXp);
+    expect(db.prepare(`SELECT id FROM attempts WHERE idempotency_key = ?`).get("format-lock-0001")).toBeUndefined();
+    expect(JSON.stringify(db.prepare(`SELECT * FROM answer_format_rejects`).all())).not.toContain(raw);
+    expect(readItemInstance(db, issued.itemInstanceId)?.consumedAt).toBeTruthy();
+    expect(() =>
+      submitAnswer(db, guardian.id, child.id, {
+        idempotencyKey: "format-lock-0002",
+        sessionId: session.sessionId,
+        itemId: session.item.id,
+        itemInstanceId: issued.itemInstanceId,
+        answer: issued.canonicalAnswer,
+        shownAt: shown(),
+        submittedAt: WHEN,
+      }),
+    ).toThrow(DomainError);
+    expect(attemptCount(db)).toBe(beforeAttempts);
+  });
+
+  it("keeps the answer parser free of server imports", () => {
+    const root = new URL("../", import.meta.url);
+    const parser = readFileSync(new URL("lib/answer-parser.ts", root), "utf8");
+    expect(parser).not.toMatch(/\bimport\b/);
+    expect(parser).not.toMatch(/better-sqlite3|@\/lib\/db|@\/lib\/attempts|server-only/);
+    expect(parser).toContain("export function parseAnswer");
+    const client = readFileSync(new URL("components/practice-session.tsx", root), "utf8");
+    const offline = readFileSync(new URL("lib/offline-queue.ts", root), "utf8");
+    expect(client).toContain('from "@/lib/answer-parser"');
+    expect(offline).toContain('from "@/lib/answer-parser"');
+    expect(readFileSync(new URL("lib/templates/rational.ts", root), "utf8")).not.toMatch(
+      /function parseAnswer\b/,
+    );
+    const skip = new Set(["answer-parser.ts"]);
+    function walk(dir: URL): void {
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        if (entry.name === "node_modules" || entry.name === ".next") continue;
+        const next = new URL(`${entry.name}${entry.isDirectory() ? "/" : ""}`, dir);
+        if (entry.isDirectory()) {
+          walk(next);
+          continue;
+        }
+        if (!entry.name.endsWith(".ts") && !entry.name.endsWith(".tsx")) continue;
+        if (skip.has(entry.name)) continue;
+        expect(readFileSync(next, "utf8"), entry.name).not.toMatch(/function parseAnswer\b/);
+      }
+    }
+    walk(new URL("lib/", root));
+    walk(new URL("components/", root));
+  });
+
+  it("does not queue an unreadable answer as an offline attempt", () => {
+    const queue = createAttemptQueue(memoryQueueStore());
+    const base = {
+      idempotencyKey: "offline-format-01",
+      childId: "child-1",
+      sessionId: "session-1",
+      itemId: "ops-g2-add",
+      shownAt: shown(),
+      submittedAt: WHEN,
+    };
+    const rejected = queue.enqueue({ ...base, answer: "banana" });
+    expect(rejected.pending).toEqual([]);
+    expect(rejected.formatRejected).toBe(true);
+    const blank = queue.enqueue({ ...base, idempotencyKey: "offline-blank-01", answer: "   " });
+    expect(blank.pending).toHaveLength(1);
+    expect(blank.pending[0]?.answer).toBe("   ");
   });
 
   it("mints an offline batch only when the server scores it", () => {

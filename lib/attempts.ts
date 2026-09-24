@@ -41,6 +41,7 @@ import * as appBuild from "@/lib/app-build";
 import { POLICY_VERSION } from "@/lib/policy";
 import { takePendingPauseHold } from "@/lib/pause-hold";
 import { practiceGate } from "@/lib/practice-gate";
+import { expectedAnswerType } from "@/lib/answer-parser";
 import {
   consumeItemInstance,
   focusForStoredAnswer,
@@ -48,7 +49,13 @@ import {
   presentIssuedItem,
   readItemInstance,
 } from "@/lib/templates/issue";
-import { UNPARSEABLE_BEHAVIOR, type UnparseableBehavior } from "@/lib/unparseable";
+import {
+  isFormatRejected,
+  UNPARSEABLE_BEHAVIOR,
+  unparseableChildLine,
+  type FormatRejected,
+  type UnparseableBehavior,
+} from "@/lib/unparseable";
 
 const KEY_PATTERN = /^[A-Za-z0-9_-]{8,80}$/;
 
@@ -343,13 +350,13 @@ export function startPracticeSession(
   return presentSession(db, childId, open.immediate());
 }
 
-export function submitAttempt(
+export function submitAnswer(
   db: Database.Database,
   guardianId: string,
   childId: string,
   input: SubmitAttemptInput,
   options?: { now?: string; unparseableBehavior?: UnparseableBehavior },
-): AttemptResult {
+): AttemptResult | FormatRejected {
   const idempotencyKey = input.idempotencyKey.trim();
   if (!KEY_PATTERN.test(idempotencyKey)) {
     throw new DomainError(
@@ -371,7 +378,7 @@ export function submitAttempt(
   }
 
   const buildSha = appBuild.currentAppBuildSha();
-  const commit = db.transaction((): { result: AttemptResult; log: AttemptLog | null } => {
+  const commit = db.transaction((): { result: AttemptResult | FormatRejected; log: AttemptLog | null } => {
     const existing = findAttempt(db, childId, idempotencyKey);
     if (existing) return { result: resultFromRow(db, existing, true), log: null };
 
@@ -417,9 +424,6 @@ export function submitAttempt(
     let difficultyStep: number | null = null;
     let estimatorEvidence: number | null = null;
     let skipEconomy = false;
-    let outcome: "unparseable" | null = null;
-    let consumeThisInstance = false;
-    let advanceSession = true;
 
     if (input.itemInstanceId) {
       const instance = readItemInstance(db, input.itemInstanceId);
@@ -442,39 +446,50 @@ export function submitAttempt(
       instanceId = instance.itemInstanceId;
       templateId = instance.templateId;
       difficultyStep = instance.difficultyStep;
-      consumeThisInstance = true;
       const verdict = gradeStoredAnswer(instance, input.answer);
       if (verdict === "unparseable") {
         const unparseableBehavior = options?.unparseableBehavior ?? UNPARSEABLE_BEHAVIOR;
-        flags = ["unparseable"];
-        correct = false;
-        estimatorEvidence = 0;
-        outcome = "unparseable";
-        skipEconomy = true;
-        if (unparseableBehavior === "retry") {
-          consumeThisInstance = false;
-          advanceSession = false;
-        }
-        beats = buildFourBeat({
-          correct: false,
-          flags,
-          item: skillItem,
-          canonicalAnswer: instance.canonicalAnswer,
-          unparseable: true,
-          unparseableBehavior,
+        const meta = db
+          .prepare(
+            `SELECT provenance, prompt_shape FROM item_template_versions
+             WHERE template_id = ? AND template_version = ?`,
+          )
+          .get(instance.templateId, instance.templateVersion) as
+          | { provenance: string; prompt_shape: string }
+          | undefined;
+        if (!meta) throw new DomainError("That problem is not in this practice pack.", 404);
+        db.prepare(
+          `INSERT INTO answer_format_rejects (
+             id, item_instance_id, template_version, provenance, prompt_type, answer_type, rejected_at
+           ) VALUES (
+             @id, @item_instance_id, @template_version, @provenance, @prompt_type, @answer_type, @rejected_at
+           )`,
+        ).run({
+          id: randomUUID(),
+          item_instance_id: instance.itemInstanceId,
+          template_version: instance.templateVersion,
+          provenance: meta.provenance,
+          prompt_type: meta.prompt_shape,
+          answer_type: expectedAnswerType(instance.canonicalAnswer),
+          rejected_at: submittedAt,
         });
-        economy = {
-          lane: "review",
-          celebrationTier: "none",
-          mints: [],
-          clientView: readSkillClientView(db, childId, skillItem.skill) ?? {
-            bandLabel: "Still learning",
-            showConceptChip: false,
-            celebrationTier: "none",
+        if (unparseableBehavior === "lock") {
+          consumeItemInstance(db, instance, idempotencyKey, submittedAt);
+          db.prepare(`UPDATE practice_sessions SET item_index = ? WHERE id = ?`).run(
+            (session.item_index + 1) % ITEM_CATALOG.length,
+            session.id,
+          );
+        }
+        return {
+          result: {
+            type: "format_rejected",
+            behavior: unparseableBehavior,
+            hint: unparseableChildLine(unparseableBehavior),
           },
+          log: null,
         };
-      } else {
-        correct = verdict === "correct";
+      }
+      correct = verdict === "correct";
         estimatorEvidence = instance.evidenceEligible ? 1 : 0;
         const focus =
           verdict === "incorrect" ? focusForStoredAnswer(instance, input.answer) : null;
@@ -505,10 +520,7 @@ export function submitAttempt(
         if (instance.evidenceEligible) {
           saveSkillState(db, childId, skillItem.skill, economy.clientView);
         }
-      }
-      if (consumeThisInstance) {
-        consumeItemInstance(db, instance, idempotencyKey, submittedAt);
-      }
+      consumeItemInstance(db, instance, idempotencyKey, submittedAt);
     } else {
       correct = gradeAnswer(itemId, input.answer);
       economy = planAttemptEconomy(db, {
@@ -540,12 +552,12 @@ export function submitAttempt(
          id, child_id, session_id, idempotency_key, item_id, answer, shown_at,
          submitted_at, correct, lane, celebration_tier, flags_json, beats_json,
          client_view_json, created_at, policy_version, build_sha, resume_presentation,
-         item_instance_id, template_id, difficulty_step, estimator_evidence, outcome
+         item_instance_id, template_id, difficulty_step, estimator_evidence
        ) VALUES (
          @id, @child_id, @session_id, @idempotency_key, @item_id, @answer, @shown_at,
          @submitted_at, @correct, @lane, @celebration_tier, @flags_json, @beats_json,
          @client_view_json, @created_at, @policy_version, @build_sha, @resume_presentation,
-         @item_instance_id, @template_id, @difficulty_step, @estimator_evidence, @outcome
+         @item_instance_id, @template_id, @difficulty_step, @estimator_evidence
        )`,
     ).run({
       id: attemptId,
@@ -570,7 +582,6 @@ export function submitAttempt(
       template_id: templateId,
       difficulty_step: difficultyStep,
       estimator_evidence: estimatorEvidence,
-      outcome,
     });
     if (!skipEconomy) commitAttemptEconomy(db, {
       childId,
@@ -585,11 +596,9 @@ export function submitAttempt(
       celebrationTier: economy.celebrationTier,
       mints: economy.mints,
     });
-    if (advanceSession) {
-      db.prepare(
-        `UPDATE practice_sessions SET item_index = ? WHERE id = ?`,
-      ).run((session.item_index + 1) % ITEM_CATALOG.length, session.id);
-    }
+    db.prepare(
+      `UPDATE practice_sessions SET item_index = ? WHERE id = ?`,
+    ).run((session.item_index + 1) % ITEM_CATALOG.length, session.id);
     const stored = findAttempt(db, childId, idempotencyKey);
     if (!stored) throw new DomainError("Attempt was not saved.", 500);
     const log = readAttemptLog(db, stored.id);
@@ -613,5 +622,20 @@ export function submitAttempt(
     }
     throw error;
   }
+}
+
+/** Scored tries only. An unreadable answer is not an attempt; use `submitAnswer`. */
+export function submitAttempt(
+  db: Database.Database,
+  guardianId: string,
+  childId: string,
+  input: SubmitAttemptInput,
+  options?: { now?: string },
+): AttemptResult {
+  const outcome = submitAnswer(db, guardianId, childId, input, options);
+  if (isFormatRejected(outcome)) {
+    throw new DomainError("An unreadable answer is not an attempt.", 422);
+  }
+  return outcome;
 }
 

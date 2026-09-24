@@ -84,6 +84,19 @@ CREATE INDEX IF NOT EXISTS item_instances_child_issued
   ON item_instances(child_id, issued_at);
 CREATE INDEX IF NOT EXISTS item_instances_child_template
   ON item_instances(child_id, template_id, operand_key);
+
+CREATE TABLE IF NOT EXISTS answer_format_rejects (
+  id TEXT PRIMARY KEY,
+  item_instance_id TEXT NOT NULL,
+  template_version INTEGER NOT NULL,
+  provenance TEXT NOT NULL CHECK (provenance IN ('seed', 'parent', 'ai_assisted')),
+  prompt_type TEXT NOT NULL,
+  answer_type TEXT NOT NULL,
+  rejected_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS answer_format_rejects_version
+  ON answer_format_rejects(template_version, provenance, prompt_type);
 `;
 
 function addAttemptColumn(db: Database.Database, name: string, ddl: string): void {
@@ -100,11 +113,6 @@ export function migrateItemTemplates(db: Database.Database): void {
   addAttemptColumn(db, "template_id", "template_id TEXT");
   addAttemptColumn(db, "difficulty_step", "difficulty_step INTEGER");
   addAttemptColumn(db, "estimator_evidence", "estimator_evidence INTEGER");
-  addAttemptColumn(
-    db,
-    "outcome",
-    "outcome TEXT CHECK (outcome IS NULL OR outcome = 'unparseable')",
-  );
   const count = db.prepare(`SELECT COUNT(*) AS count FROM item_template_versions`).get() as {
     count: number;
   };

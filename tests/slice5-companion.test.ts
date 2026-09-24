@@ -267,6 +267,7 @@ describe("build goal projection", () => {
       )
       .all() as Array<{ name: string }>;
     expect(tables.map((table) => table.name).sort()).toEqual([
+      "answer_format_rejects",
       "attempts",
       "boundary_events",
       "children",

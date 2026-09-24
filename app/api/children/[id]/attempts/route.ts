@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { parseSubmitAttempt, submitAttempt } from "@/lib/attempts";
+import { parseSubmitAttempt, submitAnswer } from "@/lib/attempts";
 import { getDb } from "@/lib/db";
 import {
   asRecord,
@@ -20,7 +20,7 @@ export async function POST(request: Request, context: Context) {
     const guardian = await requireGuardian();
     const { id } = await context.params;
     const body = asRecord(await readJson(request));
-    const result = submitAttempt(
+    const result = submitAnswer(
       getDb(),
       guardian.id,
       id,
