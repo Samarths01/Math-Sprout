@@ -1,5 +1,6 @@
 "use client";
 
+import type { ReactNode } from "react";
 import Link from "next/link";
 import { practiceClickOutcome } from "@/lib/practice-gate";
 import { buttonVariants } from "@/components/ui/button";
@@ -9,10 +10,13 @@ export function PracticeCta({
   childId,
   practiceAllowed,
   reason,
+  fuel,
 }: {
   childId: string;
   practiceAllowed: boolean;
   reason?: string;
+  /** Qualifying-event glance rendered under the button. Not a second destination. */
+  fuel?: ReactNode;
 }) {
   const outcome = practiceClickOutcome(practiceAllowed);
 
@@ -40,6 +44,7 @@ export function PracticeCta({
           Start practice
         </button>
       )}
+      {fuel}
       <p id="practice-gate-copy" className="text-sm leading-6 text-muted-foreground">
         {outcome === "start-session"
           ? "A parent has granted consent. Start practice when you are ready."

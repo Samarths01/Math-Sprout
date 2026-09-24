@@ -3,11 +3,10 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import Link from "next/link";
 import type { AttemptResult, ClientView, PublicItem } from "@/lib/attempt-contract";
-import { displayedOneFocus, FOUR_BEAT_KEYS } from "@/lib/attempt-contract";
 import type { BoundaryOptions, PracticeLane } from "@/lib/mastery";
 import { itemAt, ITEM_CATALOG } from "@/lib/item-catalog";
 import { interfaceCopy } from "@/lib/interface-copy";
-import { MintToast } from "@/components/mint-toast";
+import { PracticeFeedback } from "@/components/practice-feedback";
 import {
   consentQueueReason,
   createAttemptQueue,
@@ -28,13 +27,6 @@ import {
 } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-
-const BEAT_LABELS: Record<(typeof FOUR_BEAT_KEYS)[number], string> = {
-  whatWentWell: "What went well",
-  oneFocus: "One focus",
-  tryNext: "Try next",
-  lockIn: "Lock in",
-};
 
 const PROGRESS_COPY: Record<BoundaryOptions["progression"], string> = {
   stay: "Recommended stays the usual next step.",
@@ -486,44 +478,7 @@ export function PracticeSession({
         <CardContent>
           {feedback ? (
             <div data-testid="practice-feedback" className="grid gap-4" aria-live="polite">
-              {showResumeCelebration(feedback) ? (
-                <MintToast
-                  tier={feedback.clientView.celebrationTier}
-                  credit={feedback.fuel.credit}
-                  eventCount={feedback.eventIds.length}
-                  pieceEventIds={feedback.fuel.pieceEventIds}
-                  replayed={feedback.replayed}
-                />
-              ) : (
-                <p
-                  data-testid="quiet-resume"
-                  data-presentation="quiet"
-                  role="status"
-                  className="text-sm leading-6"
-                >
-                  {interfaceCopy("pause.resume.quiet")}
-                </p>
-              )}
-              <dl className="grid gap-3">
-                {FOUR_BEAT_KEYS.map((key) => (
-                  <div key={key} className="grid gap-1">
-                    <dt className="text-sm font-medium">{BEAT_LABELS[key]}</dt>
-                    <dd data-testid={`beat-${key}`} className="text-sm leading-6">
-                      {key === "oneFocus" ? displayedOneFocus(feedback) : feedback[key]}
-                    </dd>
-                  </div>
-                ))}
-              </dl>
-              <div data-testid="client-view" className="grid gap-2">
-                <p data-band-label={feedback.clientView.bandLabel}>
-                  {feedback.clientView.bandLabel}
-                </p>
-                {feedback.clientView.showConceptChip ? (
-                  <p data-testid="concept-chip" className="text-sm text-muted-foreground">
-                    {item.skill}
-                  </p>
-                ) : null}
-              </div>
+              <PracticeFeedback feedback={feedback} item={item} />
               {offlineCapped ? null : (
                 <Button
                   type="button"

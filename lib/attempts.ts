@@ -180,7 +180,7 @@ function readBeats(raw: string): FourBeat {
   const beats = {} as FourBeat;
   for (const key of FOUR_BEAT_KEYS) {
     const value = parsed[key];
-    if (typeof value !== "string" || value.length === 0) {
+    if (typeof value !== "string") {
       throw new DomainError("Stored attempt feedback is incomplete.", 500);
     }
     beats[key] = value;

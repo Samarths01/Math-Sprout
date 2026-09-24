@@ -2,6 +2,7 @@ import Link from "next/link";
 import { notFound, redirect } from "next/navigation";
 import { AppHeader } from "@/components/app-header";
 import { CompanionState } from "@/components/companion-state";
+import { FuelStrip } from "@/components/fuel-strip";
 import { LogoutButton } from "@/components/logout-button";
 import { PracticeCta } from "@/components/practice-cta";
 import { Shell } from "@/components/shell";
@@ -40,6 +41,10 @@ export default async function ChildHomePage({
   }
   const companion = readCompanion(getDb(), home.child.id, new Date().toISOString());
   const sproutGlance = accruedXp(getDb(), home.child.id) > 0;
+  const placedPieces = [
+    ...companion.build.completed.flatMap((goal) => goal.pieces),
+    ...companion.build.active.pieces,
+  ];
 
   return (
     <Shell width="narrow">
@@ -57,12 +62,6 @@ export default async function ChildHomePage({
             </p>
           </div>
         </div>
-        <CompanionState
-          childId={home.child.id}
-          practiceAllowed={home.practiceAllowed}
-          companion={companion}
-          sproutGlance={sproutGlance}
-        />
         <Card>
           <CardHeader>
             <CardTitle className="font-heading text-2xl">Practice</CardTitle>
@@ -76,9 +75,21 @@ export default async function ChildHomePage({
               childId={home.child.id}
               practiceAllowed={home.practiceAllowed}
               reason={home.reason}
+              fuel={
+                <FuelStrip
+                  streak={companion.streak}
+                  sprout={sproutGlance}
+                  piece={placedPieces.at(-1) ?? null}
+                />
+              }
             />
           </CardContent>
         </Card>
+        <CompanionState
+          childId={home.child.id}
+          practiceAllowed={home.practiceAllowed}
+          companion={companion}
+        />
         <Link
           href="/parent"
           className="text-sm text-primary underline-offset-4 hover:underline"

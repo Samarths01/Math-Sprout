@@ -89,13 +89,10 @@ export function CompanionState({
   childId,
   practiceAllowed,
   companion,
-  sproutGlance = false,
 }: {
   childId: string;
   practiceAllowed: boolean;
   companion: CompanionView;
-  /** True when accrued XP credits exist. A glance, not a count and not a link. */
-  sproutGlance?: boolean;
 }) {
   const { active, completed } = companion.build;
   const slots = active.complete
@@ -127,17 +124,6 @@ export function CompanionState({
           <p data-testid="streak-copy" data-copy-key={companion.streak.copyKey}>
             {interfaceCopy(companion.streak.copyKey)}
           </p>
-          {sproutGlance ? (
-            <p
-              data-testid="sprout-glance"
-              data-fuel="xp"
-              data-fuel-source="qualifying-event"
-              data-copy-key="fuel.home.sprout"
-              className="text-sm leading-6 text-muted-foreground"
-            >
-              {interfaceCopy("fuel.home.sprout")}
-            </p>
-          ) : null}
           {recovery ? (
             <div className="grid gap-2" data-testid="ember-recovery">
               <p className="text-sm leading-6 text-muted-foreground" data-copy-key={recovery.detailKey}>
