@@ -241,6 +241,38 @@ function xpCount(db: Database.Database, attemptId?: string): number {
   return row.count;
 }
 
+/** The first saved attempt is the evidence. A later sync must leave this row alone. */
+function savedItemEvidence(db: Database.Database, itemInstanceId: string) {
+  const attempts = db
+    .prepare(
+      `SELECT id, idempotency_key AS idempotencyKey, outcome, correct, flags_json AS flags
+       FROM attempts WHERE item_instance_id = ?
+       ORDER BY created_at, id`,
+    )
+    .all(itemInstanceId) as Array<{
+    id: string;
+    idempotencyKey: string;
+    outcome: string | null;
+    correct: number;
+    flags: string;
+  }>;
+  const xp = db
+    .prepare(
+      `SELECT xp.id, xp.attempt_id AS attemptId, xp.amount, xp.celebration_tier AS celebrationTier
+       FROM xp_events xp
+       JOIN attempts a ON a.id = xp.attempt_id
+       WHERE a.item_instance_id = ?
+       ORDER BY xp.minted_at, xp.id`,
+    )
+    .all(itemInstanceId) as Array<{
+    id: string;
+    attemptId: string;
+    amount: number;
+    celebrationTier: string;
+  }>;
+  return { attempts, xp };
+}
+
 const MAX_SKILL_SWITCH_RATE = 0.1;
 
 type SkillSwitchRate = {
@@ -3530,6 +3562,9 @@ describe("item templates and issuance", () => {
       { now: answeredAt },
     );
     if (isFormatRejected(scored)) throw new Error("a readable answer was rejected");
+    const firstSave = savedItemEvidence(db, screen.itemInstanceId);
+    expect(firstSave.attempts).toHaveLength(1);
+    expect(firstSave.xp).toHaveLength(1);
     endPracticeSession(db, guardian.id, child.id, session.sessionId);
     choosePracticeLane(db, guardian.id, child.id, session.sessionId, "recommended");
     const next = startPracticeSession(db, guardian.id, child.id);
@@ -3586,9 +3621,13 @@ describe("item templates and issuance", () => {
     ]);
     expect(snapshot.parked[0]?.answer).toBe(ended.answer);
     expect(snapshot.synced.map((result) => result.idempotencyKey)).toEqual([later.idempotencyKey]);
+    const afterPark = savedItemEvidence(db, screen.itemInstanceId);
+    expect(afterPark.attempts).toHaveLength(1);
+    expect(afterPark.xp).toHaveLength(1);
+    expect(afterPark).toEqual(firstSave);
   });
 
-  it("ignores a second Check for the same item while an entry is pending", () => {
+  it("ignores a second Check for the same item while an entry is pending", async () => {
     const first: QueuedAttempt = {
       idempotencyKey: "first-check",
       childId: "child-1",
@@ -3612,6 +3651,44 @@ describe("item templates and issuance", () => {
     expect(second.pending).toHaveLength(1);
     expect(JSON.stringify(second)).not.toContain("second-check");
     expect(JSON.stringify(second)).not.toContain('"7"');
+
+    const db = tempDb();
+    const { guardian, child, session } = granted(db, "one-entry@example.com");
+    const token = createSession(db, guardian.id);
+    const screen = readItemInstance(db, session.item.itemInstanceId ?? "");
+    if (!screen) throw new Error("session did not issue");
+    const live: QueuedAttempt = {
+      idempotencyKey: "one-entry-first",
+      childId: child.id,
+      sessionId: session.sessionId,
+      itemId: session.item.id,
+      itemInstanceId: screen.itemInstanceId,
+      answer: screen.canonicalAnswer,
+      shownAt: new Date(Date.parse(screen.issuedAt) + 1_000).toISOString(),
+      submittedAt: new Date(Date.parse(screen.issuedAt) + 3_000).toISOString(),
+    };
+    const liveQueue = createAttemptQueue(memoryQueueStore());
+    liveQueue.enqueue(live);
+    const ignored = liveQueue.enqueue({
+      ...live,
+      idempotencyKey: "one-entry-second",
+      answer: "0",
+    });
+    expect(ignored.pending).toHaveLength(1);
+    expect(ignored.pending[0]?.idempotencyKey).toBe(live.idempotencyKey);
+    const synced = await liveQueue.reconcile(async (attempt) => {
+      const posted = await postAttemptRoute(db, token, child.id, attempt);
+      expect(posted.status).toBe(200);
+      if (!posted.body.attemptId) throw new Error("the one queued answer was not scored");
+      return { ok: true as const, result: posted.body as AttemptResult };
+    });
+    expect(synced.pending).toEqual([]);
+    const saved = savedItemEvidence(db, screen.itemInstanceId);
+    expect(saved.attempts).toHaveLength(1);
+    expect(saved.attempts[0]?.idempotencyKey).toBe(live.idempotencyKey);
+    expect(saved.xp).toHaveLength(1);
+    const attemptRows = db.prepare(`SELECT COUNT(*) AS count FROM attempts`).get() as { count: number };
+    expect(attemptRows.count).toBe(1);
   });
 
   it("moves to the next item after a queued offline answer syncs", async () => {
@@ -3687,7 +3764,9 @@ describe("item templates and issuance", () => {
       { now: scoredAt },
     );
     if (isFormatRejected(scored)) throw new Error("a readable answer was rejected");
-    expect(xpCount(db)).toBe(1);
+    const firstSave = savedItemEvidence(db, screen.itemInstanceId);
+    expect(firstSave.attempts).toHaveLength(1);
+    expect(firstSave.xp).toHaveLength(1);
     const duplicate: QueuedAttempt = {
       idempotencyKey: "saved-second-key",
       childId: child.id,
@@ -3721,9 +3800,10 @@ describe("item templates and issuance", () => {
     expect(snapshot.dropped[0]).not.toHaveProperty("answer");
     expect(snapshot.invalidAttemptKeys).toBeUndefined();
     expect(snapshot.lastError).toBeUndefined();
-    expect(xpCount(db)).toBe(1);
-    const attempts = db.prepare(`SELECT COUNT(*) AS count FROM attempts`).get() as { count: number };
-    expect(attempts.count).toBe(1);
+    const afterDrop = savedItemEvidence(db, screen.itemInstanceId);
+    expect(afterDrop.attempts).toHaveLength(1);
+    expect(afterDrop.xp).toHaveLength(1);
+    expect(afterDrop).toEqual(firstSave);
   });
 
   it("keeps a pending entry after the queue is reloaded", () => {
@@ -3775,7 +3855,9 @@ describe("item templates and issuance", () => {
     const first = await postAttemptRoute(db, token, child.id, saved);
     expect(first.status).toBe(200);
     expect(first.body.replayed).toBe(false);
-    expect(xpCount(db)).toBe(1);
+    const firstSave = savedItemEvidence(db, screen.itemInstanceId);
+    expect(firstSave.attempts).toHaveLength(1);
+    expect(firstSave.xp).toHaveLength(1);
     const queue = createAttemptQueue(
       memoryQueueStore({
         version: 1,
@@ -3797,9 +3879,10 @@ describe("item templates and issuance", () => {
     expect(retried.dropped).toEqual([]);
     expect(retried.synced.map((result) => result.idempotencyKey)).toEqual([saved.idempotencyKey]);
     expect(retried.quietCredits).toBe(1);
-    expect(xpCount(db)).toBe(1);
-    const attempts = db.prepare(`SELECT COUNT(*) AS count FROM attempts`).get() as { count: number };
-    expect(attempts.count).toBe(1);
+    const afterRetry = savedItemEvidence(db, screen.itemInstanceId);
+    expect(afterRetry.attempts).toHaveLength(1);
+    expect(afterRetry.xp).toHaveLength(1);
+    expect(afterRetry).toEqual(firstSave);
   });
 
   it("spends a parked retry that times out and keeps one the network drops", async () => {
