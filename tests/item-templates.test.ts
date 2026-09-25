@@ -104,6 +104,7 @@ import {
   parkedRetryFailure,
   reloadLiveSession,
   runShownSession,
+  runSingleFlightFlush,
   storageQueueStore,
   type QueuedAttempt,
 } from "@/lib/offline-queue";
@@ -3993,6 +3994,78 @@ describe("item templates and issuance", () => {
     expect(afterReplay.attempts).toHaveLength(1);
     expect(afterReplay.xp).toHaveLength(1);
     expect(afterReplay).toEqual(firstSave);
+  });
+
+  it("posts each queued key once when two flushes start together", async () => {
+    const queue = createAttemptQueue(memoryQueueStore());
+    const first: QueuedAttempt = {
+      idempotencyKey: "flush-together-a",
+      childId: "child-1",
+      sessionId: "session-1",
+      itemId: "ops-g2-add",
+      answer: "42",
+      shownAt: shown(),
+      submittedAt: WHEN,
+      itemInstanceId: "issued-instance-01",
+    };
+    const second: QueuedAttempt = {
+      ...first,
+      idempotencyKey: "flush-together-b",
+      answer: "7",
+      itemInstanceId: "issued-instance-02",
+    };
+    queue.enqueue(first);
+    queue.enqueue(second);
+    const posts: string[] = [];
+    const flush = () =>
+      queue.reconcile(async (attempt) => {
+        posts.push(attempt.idempotencyKey);
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        return { ok: true as const, result: syncedAttempt(attempt.idempotencyKey) };
+      });
+    await Promise.all([runSingleFlightFlush(flush), runSingleFlightFlush(flush)]);
+    expect(posts).toEqual([first.idempotencyKey, second.idempotencyKey]);
+    const client = readFileSync(path.join(process.cwd(), "components/practice-session.tsx"), "utf8");
+    expect(client).toContain("runSingleFlightFlush(() => flushOnce())");
+  });
+
+  it("runs one follow-up flush when another trigger arrives mid-flush", async () => {
+    const queue = createAttemptQueue(memoryQueueStore());
+    const first: QueuedAttempt = {
+      idempotencyKey: "flush-follow-a",
+      childId: "child-1",
+      sessionId: "session-1",
+      itemId: "ops-g2-add",
+      answer: "42",
+      shownAt: shown(),
+      submittedAt: WHEN,
+      itemInstanceId: "issued-instance-01",
+    };
+    const second: QueuedAttempt = {
+      ...first,
+      idempotencyKey: "flush-follow-b",
+      answer: "7",
+      itemInstanceId: "issued-instance-02",
+    };
+    queue.enqueue(first);
+    queue.enqueue(second);
+    const posts: string[] = [];
+    let passes = 0;
+    const flush = () => {
+      passes += 1;
+      return queue.reconcile(async (attempt) => {
+        posts.push(attempt.idempotencyKey);
+        if (passes === 1 && attempt.idempotencyKey === first.idempotencyKey) {
+          void runSingleFlightFlush(flush);
+          void runSingleFlightFlush(flush);
+        }
+        return { ok: true as const, result: syncedAttempt(attempt.idempotencyKey) };
+      });
+    };
+    const snapshot = await runSingleFlightFlush(flush);
+    expect(passes).toBe(2);
+    expect(posts).toEqual([first.idempotencyKey, second.idempotencyKey]);
+    expect(snapshot.pending).toEqual([]);
   });
 
   it("parks a try after repeated server errors or after it ages out", async () => {

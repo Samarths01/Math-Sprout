@@ -100,8 +100,9 @@ export const QUEUE_RETRY_TIMEOUT_MS = 8_000;
 
 /** A thrown parked-retry post stays parked. A timeout is not a drop. */
 export function parkedRetryFailure(
-  _error: unknown,
+  error: unknown,
 ): Extract<SyncPost, { ok: false; reason: "offline" }> {
+  void error;
   return { ok: false, reason: "offline" };
 }
 
@@ -478,6 +479,46 @@ export function createAttemptQueue(store: QueueStore) {
       };
     },
   };
+}
+
+let flushInFlight: Promise<QueueSnapshot> | null = null;
+let flushFollowUp: (() => Promise<QueueSnapshot>) | null = null;
+
+/**
+ * One flush at a time. A trigger that arrives while a flush is running joins
+ * that flush and schedules a single follow-up pass. Further triggers during
+ * the same flush do not add more passes.
+ */
+export function runSingleFlightFlush(
+  flush: () => Promise<QueueSnapshot>,
+): Promise<QueueSnapshot> {
+  if (flushInFlight) {
+    flushFollowUp = flush;
+    return flushInFlight;
+  }
+  let resolveFlight!: (snapshot: QueueSnapshot) => void;
+  let rejectFlight!: (error: unknown) => void;
+  const flight = new Promise<QueueSnapshot>((resolve, reject) => {
+    resolveFlight = resolve;
+    rejectFlight = reject;
+  });
+  flushInFlight = flight;
+  void (async () => {
+    try {
+      let snapshot = await flush();
+      while (flushFollowUp) {
+        const next = flushFollowUp;
+        flushFollowUp = null;
+        snapshot = await next();
+      }
+      resolveFlight(snapshot);
+    } catch (error) {
+      rejectFlight(error);
+    } finally {
+      if (flushInFlight === flight) flushInFlight = null;
+    }
+  })();
+  return flight;
 }
 
 export type ShownSessionAction = "start" | "reconnect" | "new-session";
