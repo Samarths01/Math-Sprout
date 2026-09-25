@@ -3,8 +3,8 @@
 
 import { createElement, act } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { afterEach, describe, expect, it } from "vitest";
-import { PracticeSession } from "@/components/practice-session";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { OFFLINE_CAP_TIMEOUT_MS, PracticeSession } from "@/components/practice-session";
 import { XP_AMOUNT, type AttemptResult, type PublicItem } from "@/lib/attempt-contract";
 
 const columnItem: PublicItem = {
@@ -90,7 +90,7 @@ let itemIndex = 0;
 let root: Root | null = null;
 let container: HTMLDivElement | null = null;
 
-function installFetch() {
+function installFetch(options?: { stallCap?: boolean }) {
   itemIndex = 0;
   capReleases.length = 0;
   window.localStorage.clear();
@@ -115,7 +115,21 @@ function installFetch() {
       return json(attemptResult(body.idempotencyKey, current, next));
     }
     if (url.endsWith("/offline-cap") && init?.method === "POST") {
-      await holdCap();
+      if (options?.stallCap) {
+        await new Promise<void>((_resolve, reject) => {
+          const signal = init.signal;
+          const abort = () =>
+            reject(new DOMException("The operation was aborted.", "AbortError"));
+          if (!signal) return;
+          if (signal.aborted) {
+            abort();
+            return;
+          }
+          signal.addEventListener("abort", abort, { once: true });
+        });
+      } else {
+        await holdCap();
+      }
       return json({ ok: true });
     }
     return json({});
@@ -124,7 +138,11 @@ function installFetch() {
 
 async function settle() {
   await act(async () => {
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    if (vi.isFakeTimers()) {
+      await vi.advanceTimersByTimeAsync(0);
+    } else {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
   });
 }
 
@@ -183,23 +201,35 @@ async function checkAnswer() {
   });
 }
 
-async function nextProblem() {
-  await act(async () => {
-    const button = [...document.querySelectorAll("button")].find((node) =>
-      node.textContent?.includes("Next problem"),
-    );
-    if (!(button instanceof HTMLButtonElement)) throw new Error("Next problem missing");
-    button.click();
-  });
+function nextButton(): HTMLButtonElement {
+  const button = [...document.querySelectorAll("button")].find((node) =>
+    node.textContent?.includes("Next problem"),
+  );
+  if (!(button instanceof HTMLButtonElement)) throw new Error("Next problem missing");
+  return button;
+}
+
+async function releaseOfflineCap() {
   const release = capReleases.shift();
   if (!release) throw new Error("offline-cap was not in flight");
   await act(async () => {
     release();
   });
+}
+
+async function nextProblem() {
+  await releaseOfflineCap();
+  await waitFor(() => {
+    if (nextButton().disabled) throw new Error("Next problem still disabled");
+  });
+  await act(async () => {
+    nextButton().click();
+  });
   await settle();
 }
 
 afterEach(() => {
+  vi.useRealTimers();
   if (root) {
     act(() => {
       root?.unmount();
@@ -250,5 +280,83 @@ describe("practice answer state follows the item instance", () => {
       "What is 20 + 4?",
     );
     expectFreshAnswer("What is 20 + 4?");
+  });
+
+  it("keeps Next disabled while the offline-cap request is pending", async () => {
+    installFetch();
+    container = document.createElement("div");
+    document.body.appendChild(container);
+    root = createRoot(container);
+    await act(async () => {
+      root?.render(
+        createElement(PracticeSession, { childId: "child-1", displayName: "Ada" }),
+      );
+    });
+    await waitFor(() => {
+      expect(document.querySelector('[data-testid="practice-answer"]')).not.toBeNull();
+    });
+
+    await typeAnswer("1");
+    await checkAnswer();
+    expect(nextButton().disabled).toBe(true);
+
+    await releaseOfflineCap();
+    await waitFor(() => {
+      expect(nextButton().disabled).toBe(false);
+    });
+  });
+
+  it("enables Next after a stalled offline-cap request times out", async () => {
+    vi.useFakeTimers();
+    installFetch({ stallCap: true });
+    container = document.createElement("div");
+    document.body.appendChild(container);
+    root = createRoot(container);
+    await act(async () => {
+      root?.render(
+        createElement(PracticeSession, { childId: "child-1", displayName: "Ada" }),
+      );
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    await waitFor(() => {
+      expect(document.querySelector('[data-testid="practice-answer"]')).not.toBeNull();
+    });
+
+    await typeAnswer("1");
+    await checkAnswer();
+    expect(nextButton().disabled).toBe(true);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(OFFLINE_CAP_TIMEOUT_MS - 1);
+    });
+    expect(nextButton().disabled).toBe(true);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1);
+    });
+    expect(nextButton().disabled).toBe(false);
+
+    await act(async () => {
+      nextButton().click();
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+
+    const input = answerInput();
+    expect(input.value).toBe("");
+    expect(input.disabled).toBe(false);
+    await typeAnswer("4");
+    expect(answerInput().value).toBe("4");
+    const check = document.querySelector('[data-testid="practice-submit"]');
+    const end = document.querySelector('[data-testid="end-session"]');
+    if (!(check instanceof HTMLButtonElement) || !(end instanceof HTMLButtonElement)) {
+      throw new Error("Check or End missing");
+    }
+    expect(check.disabled).toBe(false);
+    expect(check.textContent).toContain("Check answer");
+    expect(end.disabled).toBe(false);
   });
 });

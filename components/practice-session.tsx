@@ -40,6 +40,9 @@ import {
 } from "@/components/ui/card";
 import { Label } from "@/components/ui/label";
 
+/** A stalled parent receipt is the same as being offline. */
+export const OFFLINE_CAP_TIMEOUT_MS = 8_000;
+
 function answerKindOf(item: PublicItem): AnswerKind {
   return item.answerKind === "fraction" ? "fraction" : "whole";
 }
@@ -169,6 +172,8 @@ function PracticeTurn({
   const [savedOffline, setSavedOffline] = useState(false);
   const [formatHint, setFormatHint] = useState<string | null>(null);
   const [formatLocked, setFormatLocked] = useState(false);
+  // After a reload the response-time clock starts when the item is shown again.
+  // The 2-minute cap covers edge cases.
   const [shownAt] = useState(() => new Date().toISOString());
 
   useLayoutEffect(() => {
@@ -200,80 +205,80 @@ function PracticeTurn({
     if (!shownAt || busy || formatLocked) return;
     setBusy(true);
     setError(null);
-    if (parseAnswer(answer).kind === "unparseable") {
-      const offline = typeof navigator !== "undefined" && navigator.onLine === false;
-      if (!offline && item.itemInstanceId) {
-        const posted = await postAttempt(childId, {
-          idempotencyKey: crypto.randomUUID(),
-          childId,
-          sessionId,
-          itemId: item.id,
-          answer,
-          shownAt,
-          submittedAt: new Date().toISOString(),
-          itemInstanceId: item.itemInstanceId,
-        });
-        if (!posted.ok && posted.reason === "format_rejected") {
-          setFormatHint(posted.rejected.hint);
-          setFormatLocked(posted.rejected.behavior === "lock");
-          setFeedback(null);
-          setSavedOffline(false);
-          setBusy(false);
-          return;
+    try {
+      if (parseAnswer(answer).kind === "unparseable") {
+        const offline = typeof navigator !== "undefined" && navigator.onLine === false;
+        if (!offline && item.itemInstanceId) {
+          const posted = await postAttempt(childId, {
+            idempotencyKey: crypto.randomUUID(),
+            childId,
+            sessionId,
+            itemId: item.id,
+            answer,
+            shownAt,
+            submittedAt: new Date().toISOString(),
+            itemInstanceId: item.itemInstanceId,
+          });
+          if (!posted.ok && posted.reason === "format_rejected") {
+            setFormatHint(posted.rejected.hint);
+            setFormatLocked(posted.rejected.behavior === "lock");
+            setFeedback(null);
+            setSavedOffline(false);
+            return;
+          }
         }
+        setFormatHint(offlineFormatHint(item));
+        setFeedback(null);
+        setSavedOffline(false);
+        return;
       }
-      setFormatHint(offlineFormatHint(item));
-      setFeedback(null);
-      setSavedOffline(false);
+      setFormatHint(null);
+      if (queue().snapshot().pending.length >= OFFLINE_QUEUE_CAP) {
+        await onOfflineCap(OFFLINE_QUEUE_CAP);
+        return;
+      }
+      const idempotencyKey = crypto.randomUUID();
+      const queued: QueuedAttempt = {
+        idempotencyKey,
+        childId,
+        sessionId,
+        itemId: item.id,
+        answer,
+        shownAt,
+        submittedAt: new Date().toISOString(),
+        ...(item.itemInstanceId ? { itemInstanceId: item.itemInstanceId } : {}),
+      };
+      armWaiting(instanceId, idempotencyKey);
+      queue().enqueue(queued);
+      const snapshot = await flush();
+      const synced = snapshot.synced.find((result) => result.idempotencyKey === idempotencyKey);
+      if (synced && showResumeCelebration(synced)) {
+        markFuelPulse(window.sessionStorage, childId, {
+          tier: synced.clientView.celebrationTier,
+          credit: synced.fuel.credit,
+          eventCount: synced.eventIds.length,
+          replayed: synced.replayed,
+          resumeQuiet: false,
+          eventId: synced.eventIds[0] ?? null,
+        });
+        setFeedback(synced);
+        setPersistedView(synced.clientView);
+        setSavedOffline(false);
+        setHeldNotice(false);
+      } else if (synced) {
+        setFeedback(null);
+        setPersistedView(synced.clientView);
+        setQuietResume(true);
+        setSavedOffline(false);
+        setHeldNotice(false);
+      } else if (snapshot.pending.some((entry) => entry.idempotencyKey === idempotencyKey)) {
+        setSavedOffline(!snapshot.held);
+        setHeldNotice(Boolean(snapshot.held));
+        setFeedback(null);
+      }
+    } finally {
       setBusy(false);
-      return;
     }
-    setFormatHint(null);
-    if (queue().snapshot().pending.length >= OFFLINE_QUEUE_CAP) {
-      await onOfflineCap(OFFLINE_QUEUE_CAP);
-      setBusy(false);
-      return;
-    }
-    const idempotencyKey = crypto.randomUUID();
-    const queued: QueuedAttempt = {
-      idempotencyKey,
-      childId,
-      sessionId,
-      itemId: item.id,
-      answer,
-      shownAt,
-      submittedAt: new Date().toISOString(),
-      ...(item.itemInstanceId ? { itemInstanceId: item.itemInstanceId } : {}),
-    };
-    armWaiting(instanceId, idempotencyKey);
-    queue().enqueue(queued);
-    const snapshot = await flush();
-    const synced = snapshot.synced.find((result) => result.idempotencyKey === idempotencyKey);
-    if (synced && showResumeCelebration(synced)) {
-      markFuelPulse(window.sessionStorage, childId, {
-        tier: synced.clientView.celebrationTier,
-        credit: synced.fuel.credit,
-        eventCount: synced.eventIds.length,
-        replayed: synced.replayed,
-        resumeQuiet: false,
-        eventId: synced.eventIds[0] ?? null,
-      });
-      setFeedback(synced);
-      setPersistedView(synced.clientView);
-      setSavedOffline(false);
-      setHeldNotice(false);
-    } else if (synced) {
-      setFeedback(null);
-      setPersistedView(synced.clientView);
-      setQuietResume(true);
-      setSavedOffline(false);
-      setHeldNotice(false);
-    } else if (snapshot.pending.some((entry) => entry.idempotencyKey === idempotencyKey)) {
-      setSavedOffline(!snapshot.held);
-      setHeldNotice(Boolean(snapshot.held));
-      setFeedback(null);
-    }
-    setBusy(false);
   }
 
   const nextFromFeedback = feedback?.nextItem;
@@ -315,6 +320,7 @@ function PracticeTurn({
                 <Button
                   type="button"
                   size="primary"
+                  disabled={busy}
                   onClick={() => {
                     if (nextFromFeedback) onAdvance(nextFromFeedback);
                   }}
@@ -464,14 +470,20 @@ export function PracticeSession({
   }
 
   async function publishOfflineCap(waiting: number): Promise<void> {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), OFFLINE_CAP_TIMEOUT_MS);
     try {
       await fetch(`/api/children/${childId}/offline-cap`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ waiting }),
+        signal: controller.signal,
       });
     } catch {
-      // The try stays on this focus. A later flush retries the parent receipt.
+      // A timeout or abort is the same as offline: the receipt may not have
+      // landed. The try stays on this focus. A later flush retries it.
+    } finally {
+      clearTimeout(timer);
     }
   }
 
