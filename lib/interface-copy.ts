@@ -42,6 +42,7 @@ export const INTERFACE_COPY = {
     "This try is waiting. A parent can see it. It saves quietly when practice is allowed again.",
   "pause.resume.quiet": "Saved. The tries that waited did not get a celebration.",
   "offline.cap.kid": "These answers are waiting to sync. Stay with this problem.",
+  "offline.parked.kid": "One answer could not be saved. You can keep going.",
   "offline.cap.waiting": "The offline limit is full. Answers are waiting to sync.",
   "offline.cap.detail": "They stay on this focus until the practice record catches up.",
   "parent.breath.empty": "No practice yet.",

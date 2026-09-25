@@ -1,6 +1,7 @@
 import type { AttemptResult } from "@/lib/attempt-contract";
 import { foldRewards } from "@/lib/attempt-contract";
 import { parseAnswer } from "@/lib/answer-parser";
+import { interfaceCopy } from "@/lib/interface-copy";
 import type { FormatRejected } from "@/lib/unparseable";
 
 export type QueuedAttempt = {
@@ -12,6 +13,8 @@ export type QueuedAttempt = {
   shownAt: string;
   submittedAt: string;
   itemInstanceId?: string;
+  /** Retryable sync failures so far. A parked try is no longer pending. */
+  syncFailures?: number;
 };
 
 export type BlockedAttempt = QueuedAttempt & { message: string };
@@ -23,10 +26,19 @@ export type DroppedAttempt = {
   sessionId: string;
 };
 
+/** A try set aside so it no longer blocks the queue. The answer is not kept. */
+export type ParkedAttempt = {
+  idempotencyKey: string;
+  childId: string;
+  sessionId: string;
+  message: string;
+};
+
 export type QueueData = {
   version: 1;
   pending: QueuedAttempt[];
   blocked: BlockedAttempt[];
+  parked: ParkedAttempt[];
   dropped: DroppedAttempt[];
   synced: AttemptResult[];
 };
@@ -67,8 +79,17 @@ const SYNCED_CAP = 40;
  */
 export const OFFLINE_QUEUE_CAP = 3;
 
+/**
+ * A retryable failure stays at the head for a few tries. After this many
+ * failures, or once the try is this old, it is parked and later answers flush.
+ * One server error still retries. Three failures is a few reconnects, not a
+ * single blip. Fifteen minutes is an earlier sitting, not this one problem.
+ */
+export const QUEUE_PARK_AFTER_FAILURES = 3;
+export const QUEUE_PARK_AFTER_MS = 15 * 60 * 1000;
+
 export function emptyQueue(): QueueData {
-  return { version: 1, pending: [], blocked: [], dropped: [], synced: [] };
+  return { version: 1, pending: [], blocked: [], parked: [], dropped: [], synced: [] };
 }
 
 /**
@@ -86,10 +107,11 @@ export function consentQueueReason(
 /**
  * Missing or invalid instance ids are permanent when the body names that case.
  * An unknown instance is 404 with `code: unknown_instance`. An already-used
- * instance is 409 with `code: already_locked`. Other 404s and 409s stay
- * retryable, including a missing session, a missing child, and a routing 404.
- * 5xx stays retryable. Other statuses return null so the caller keeps its
- * existing mapping.
+ * instance is 409 with `code: already_locked`. A session that has ended is
+ * 409 with `code: session_ended` and `retryable: false`; that try is dropped.
+ * Other 404s and 409s stay retryable, including a missing session, a missing
+ * child, and a routing 404. 5xx stays retryable until the park limit. Other
+ * statuses return null so the caller keeps its existing mapping.
  */
 export function classifyAttemptFailure(
   status: number,
@@ -97,10 +119,12 @@ export function classifyAttemptFailure(
 ): Extract<SyncPost, { ok: false; reason: "invalid_attempt" | "error" }> | null {
   const unknownInstance = status === 404 && body?.code === "unknown_instance";
   const alreadyUsed = status === 409 && body?.code === "already_locked";
+  const sessionEnded = status === 409 && body?.code === "session_ended";
   if (
     (status === 400 && body?.error === "invalid_attempt" && body.retryable === false) ||
     unknownInstance ||
-    alreadyUsed
+    alreadyUsed ||
+    sessionEnded
   ) {
     return { ok: false, reason: "invalid_attempt" };
   }
@@ -129,6 +153,23 @@ export function reloadLiveSession(
   if (!waitingKey || !snapshot.invalidAttemptKeys?.includes(waitingKey)) return false;
   reload();
   return true;
+}
+
+function readParked(value: unknown): ParkedAttempt[] {
+  if (!Array.isArray(value)) return [];
+  const parked: ParkedAttempt[] = [];
+  for (const item of value) {
+    if (!item || typeof item !== "object") continue;
+    const row = item as Partial<ParkedAttempt>;
+    if (typeof row.idempotencyKey !== "string" || row.idempotencyKey.length === 0) continue;
+    parked.push({
+      idempotencyKey: row.idempotencyKey,
+      childId: typeof row.childId === "string" ? row.childId : "",
+      sessionId: typeof row.sessionId === "string" ? row.sessionId : "",
+      message: interfaceCopy("offline.parked.kid"),
+    });
+  }
+  return parked;
 }
 
 function anonymize(attempt: QueuedAttempt): DroppedAttempt {
@@ -180,6 +221,7 @@ export function storageQueueStore(
           version: 1,
           pending: parsed.pending,
           blocked: [],
+          parked: readParked(parsed.parked),
           dropped: [
             ...readDropped(parsed.dropped),
             ...readDropped(parsed.blocked),
@@ -220,6 +262,7 @@ export function createAttemptQueue(store: QueueStore) {
         data.pending.some((item) => item.idempotencyKey === attempt.idempotencyKey) ||
         data.synced.some((item) => item.idempotencyKey === attempt.idempotencyKey) ||
         data.blocked.some((item) => item.idempotencyKey === attempt.idempotencyKey) ||
+        data.parked.some((item) => item.idempotencyKey === attempt.idempotencyKey) ||
         data.dropped.some((item) => item.idempotencyKey === attempt.idempotencyKey);
       if (!known) {
         if (data.pending.length >= OFFLINE_QUEUE_CAP) {
@@ -232,6 +275,7 @@ export function createAttemptQueue(store: QueueStore) {
     },
     async reconcile(
       post: (attempt: QueuedAttempt) => Promise<SyncPost>,
+      options?: { now?: string },
     ): Promise<QueueSnapshot> {
       const data = store.load();
       let lastError: string | undefined;
@@ -240,6 +284,7 @@ export function createAttemptQueue(store: QueueStore) {
       let quietCredits = 0;
       let held = 0;
       const invalidAttemptKeys: string[] = [];
+      const now = options?.now ?? new Date().toISOString();
       for (const attempt of data.pending) {
         if (stopped) {
           stillPending.push(attempt);
@@ -280,7 +325,19 @@ export function createAttemptQueue(store: QueueStore) {
           continue;
         }
         if (!posted.ok) {
-          stillPending.push(attempt);
+          const failures = (attempt.syncFailures ?? 0) + 1;
+          const ageMs = Date.parse(now) - Date.parse(attempt.submittedAt);
+          const agedOut = Number.isFinite(ageMs) && ageMs >= QUEUE_PARK_AFTER_MS;
+          if (failures >= QUEUE_PARK_AFTER_FAILURES || agedOut) {
+            data.parked.push({
+              idempotencyKey: attempt.idempotencyKey,
+              childId: attempt.childId,
+              sessionId: attempt.sessionId,
+              message: interfaceCopy("offline.parked.kid"),
+            });
+            continue;
+          }
+          stillPending.push({ ...attempt, syncFailures: failures });
           stopped = true;
           lastError = posted.message;
           continue;
@@ -306,11 +363,34 @@ export function createAttemptQueue(store: QueueStore) {
   };
 }
 
+export type ShownSessionAction = "start" | "reconnect" | "new-session";
+
 /**
- * A prefetch or an advance can supersede the batch a queued try belongs to.
+ * Session start, reconnect, and a new session flush queued answers and show
+ * the one item the session route issued. They do not request a hidden batch.
+ * Reconnect only flushes. Start and a new session open the session after the
+ * queue has drained, so a parked or dropped try does not block that one item.
+ */
+export async function runShownSession<T>(
+  action: ShownSessionAction,
+  input: {
+    flush: () => Promise<QueueSnapshot>;
+    openSession?: () => Promise<T>;
+  },
+): Promise<{ snapshot: QueueSnapshot; shown: T | null }> {
+  if (action === "reconnect") {
+    return { snapshot: await input.flush(), shown: null };
+  }
+  if (!input.openSession) throw new Error("A shown session needs an opener.");
+  const drained = await issueAfterQueueDrain(input.flush, input.openSession);
+  return { snapshot: drained.snapshot, shown: drained.issued };
+}
+
+/**
+ * A batch issue can supersede items a queued try still belongs to.
  * Reconcile first. Issuance runs only after the queue has drained. Entries
- * that reconcile drops as non-retryable are not pending, so they do not block
- * the next batch. A retryable try still waiting does.
+ * that reconcile drops or parks are not pending, so they do not block the
+ * next batch. A retryable try still under the park limit does.
  */
 export async function issueAfterQueueDrain<T>(
   reconcile: () => Promise<QueueSnapshot>,

@@ -490,6 +490,9 @@ export function submitAnswer(
       throw new DomainError(
         "This session has ended. Choose a lane to start the next one.",
         409,
+        undefined,
+        undefined,
+        "session_ended",
       );
     }
     const item = catalogItem(itemId);

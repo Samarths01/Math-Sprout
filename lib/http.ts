@@ -99,6 +99,7 @@ export function publicErrorBody(error: unknown): {
       body: {
         error: error.message,
         ...(error.code ? { code: error.code } : {}),
+        ...(error.code === "session_ended" ? { retryable: false as const } : {}),
         ...(error.queueDisposition ? { queueDisposition: error.queueDisposition } : {}),
       },
     };

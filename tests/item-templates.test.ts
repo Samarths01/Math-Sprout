@@ -11,8 +11,11 @@ import type { AttemptResult } from "@/lib/attempt-contract";
 import { currentAppBuildSha } from "@/lib/app-build";
 import { parseAnswer, rationalsEqual } from "@/lib/answer-parser";
 import { advancePracticeSlot, parseSubmitAttempt, startPracticeSession, submitAnswer, submitAttempt } from "@/lib/attempts";
+import { choosePracticeLane, endPracticeSession } from "@/lib/boundary";
+import { interfaceCopy } from "@/lib/interface-copy";
 import { AnswerBlank } from "@/components/answer-blank";
 import { PracticeProblem } from "@/components/practice-problem";
+import { ParkedAttemptNotice } from "@/components/practice-session";
 import { PracticeFeedback } from "@/components/practice-feedback";
 import { openDatabase } from "@/lib/db";
 import { DomainError, createChild, createGuardian, createSession, getChildHome, setConsent } from "@/lib/domain";
@@ -90,11 +93,14 @@ import {
   startIndexForLane,
 } from "@/lib/learner-state";
 import {
+  QUEUE_PARK_AFTER_FAILURES,
+  QUEUE_PARK_AFTER_MS,
   classifyAttemptFailure,
   createAttemptQueue,
   issueAfterQueueDrain,
   memoryQueueStore,
   reloadLiveSession,
+  runShownSession,
   type QueuedAttempt,
 } from "@/lib/offline-queue";
 import { provisionalVerdict } from "@/lib/provisional-verdict";
@@ -3055,6 +3061,13 @@ describe("item templates and issuance", () => {
     expect(classifyAttemptFailure(409, { error: "That session is already closed." })).toBeNull();
     expect(
       classifyAttemptFailure(409, {
+        error: "This session has ended. Choose a lane to start the next one.",
+        code: "session_ended",
+        retryable: false,
+      }),
+    ).toEqual({ ok: false, reason: "invalid_attempt" });
+    expect(
+      classifyAttemptFailure(409, {
         error: "That problem is already locked.",
         code: "already_locked",
       }),
@@ -3300,7 +3313,7 @@ describe("item templates and issuance", () => {
           const classified = classifyAttemptFailure(500, { error: "Something went wrong." });
           if (!classified) throw new Error("expected a retryable server error");
           return classified;
-        }),
+        }, { now: WHEN }),
       async () => {
         issuedWhileWaiting = true;
         return null;
@@ -3446,7 +3459,7 @@ describe("item templates and issuance", () => {
       const classified = classifyAttemptFailure(500, { error: "Something went wrong." });
       if (!classified) throw new Error("expected a retryable server error");
       return classified;
-    });
+    }, { now: WHEN });
     expect(posts).toBe(1);
     expect(waiting.pending).toHaveLength(1);
     expect(waiting.dropped).toEqual([]);
@@ -3464,12 +3477,266 @@ describe("item templates and issuance", () => {
     expect(synced.synced.map((result) => result.idempotencyKey)).toEqual([attempt.idempotencyKey]);
   });
 
+  it("drops a session_ended answer and still flushes the next one", async () => {
+    const db = tempDb();
+    const { guardian, child, session } = granted(db, "session-ended@example.com");
+    const screen = readItemInstance(db, session.item.itemInstanceId ?? "");
+    if (!screen) throw new Error("session did not issue");
+    const answeredAt = new Date(Date.parse(screen.issuedAt) + 3_000).toISOString();
+    const scored = submitAnswer(
+      db,
+      guardian.id,
+      child.id,
+      {
+        idempotencyKey: "ended-screen-score",
+        sessionId: session.sessionId,
+        itemId: session.item.id,
+        itemInstanceId: screen.itemInstanceId,
+        answer: screen.canonicalAnswer,
+        shownAt: new Date(Date.parse(answeredAt) - 2_000).toISOString(),
+        submittedAt: answeredAt,
+      },
+      { now: answeredAt },
+    );
+    if (isFormatRejected(scored)) throw new Error("a readable answer was rejected");
+    endPracticeSession(db, guardian.id, child.id, session.sessionId);
+    choosePracticeLane(db, guardian.id, child.id, session.sessionId, "recommended");
+    const next = startPracticeSession(db, guardian.id, child.id);
+    const nextItem = readItemInstance(db, next.item.itemInstanceId ?? "");
+    if (!nextItem) throw new Error("new session did not issue");
+    const token = createSession(db, guardian.id);
+    const ended: QueuedAttempt = {
+      idempotencyKey: "ended-session-try",
+      childId: child.id,
+      sessionId: session.sessionId,
+      itemId: session.item.id,
+      itemInstanceId: screen.itemInstanceId,
+      answer: screen.canonicalAnswer,
+      shownAt: shown(),
+      submittedAt: WHEN,
+    };
+    const later: QueuedAttempt = {
+      idempotencyKey: "next-session-try",
+      childId: child.id,
+      sessionId: next.sessionId,
+      itemId: next.item.id,
+      itemInstanceId: nextItem.itemInstanceId,
+      answer: nextItem.canonicalAnswer,
+      shownAt: shown(),
+      submittedAt: new Date(Date.parse(WHEN) + 1_000).toISOString(),
+    };
+    const queue = createAttemptQueue(memoryQueueStore());
+    queue.enqueue(ended);
+    queue.enqueue(later);
+    const snapshot = await queue.reconcile(async (attempt) => {
+      const posted = await postAttemptRoute(db, token, child.id, attempt);
+      if (attempt.idempotencyKey === ended.idempotencyKey) {
+        expect(posted.status).toBe(409);
+        expect(posted.body.code).toBe("session_ended");
+        expect(posted.body.retryable).toBe(false);
+      }
+      const classified = classifyAttemptFailure(posted.status, posted.body);
+      if (classified) return classified;
+      if (posted.status === 200 && posted.body.attemptId) {
+        return { ok: true as const, result: posted.body as AttemptResult };
+      }
+      throw new Error(`unexpected queue response ${posted.status}`);
+    });
+    expect(snapshot.pending).toEqual([]);
+    expect(snapshot.dropped).toEqual([
+      {
+        idempotencyKey: ended.idempotencyKey,
+        childId: ended.childId,
+        sessionId: ended.sessionId,
+      },
+    ]);
+    expect(JSON.stringify(snapshot.dropped)).not.toContain(`"answer"`);
+    expect(snapshot.synced.map((result) => result.idempotencyKey)).toEqual([later.idempotencyKey]);
+    expect(snapshot.parked).toEqual([]);
+  });
+
+  it("parks a try after repeated server errors or after it ages out", async () => {
+    const head: QueuedAttempt = {
+      idempotencyKey: "stuck-head",
+      childId: "child-1",
+      sessionId: "session-1",
+      itemId: "ops-g2-add",
+      answer: "42",
+      shownAt: shown(),
+      submittedAt: WHEN,
+      itemInstanceId: "issued-instance-01",
+    };
+    const later: QueuedAttempt = {
+      idempotencyKey: "later-answer",
+      childId: "child-1",
+      sessionId: "session-1",
+      itemId: "ops-g2-add",
+      answer: "7",
+      shownAt: shown(),
+      submittedAt: WHEN,
+      itemInstanceId: "issued-instance-02",
+    };
+    const queue = createAttemptQueue(memoryQueueStore());
+    queue.enqueue(head);
+    queue.enqueue(later);
+    let laterPosts = 0;
+    const serverError = () => {
+      const classified = classifyAttemptFailure(500, { error: "Something went wrong." });
+      if (!classified) throw new Error("expected a retryable server error");
+      return classified;
+    };
+    for (let attempt = 1; attempt < QUEUE_PARK_AFTER_FAILURES; attempt += 1) {
+      const waiting = await queue.reconcile(async (entry) => {
+        expect(entry.idempotencyKey).toBe(head.idempotencyKey);
+        return serverError();
+      }, { now: WHEN });
+      expect(waiting.pending.map((entry) => entry.idempotencyKey)).toEqual([
+        head.idempotencyKey,
+        later.idempotencyKey,
+      ]);
+      expect(waiting.parked).toEqual([]);
+      expect(laterPosts).toBe(0);
+    }
+    let issuedAfterPark = false;
+    const parked = await issueAfterQueueDrain(
+      () =>
+        queue.reconcile(
+          async (entry) => {
+            if (entry.idempotencyKey === later.idempotencyKey) laterPosts += 1;
+            if (entry.idempotencyKey === head.idempotencyKey) return serverError();
+            return { ok: true as const, result: syncedAttempt(entry.idempotencyKey) };
+          },
+          { now: WHEN },
+        ),
+      async () => {
+        issuedAfterPark = true;
+        return "shown";
+      },
+    );
+    expect(laterPosts).toBe(1);
+    expect(parked.snapshot.pending).toEqual([]);
+    expect(parked.snapshot.parked).toEqual([
+      {
+        idempotencyKey: head.idempotencyKey,
+        childId: head.childId,
+        sessionId: head.sessionId,
+        message: interfaceCopy("offline.parked.kid"),
+      },
+    ]);
+    expect(JSON.stringify(parked.snapshot.parked)).not.toContain(head.answer);
+    expect(parked.snapshot.synced.map((result) => result.idempotencyKey)).toEqual([later.idempotencyKey]);
+    expect(issuedAfterPark).toBe(true);
+    expect(parked.issued).toBe("shown");
+    const notice = renderToStaticMarkup(createElement(ParkedAttemptNotice));
+    expect(notice).toContain('data-testid="parked-attempt"');
+    expect(notice).toContain(interfaceCopy("offline.parked.kid"));
+    expect(notice.toLowerCase()).not.toMatch(/5xx|session_ended|error code/);
+
+    const agedHead: QueuedAttempt = {
+      ...head,
+      idempotencyKey: "aged-head",
+      answer: "99",
+      submittedAt: new Date(Date.parse(WHEN) - QUEUE_PARK_AFTER_MS).toISOString(),
+    };
+    const agedLater: QueuedAttempt = { ...later, idempotencyKey: "aged-later", answer: "3" };
+    const aged = createAttemptQueue(memoryQueueStore());
+    aged.enqueue(agedHead);
+    aged.enqueue(agedLater);
+    const agedOut = await aged.reconcile(
+      async (entry) => {
+        if (entry.idempotencyKey === agedHead.idempotencyKey) return serverError();
+        return { ok: true as const, result: syncedAttempt(entry.idempotencyKey) };
+      },
+      { now: WHEN },
+    );
+    expect(agedOut.pending).toEqual([]);
+    expect(agedOut.parked.map((entry) => entry.idempotencyKey)).toEqual([agedHead.idempotencyKey]);
+    expect(JSON.stringify(agedOut.parked)).not.toContain(agedHead.answer);
+    expect(agedOut.synced.map((result) => result.idempotencyKey)).toEqual([agedLater.idempotencyKey]);
+  });
+
+  it("issues no hidden items on session start, reconnect, or a new session", async () => {
+    const db = tempDb();
+    const guardian = createGuardian(db, {
+      email: "shown-only@example.com",
+      password: "correct-horse",
+      timezone: "America/Los_Angeles",
+    });
+    const child = createChild(db, guardian.id, { displayName: "Ava" });
+    setConsent(db, guardian.id, child.id, "grant");
+    const issuedIds = () =>
+      (
+        db.prepare(`SELECT item_instance_id AS id FROM item_instances WHERE child_id = ? ORDER BY issued_at, rowid`).all(
+          child.id,
+        ) as Array<{ id: string }>
+      ).map((row) => row.id);
+    const flush = async () => createAttemptQueue(memoryQueueStore()).snapshot();
+    const started = await runShownSession("start", {
+      flush,
+      openSession: () => Promise.resolve(startPracticeSession(db, guardian.id, child.id)),
+    });
+    const shownId = started.shown?.item.itemInstanceId;
+    if (!shownId) throw new Error("start did not show an item");
+    expect(issuedIds()).toEqual([shownId]);
+
+    await runShownSession("reconnect", {
+      flush,
+      openSession: () => Promise.reject(new Error("reconnect must not issue")),
+    });
+    expect(issuedIds()).toEqual([shownId]);
+
+    const screen = readItemInstance(db, shownId);
+    if (!screen || !started.shown) throw new Error("shown item is missing");
+    const answeredAt = new Date(Date.parse(screen.issuedAt) + 3_000).toISOString();
+    const scored = submitAnswer(
+      db,
+      guardian.id,
+      child.id,
+      {
+        idempotencyKey: "shown-screen-score",
+        sessionId: started.shown.sessionId,
+        itemId: started.shown.item.id,
+        itemInstanceId: shownId,
+        answer: screen.canonicalAnswer,
+        shownAt: new Date(Date.parse(answeredAt) - 2_000).toISOString(),
+        submittedAt: answeredAt,
+      },
+      { now: answeredAt },
+    );
+    if (isFormatRejected(scored)) throw new Error("a readable answer was rejected");
+    const beforeNewSession = issuedIds();
+    endPracticeSession(db, guardian.id, child.id, started.shown.sessionId);
+    choosePracticeLane(db, guardian.id, child.id, started.shown?.sessionId ?? "", "recommended");
+    const next = await runShownSession("new-session", {
+      flush,
+      openSession: () => Promise.resolve(startPracticeSession(db, guardian.id, child.id)),
+    });
+    const nextId = next.shown?.item.itemInstanceId;
+    if (!nextId || !next.shown) throw new Error("new session did not show an item");
+    expect(next.shown.sessionId).not.toBe(started.shown?.sessionId);
+    const nextRows = db
+      .prepare(`SELECT item_instance_id AS id FROM item_instances WHERE session_id = ?`)
+      .all(next.shown.sessionId) as Array<{ id: string }>;
+    expect(nextRows.map((row) => row.id)).toEqual([nextId]);
+    expect(beforeNewSession).toContain(shownId);
+    expect(beforeNewSession).not.toContain(nextId);
+    expect(issuedIds()).toEqual([...beforeNewSession, nextId]);
+
+    const client = readFileSync(path.join(process.cwd(), "components/practice-session.tsx"), "utf8");
+    expect(client).toContain('runShownSession("start"');
+    expect(client).toContain('runShownSession("reconnect"');
+    expect(client).toContain('runShownSession("new-session"');
+    expect(client).not.toMatch(/\/items/);
+    expect(client).not.toContain("prefetchBatch");
+  });
+
   it("reloads the live session when a queued try is permanently invalid", () => {
     const reload = vi.fn();
     const snapshot = {
       version: 1 as const,
       pending: [],
       blocked: [],
+      parked: [],
       dropped: [],
       synced: [],
       invalidAttemptKeys: ["live-waiting-key"],
