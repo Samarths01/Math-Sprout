@@ -780,6 +780,10 @@ export function issueForProgression(
     if (draw) picked = { step: requestedStep, reason: "exhausted_repeat", draw };
   }
   if (!picked) throw new DomainError("No problem is available.", 500);
+  // A switch is ordinary evidence. Only a repeat is issued ineligible.
+  if (picked.reason === "template_switch" || picked.reason === "exhausted_switch") {
+    picked = { ...picked, draw: { ...picked.draw, evidenceEligible: true } };
+  }
   try {
     return insertInstance(db, {
       childId: input.childId,

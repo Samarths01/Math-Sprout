@@ -4192,6 +4192,8 @@ describe("item templates and issuance", () => {
       now: new Date(start + 2000).toISOString(),
     });
     expect(switched.issueReason).toBe("template_switch");
+    expect(switched.evidenceEligible).toBe(true);
+    expect(switched.repeatForced).toBe(false);
     expect(switched.requestedSkillId).toBe(SKILLS.sub);
     expect(skillOfIssued(db, switched.templateId, switched.templateVersion)).not.toBe(SKILLS.sub);
     const stillFresh = (
