@@ -4,6 +4,7 @@ import {
   FOUR_BEAT_KEYS,
   integrityFlags,
   responseLatencyMs,
+  SUBMITTED_AT_SKEW_MS,
   type AttemptResult,
   type FourBeat,
   type IntegrityFlag,
@@ -137,6 +138,22 @@ function parseInstant(value: string, label: string): string {
     throw new DomainError(`${label} must be a valid time.`, 400);
   }
   return new Date(ms).toISOString();
+}
+
+/**
+ * `submittedAt` is the device Check time. It also picks the XP and streak day,
+ * the spam window, and evidence order. Reject a time ahead of the server, or
+ * earlier than this item's server `issued_at`. Counted latency is capped apart
+ * from this check.
+ */
+function rejectSubmittedAt(submittedAt: string, receivedAtMs: number, issuedAt?: string): void {
+  const submittedMs = Date.parse(submittedAt);
+  if (submittedMs > receivedAtMs + SUBMITTED_AT_SKEW_MS) {
+    throw new DomainError("Submitted time is ahead of the server.", 400);
+  }
+  if (issuedAt !== undefined && submittedMs < Date.parse(issuedAt)) {
+    throw new DomainError("Submitted time is earlier than this problem was issued.", 400);
+  }
 }
 
 export function parseSubmitAttempt(
@@ -497,6 +514,8 @@ export function submitAnswer(
   }
   const shownAt = parseInstant(input.shownAt, "Shown time");
   const submittedAt = parseInstant(input.submittedAt, "Submitted time");
+  const requestedNow = options?.now ? Date.parse(options.now) : Number.NaN;
+  const receivedAtMs = Number.isFinite(requestedNow) ? requestedNow : Date.parse(nowIso());
   const sessionId = input.sessionId.trim();
   const itemId = input.itemId.trim();
   getChild(db, guardianId, childId);
@@ -509,6 +528,7 @@ export function submitAnswer(
   const commit = db.transaction((): { result: AttemptResult | FormatRejected; log: AttemptLog | null } => {
     const existing = findAttempt(db, childId, idempotencyKey);
     if (existing) return { result: resultFromRow(db, existing, true), log: null };
+    rejectSubmittedAt(submittedAt, receivedAtMs);
 
     const child = getChild(db, guardianId, childId);
     const gate = practiceGate(child.consentStatus);
@@ -595,6 +615,7 @@ export function submitAnswer(
           instanceHasSavedAttempt(db, instance.itemInstanceId),
         );
       }
+      rejectSubmittedAt(submittedAt, receivedAtMs, instance.issuedAt);
       const skillRow = db
         .prepare(
           `SELECT skill_id FROM item_template_versions

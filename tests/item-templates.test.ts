@@ -7,7 +7,12 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { POST as submitAttemptRoute } from "@/app/api/children/[id]/attempts/route";
 import { POST as issueItemsRoute } from "@/app/api/children/[id]/sessions/[sessionId]/items/route";
 import Database from "better-sqlite3";
-import { ATTEMPT_LATENCY_CAP_MS, responseLatencyMs, type AttemptResult } from "@/lib/attempt-contract";
+import {
+  ATTEMPT_LATENCY_CAP_MS,
+  responseLatencyMs,
+  SUBMITTED_AT_SKEW_MS,
+  type AttemptResult,
+} from "@/lib/attempt-contract";
 import { currentAppBuildSha } from "@/lib/app-build";
 import { parseAnswer, rationalsEqual } from "@/lib/answer-parser";
 import { advancePracticeSlot, parseSubmitAttempt, startPracticeSession, submitAnswer, submitAttempt } from "@/lib/attempts";
@@ -232,6 +237,14 @@ function granted(db: Database.Database, email = "parent@example.com") {
 
 function shown(): string {
   return new Date(Date.parse(WHEN) - 2_000).toISOString();
+}
+
+/** A fixture clock can sit before the wall-clock issue time. Pull issued_at back so the device time is still on or after it. */
+function issueBeforeSubmit(db: Database.Database, itemInstanceId: string, submittedAt: string): void {
+  db.prepare(
+    `UPDATE item_instances SET issued_at = ?
+     WHERE item_instance_id = ? AND issued_at > ?`,
+  ).run(new Date(Date.parse(submittedAt) - 1_000).toISOString(), itemInstanceId, submittedAt);
 }
 
 function xpCount(db: Database.Database, attemptId?: string): number {
@@ -1680,6 +1693,7 @@ describe("item templates and issuance", () => {
        WHERE template_id = ? AND template_version = ?`,
     ).run(issued.templateId, version);
     const before = evidenceForSkill(db, child.id, session.item.skill);
+    issueBeforeSubmit(db, issued.itemInstanceId, WHEN);
     const result = submitAttempt(
       db,
       guardian.id,
@@ -1754,6 +1768,7 @@ describe("item templates and issuance", () => {
     ).toThrow(DomainError);
     expect(xpCount(db)).toBe(0);
 
+    issueBeforeSubmit(db, issued.itemInstanceId, WHEN);
     const scored = submitAttempt(
       db,
       guardian.id,
@@ -1797,6 +1812,7 @@ describe("item templates and issuance", () => {
     const { guardian, child, session } = granted(db);
     const issued = readItemInstance(db, session.item.itemInstanceId ?? "");
     if (!issued) throw new Error("session did not issue");
+    issueBeforeSubmit(db, issued.itemInstanceId, WHEN);
     const first = submitAttempt(
       db,
       guardian.id,
@@ -1843,6 +1859,7 @@ describe("item templates and issuance", () => {
     const db = tempDb();
     const { guardian, child, session } = granted(db);
     const skill = session.item.skill;
+    issueBeforeSubmit(db, session.item.itemInstanceId ?? "", WHEN);
     const blank = submitAttempt(
       db,
       guardian.id,
@@ -2717,6 +2734,7 @@ describe("item templates and issuance", () => {
       expect(seen.has(issued.itemInstanceId)).toBe(false);
       seen.add(issued.itemInstanceId);
       const when = new Date(Date.parse(WHEN) + index * 20_000).toISOString();
+      issueBeforeSubmit(db, issued.itemInstanceId, when);
       const scored = submitAttempt(
         db,
         guardian.id,
@@ -3173,6 +3191,7 @@ describe("item templates and issuance", () => {
       const screen = readItemInstance(db, screenId);
       if (!screen || screen.consumedAt) throw new Error("screen is not answerable");
       const answeredAt = new Date(Date.parse(WHEN) + round * 10_000 + 4_000).toISOString();
+      issueBeforeSubmit(db, screen.itemInstanceId, answeredAt);
       const scored = submitAnswer(
         db,
         guardian.id,
@@ -3271,6 +3290,7 @@ describe("item templates and issuance", () => {
       if (!parkedId) throw new Error("prefetch did not park an item");
       expect(openCount(), `round ${round} after park`).toBeLessThanOrEqual(OUTSTANDING_UNANSWERED_CAP);
       const answeredAt = new Date(Date.parse(WHEN) + round * 60_000 + 4_000).toISOString();
+      issueBeforeSubmit(db, screen.itemInstanceId, answeredAt);
       const moved = submitAnswer(
         db,
         guardian.id,
@@ -3289,6 +3309,7 @@ describe("item templates and issuance", () => {
       if (isFormatRejected(moved)) throw new Error("a readable answer was rejected");
       const older = readItemInstance(db, parkedId);
       if (!older || older.consumedAt) throw new Error("parked item was already used");
+      issueBeforeSubmit(db, parkedId, new Date(Date.parse(answeredAt) + 4_000).toISOString());
       expect(openCount(), `round ${round} after screen`).toBeLessThanOrEqual(OUTSTANDING_UNANSWERED_CAP);
 
       const queue = createAttemptQueue(memoryQueueStore());
@@ -3583,6 +3604,8 @@ describe("item templates and issuance", () => {
       shownAt: shown(),
       submittedAt: WHEN,
     };
+    const laterSubmittedAt = new Date(Date.parse(WHEN) + 1_000).toISOString();
+    issueBeforeSubmit(db, nextItem.itemInstanceId, laterSubmittedAt);
     const later: QueuedAttempt = {
       idempotencyKey: "next-session-try",
       childId: child.id,
@@ -3591,7 +3614,7 @@ describe("item templates and issuance", () => {
       itemInstanceId: nextItem.itemInstanceId,
       answer: nextItem.canonicalAnswer,
       shownAt: shown(),
-      submittedAt: new Date(Date.parse(WHEN) + 1_000).toISOString(),
+      submittedAt: laterSubmittedAt,
     };
     const queue = createAttemptQueue(memoryQueueStore());
     queue.enqueue(ended);
@@ -3990,7 +4013,12 @@ describe("item templates and issuance", () => {
     expect(storedTimes.submittedAt).toBe(saved.submittedAt);
     const queuedLatency = Date.parse(saved.submittedAt) - Date.parse(saved.shownAt);
     expect(Date.parse(storedTimes.submittedAt) - Date.parse(storedTimes.shownAt)).toBe(queuedLatency);
-    expect(readAttemptLog(db, firstSave.attempts[0]?.id ?? "").latencyMs).toBe(queuedLatency);
+    expect(queuedLatency).toBeLessThanOrEqual(ATTEMPT_LATENCY_CAP_MS);
+    expect(readAttemptLog(db, firstSave.attempts[0]?.id ?? "").latencyMs).toBe(
+      Math.min(queuedLatency, ATTEMPT_LATENCY_CAP_MS),
+    );
+    expect(Date.parse(storedTimes.submittedAt)).toBeGreaterThanOrEqual(Date.parse(screen.issuedAt));
+    expect(Date.parse(storedTimes.submittedAt)).toBeLessThanOrEqual(Date.now() + SUBMITTED_AT_SKEW_MS);
     expect(timedOut.parked[0]?.shownAt).toBe(saved.shownAt);
     expect(timedOut.parked[0]?.submittedAt).toBe(saved.submittedAt);
     const replayed = await queue.retryParkedOnce(async (attempt) => {
@@ -4039,10 +4067,10 @@ describe("item templates and issuance", () => {
         itemId: session.item.id,
         itemInstanceId: screen.itemInstanceId,
         answer: screen.canonicalAnswer,
-        shownAt: WHEN,
-        submittedAt: WHEN,
+        shownAt: screen.issuedAt,
+        submittedAt: screen.issuedAt,
       },
-      { now: WHEN },
+      { now: screen.issuedAt },
     );
     if (isFormatRejected(fast)) throw new Error("a readable answer was rejected");
     expect(fast.flags).toContain("too_fast");
@@ -4050,11 +4078,13 @@ describe("item templates and issuance", () => {
       .prepare(`SELECT shown_at AS shownAt, submitted_at AS submittedAt FROM attempts WHERE id = ?`)
       .get(fast.attemptId) as { shownAt: string; submittedAt: string };
     expect(readAttemptLog(db, fast.attemptId).latencyMs).toBe(0);
-    expect(fastRow.shownAt).toBe(WHEN);
-    expect(fastRow.submittedAt).toBe(WHEN);
+    expect(fastRow.shownAt).toBe(screen.issuedAt);
+    expect(fastRow.submittedAt).toBe(screen.issuedAt);
     const next = readItemInstance(db, fast.nextItem.itemInstanceId ?? "");
     if (!next) throw new Error("next item was not issued");
-    const longSubmitted = new Date(Date.parse(WHEN) + ATTEMPT_LATENCY_CAP_MS + 30 * 60_000).toISOString();
+    const longSubmitted = new Date(
+      Date.parse(next.issuedAt) + ATTEMPT_LATENCY_CAP_MS + 30 * 60_000,
+    ).toISOString();
     const capped = submitAnswer(
       db,
       guardian.id,
@@ -4065,7 +4095,7 @@ describe("item templates and issuance", () => {
         itemId: session.item.id,
         itemInstanceId: next.itemInstanceId,
         answer: next.canonicalAnswer,
-        shownAt: WHEN,
+        shownAt: next.issuedAt,
         submittedAt: longSubmitted,
       },
       { now: longSubmitted },
@@ -4075,6 +4105,73 @@ describe("item templates and issuance", () => {
     expect(readAttemptLog(db, capped.attemptId).latencyMs).toBe(ATTEMPT_LATENCY_CAP_MS);
     const summary = readParentSummary(db, guardian.id, child.id, longSubmitted);
     expect(summary.minutes).toBe(PRACTICE_SESSION_LENGTH);
+  });
+
+  it("rejects a submitted time ahead of the server or before the item was issued", () => {
+    expect(SUBMITTED_AT_SKEW_MS).toBe(2 * 60_000);
+    const db = tempDb();
+    const { guardian, child, session } = granted(db, "submitted-bounds@example.com");
+    const screen = readItemInstance(db, session.item.itemInstanceId ?? "");
+    if (!screen) throw new Error("session did not issue");
+    const receivedAt = new Date(Date.parse(screen.issuedAt) + 60_000).toISOString();
+    const ahead = new Date(Date.parse(receivedAt) + SUBMITTED_AT_SKEW_MS + 1_000).toISOString();
+    expect(() =>
+      submitAnswer(
+        db,
+        guardian.id,
+        child.id,
+        {
+          idempotencyKey: "submitted-ahead",
+          sessionId: session.sessionId,
+          itemId: session.item.id,
+          itemInstanceId: screen.itemInstanceId,
+          answer: screen.canonicalAnswer,
+          shownAt: screen.issuedAt,
+          submittedAt: ahead,
+        },
+        { now: receivedAt },
+      ),
+    ).toThrow(/ahead of the server/);
+    const early = new Date(Date.parse(screen.issuedAt) - 1_000).toISOString();
+    expect(() =>
+      submitAnswer(
+        db,
+        guardian.id,
+        child.id,
+        {
+          idempotencyKey: "submitted-before-issue",
+          sessionId: session.sessionId,
+          itemId: session.item.id,
+          itemInstanceId: screen.itemInstanceId,
+          answer: screen.canonicalAnswer,
+          shownAt: early,
+          submittedAt: early,
+        },
+        { now: receivedAt },
+      ),
+    ).toThrow(/earlier than this problem was issued/);
+    const onTime = submitAnswer(
+      db,
+      guardian.id,
+      child.id,
+      {
+        idempotencyKey: "submitted-on-time",
+        sessionId: session.sessionId,
+        itemId: session.item.id,
+        itemInstanceId: screen.itemInstanceId,
+        answer: screen.canonicalAnswer,
+        shownAt: screen.issuedAt,
+        submittedAt: new Date(Date.parse(receivedAt) + SUBMITTED_AT_SKEW_MS).toISOString(),
+      },
+      { now: receivedAt },
+    );
+    if (isFormatRejected(onTime)) throw new Error("a readable answer was rejected");
+    const stored = db
+      .prepare(`SELECT shown_at AS shownAt, submitted_at AS submittedAt FROM attempts WHERE id = ?`)
+      .get(onTime.attemptId) as { shownAt: string; submittedAt: string };
+    expect(stored.shownAt).toBe(screen.issuedAt);
+    expect(Date.parse(stored.submittedAt)).toBe(Date.parse(receivedAt) + SUBMITTED_AT_SKEW_MS);
+    expect(db.prepare(`SELECT COUNT(*) AS count FROM attempts`).get()).toEqual({ count: 1 });
   });
 
   it("saves a parked answer behind a newer attempt as a late replay", async () => {
