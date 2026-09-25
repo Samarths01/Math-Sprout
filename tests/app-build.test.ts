@@ -85,7 +85,7 @@ function tempDb() {
 function assertChildPayloadSealed(value: unknown) {
   const dumped = JSON.stringify(value);
   expect(dumped).not.toMatch(
-    /build_sha|policy_version|buildSha|policyVersion|provenance|evidence_eligible|evidenceEligible|computed_step|computedStep|assigned_step|assignedStep|parent_prior|parentPrior|template_version|templateVersion|canonical_answer|canonicalAnswer|form_mismatch|issue_reason|issueReason|exhausted_switch|exhausted_repeat|exhausted_stepup|switchRate|poolIssuance/,
+    /build_sha|policy_version|buildSha|policyVersion|provenance|evidence_eligible|evidenceEligible|computed_step|computedStep|assigned_step|assignedStep|parent_prior|parentPrior|template_version|templateVersion|canonical_answer|canonicalAnswer|form_mismatch|issue_reason|issueReason|template_switch|exhausted_switch|exhausted_repeat|exhausted_stepup|switchRate|poolIssuance/,
   );
   if (value && typeof value === "object" && "reason" in value) {
     const reason = (value as { reason?: unknown }).reason;
@@ -653,6 +653,7 @@ describe("app build tag", () => {
       "form_mismatch",
       "issue_reason",
       "issueReason",
+      "template_switch",
       "exhausted_switch",
       "exhausted_repeat",
       "exhausted_stepup",

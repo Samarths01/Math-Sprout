@@ -38,7 +38,7 @@ export type ExhaustionEventCount = {
   templateId: string;
   templateVersion: number;
   step: number;
-  reason: "exhausted_switch" | "exhausted_repeat";
+  reason: "template_switch" | "exhausted_switch" | "exhausted_repeat";
   count: number;
 };
 
@@ -62,7 +62,7 @@ export function exhaustionEventCounts(
        FROM item_instances i
        JOIN item_template_versions t
          ON t.template_id = i.template_id AND t.template_version = i.template_version
-       WHERE i.child_id = ? AND i.issue_reason IN ('exhausted_switch', 'exhausted_repeat')
+       WHERE i.child_id = ? AND i.issue_reason IN ('template_switch', 'exhausted_switch', 'exhausted_repeat')
        GROUP BY t.skill_id, i.template_id, i.template_version, i.difficulty_step, i.issue_reason
        ORDER BY t.skill_id ASC, i.template_id ASC, i.template_version ASC, i.difficulty_step ASC, i.issue_reason ASC`,
     )
@@ -75,9 +75,10 @@ export type PoolIssuanceCount = {
   templateVersion: number;
   step: number;
   issued: number;
+  templateSwitch: number;
   exhaustedSwitch: number;
   exhaustedRepeat: number;
-  /** `exhaustedSwitch / issued` for this pool. Zero when nothing was issued. */
+  /** `(templateSwitch + exhaustedSwitch) / issued`. Zero when nothing was issued. */
   switchRate: number;
 };
 
@@ -97,6 +98,7 @@ export function poolIssuanceCounts(db: Database.Database, childId: string): Pool
          i.template_version AS templateVersion,
          i.difficulty_step AS step,
          COUNT(*) AS issued,
+         SUM(CASE WHEN i.issue_reason = 'template_switch' THEN 1 ELSE 0 END) AS templateSwitch,
          SUM(CASE WHEN i.issue_reason = 'exhausted_switch' THEN 1 ELSE 0 END) AS exhaustedSwitch,
          SUM(CASE WHEN i.issue_reason = 'exhausted_repeat' THEN 1 ELSE 0 END) AS exhaustedRepeat
        FROM item_instances i
@@ -112,12 +114,13 @@ export function poolIssuanceCounts(db: Database.Database, childId: string): Pool
     templateVersion: number;
     step: number;
     issued: number;
+    templateSwitch: number;
     exhaustedSwitch: number;
     exhaustedRepeat: number;
   }>;
   return rows.map((row) => ({
     ...row,
-    switchRate: row.issued === 0 ? 0 : row.exhaustedSwitch / row.issued,
+    switchRate: row.issued === 0 ? 0 : (row.templateSwitch + row.exhaustedSwitch) / row.issued,
   }));
 }
 

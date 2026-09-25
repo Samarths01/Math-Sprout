@@ -142,17 +142,27 @@ const MAX_SKILL_SWITCH_RATE = 0.1;
 type SkillSwitchRate = {
   skill: string;
   issued: number;
+  templateSwitch: number;
   exhaustedSwitch: number;
   exhaustedRepeat: number;
   rate: number;
 };
 
-/** Switch rate is exhausted_switch divided by items requested for that skill. */
+/** Switch rate counts template_switch and exhausted_switch, over items requested for that skill. */
 function skillSwitchRates(db: Database.Database, childId: string): SkillSwitchRate[] {
-  const totals = new Map<string, { issued: number; exhaustedSwitch: number; exhaustedRepeat: number }>();
+  const totals = new Map<
+    string,
+    { issued: number; templateSwitch: number; exhaustedSwitch: number; exhaustedRepeat: number }
+  >();
   for (const pool of poolIssuanceCounts(db, childId)) {
-    const row = totals.get(pool.skill) ?? { issued: 0, exhaustedSwitch: 0, exhaustedRepeat: 0 };
+    const row = totals.get(pool.skill) ?? {
+      issued: 0,
+      templateSwitch: 0,
+      exhaustedSwitch: 0,
+      exhaustedRepeat: 0,
+    };
     row.issued += pool.issued;
+    row.templateSwitch += pool.templateSwitch;
     row.exhaustedSwitch += pool.exhaustedSwitch;
     row.exhaustedRepeat += pool.exhaustedRepeat;
     totals.set(pool.skill, row);
@@ -161,13 +171,14 @@ function skillSwitchRates(db: Database.Database, childId: string): SkillSwitchRa
     .map(([skill, row]) => ({
       skill,
       ...row,
-      rate: row.issued === 0 ? 0 : row.exhaustedSwitch / row.issued,
+      rate: row.issued === 0 ? 0 : (row.templateSwitch + row.exhaustedSwitch) / row.issued,
     }))
     .sort((left, right) => (left.skill < right.skill ? -1 : left.skill > right.skill ? 1 : 0));
 }
 
 function formatSkillSwitchRate(row: SkillSwitchRate): string {
-  return `${row.skill}: ${(row.rate * 100).toFixed(1)}% (${row.exhaustedSwitch}/${row.issued})`;
+  const switches = row.templateSwitch + row.exhaustedSwitch;
+  return `${row.skill}: ${(row.rate * 100).toFixed(1)}% (${switches}/${row.issued}; template ${row.templateSwitch}, exhausted ${row.exhaustedSwitch})`;
 }
 
 type SessionSwitchLog = {
@@ -232,10 +243,12 @@ function issueRotationWeek(
         expect(issued.difficultyStep, label).toBe(1);
         expect(issued.requestedSkillId, label).toBe(requested);
         const issuedSkill = skillOfIssued(db, issued.templateId, issued.templateVersion);
-        if (issuedSkill !== requested || issued.issueReason === "exhausted_switch") {
-          expect(issued.issueReason, `${label}: ${requested} -> ${issuedSkill}`).toBe("exhausted_switch");
+        const switched =
+          issued.issueReason === "template_switch" || issued.issueReason === "exhausted_switch";
+        if (issuedSkill !== requested || switched) {
+          expect(switched, `${label}: ${requested} -> ${issuedSkill} (${issued.issueReason})`).toBe(true);
           expect(issuedSkill, `${label}: ${requested}`).not.toBe(requested);
-          switches.push(`${requested} -> ${issuedSkill}`);
+          switches.push(`${requested} -> ${issuedSkill} (${issued.issueReason})`);
         }
       }
       sessions.push({ label, switches });
@@ -247,19 +260,20 @@ function issueRotationWeek(
 
 const MIN_DISTINCT_TEMPLATES = 3;
 
+/** Templates the child was issued in this run, grouped by the template's skill. */
 function distinctTemplatesBySkill(
   db: Database.Database,
   childId: string,
 ): Array<{ skill: string; templates: number }> {
   const rows = db
     .prepare(
-      `SELECT COALESCE(i.requested_skill_id, t.skill_id) AS skill,
+      `SELECT t.skill_id AS skill,
               COUNT(DISTINCT i.template_id) AS templates
        FROM item_instances i
        JOIN item_template_versions t
          ON t.template_id = i.template_id AND t.template_version = i.template_version
        WHERE i.child_id = ?
-       GROUP BY COALESCE(i.requested_skill_id, t.skill_id)
+       GROUP BY t.skill_id
        ORDER BY skill ASC`,
     )
     .all(childId) as Array<{ skill: string; templates: number }>;
@@ -290,6 +304,8 @@ type CohortResult = {
     skill: string;
     overall: number;
     overallText: string;
+    templateSwitch: number;
+    exhaustedSwitch: number;
     worst: number;
     worstChild: string;
   }>;
@@ -331,6 +347,7 @@ function runChildCohort(
   const skills = perChild[0]?.map((row) => row.skill) ?? [];
   const summary = skills.map((skill) => {
     let issued = 0;
+    let templateSwitch = 0;
     let exhaustedSwitch = 0;
     let worstRate = 0;
     let worstChild = "";
@@ -338,16 +355,20 @@ function runChildCohort(
       const row = perChild[index]?.find((item) => item.skill === skill);
       if (!row) continue;
       issued += row.issued;
+      templateSwitch += row.templateSwitch;
       exhaustedSwitch += row.exhaustedSwitch;
       if (row.rate > worstRate) {
         worstRate = row.rate;
         worstChild = `${input.childPrefix}-${String(index).padStart(2, "0")}`;
       }
     }
+    const switches = templateSwitch + exhaustedSwitch;
     return {
       skill,
-      overall: issued === 0 ? 0 : exhaustedSwitch / issued,
-      overallText: `${exhaustedSwitch}/${issued}`,
+      overall: issued === 0 ? 0 : switches / issued,
+      overallText: `${switches}/${issued}`,
+      templateSwitch,
+      exhaustedSwitch,
       worst: worstRate,
       worstChild,
     };
@@ -945,6 +966,8 @@ describe("item templates and issuance", () => {
   it("avoids a 7-day exact repeat and a back-to-back template", () => {
     const db = tempDb();
     const { child, session } = granted(db);
+    const opened = readItemInstance(db, session.item.itemInstanceId ?? "");
+    if (!opened) throw new Error("session did not issue");
     const seen = new Set<string>();
     let previous = "";
     for (let index = 0; index < 8; index += 1) {
@@ -953,7 +976,7 @@ describe("item templates and issuance", () => {
         sessionId: session.sessionId,
         skillId: SKILLS.add,
         idempotencyKey: `fresh-slot-${index}1`,
-        now: WHEN,
+        now: new Date(Date.parse(opened.issuedAt) + (index + 1) * 1000).toISOString(),
       });
       const key = `${issued.templateId}:${issued.operandKey}`;
       expect(seen.has(key)).toBe(false);
@@ -3452,7 +3475,7 @@ describe("item templates and issuance", () => {
     expect(switchHtml).not.toContain("mint-toast");
     expect(switchHtml).not.toMatch(/Level up|level-up|Switched|switched to/);
     expect(JSON.stringify(toPublicItem(switchedCatalog, switched))).not.toMatch(
-      /issue_reason|issueReason|exhausted_switch|exhausted_repeat|exhausted_stepup|switchRate|poolIssuance|evidence_eligible|evidenceEligible/,
+      /issue_reason|issueReason|template_switch|exhausted_switch|exhausted_repeat|exhausted_stepup|switchRate|poolIssuance|evidence_eligible|evidenceEligible/,
     );
 
     db.prepare(`UPDATE item_template_versions SET active = 0 WHERE template_id != 'frac-equiv-lowest'`).run();
@@ -3496,6 +3519,7 @@ describe("item templates and issuance", () => {
         skill: SKILLS.equiv,
         templateVersion: lowest.version,
         issued: pool.length + 1,
+        templateSwitch: 0,
         exhaustedSwitch: 0,
         exhaustedRepeat: 1,
         switchRate: 0,
@@ -3859,13 +3883,27 @@ describe("item templates and issuance", () => {
        WHERE skill_id = ? AND template_id != 'frac-equiv-mixed'`,
     ).run(SKILLS.equiv);
     const { child, session } = granted(db);
+    const opened = readItemInstance(db, session.item.itemInstanceId ?? "");
+    if (!opened) throw new Error("session did not issue");
+    let clock = Date.parse(opened.issuedAt);
     for (let index = 0; index < mixedPool.length; index += 1) {
+      if (index > 0) {
+        clock += 1000;
+        issueForProgression(db, {
+          childId: child.id,
+          sessionId: session.sessionId,
+          skillId: SKILLS.add,
+          idempotencyKey: `improper-left-gap-${index}`,
+          now: new Date(clock).toISOString(),
+        });
+      }
+      clock += 1000;
       const issued = issueForProgression(db, {
         childId: child.id,
         sessionId: session.sessionId,
         skillId: SKILLS.equiv,
         idempotencyKey: `improper-left-mixed-${index}`,
-        now: new Date(Date.parse(WHEN) + index * 1000).toISOString(),
+        now: new Date(clock).toISOString(),
       });
       expect(issued.templateId).toBe("frac-equiv-mixed");
       expect(issued.issueReason).toBe("normal");
@@ -3882,7 +3920,7 @@ describe("item templates and issuance", () => {
       sessionId: session.sessionId,
       skillId: SKILLS.equiv,
       idempotencyKey: "improper-left-one",
-      now: new Date(Date.parse(WHEN) + mixedPool.length * 1000).toISOString(),
+      now: new Date(clock + 1000).toISOString(),
     });
     expect(stillFresh.templateId).toBe("frac-equiv-improper");
     expect(stillFresh.issueReason).toBe("normal");
@@ -3892,9 +3930,9 @@ describe("item templates and issuance", () => {
       sessionId: session.sessionId,
       skillId: SKILLS.equiv,
       idempotencyKey: "improper-left-switch",
-      now: new Date(Date.parse(WHEN) + (mixedPool.length + 1) * 1000).toISOString(),
+      now: new Date(clock + 2000).toISOString(),
     });
-    expect(switched.issueReason).toBe("exhausted_switch");
+    expect(switched.issueReason).toBe("template_switch");
     expect(switched.templateId).not.toBe("frac-equiv-improper");
     expect(skillOfIssued(db, switched.templateId, switched.templateVersion)).toBe(SKILLS.addLike);
     expect(switched.difficultyStep).toBe(assignedStepForSkill(SKILLS.addLike));
@@ -3916,7 +3954,9 @@ describe("item templates and issuance", () => {
     );
     expect(route).toContain("publicItemForInstance");
     const rates = skillSwitchRates(db, child.id);
-    expect(rates.find((row) => row.skill === SKILLS.equiv)?.exhaustedSwitch).toBe(1);
+    expect(rates.find((row) => row.skill === SKILLS.equiv)?.templateSwitch).toBe(1);
+    expect(rates.find((row) => row.skill === SKILLS.equiv)?.exhaustedSwitch).toBe(0);
+    expect(rates.find((row) => row.skill === SKILLS.addLike)?.templateSwitch ?? 0).toBe(0);
     expect(rates.find((row) => row.skill === SKILLS.addLike)?.exhaustedSwitch ?? 0).toBe(0);
   });
 
@@ -3959,6 +3999,73 @@ describe("item templates and issuance", () => {
       )
       .all(child.id, SKILLS.sub) as Array<{ reason: string; count: number }>;
     expect(reasons).toEqual([{ reason: "normal", count: 8 }]);
+  });
+
+  it("picks the least recently seen template from the issued log", () => {
+    const db = tempDb();
+    const { child, session } = granted(db, "seen-log@example.com");
+    const opened = readItemInstance(db, session.item.itemInstanceId ?? "");
+    if (!opened) throw new Error("session did not issue");
+    const issued: ItemInstance[] = [];
+    for (let index = 0; index < 5; index += 1) {
+      issued.push(
+        issueForProgression(db, {
+          childId: child.id,
+          sessionId: session.sessionId,
+          skillId: SKILLS.sub,
+          idempotencyKey: `seen-log-${index}`,
+          now: new Date(Date.parse(opened.issuedAt) + (index + 1) * 1000).toISOString(),
+        }),
+      );
+    }
+    expect(issued.every((row) => row.issueReason === "normal")).toBe(true);
+    const firstFour = issued.slice(0, 4);
+    expect(new Set(firstFour.map((row) => row.templateId)).size).toBe(4);
+    const oldestFresh = firstFour
+      .filter((row) => row.templateId !== "sub-2d-v0")
+      .reduce((best, row) => (row.issuedAt < best.issuedAt ? row : best));
+    expect(issued[4]?.templateId).toBe(oldestFresh.templateId);
+  });
+
+  it("records template_switch when the only fresh template is the one just used", () => {
+    const inline = newestTemplate("sub-2d-inline");
+    if (!inline) throw new Error("missing subtract inline template");
+    expect(eligibleDraws(inline, 1).length).toBeGreaterThan(1);
+    const db = tempDb();
+    db.prepare(
+      `UPDATE item_template_versions SET active = 0
+       WHERE skill_id = ? AND template_id != 'sub-2d-inline'`,
+    ).run(SKILLS.sub);
+    const { child, session } = granted(db, "template-switch@example.com");
+    const opened = readItemInstance(db, session.item.itemInstanceId ?? "");
+    if (!opened) throw new Error("session did not issue");
+    const start = Date.parse(opened.issuedAt);
+    const first = issueForProgression(db, {
+      childId: child.id,
+      sessionId: session.sessionId,
+      skillId: SKILLS.sub,
+      idempotencyKey: "template-switch-first",
+      now: new Date(start + 1000).toISOString(),
+    });
+    expect(first.issueReason).toBe("normal");
+    expect(first.templateId).toBe("sub-2d-inline");
+    const switched = issueForProgression(db, {
+      childId: child.id,
+      sessionId: session.sessionId,
+      skillId: SKILLS.sub,
+      idempotencyKey: "template-switch-next",
+      now: new Date(start + 2000).toISOString(),
+    });
+    expect(switched.issueReason).toBe("template_switch");
+    expect(switched.requestedSkillId).toBe(SKILLS.sub);
+    expect(skillOfIssued(db, switched.templateId, switched.templateVersion)).not.toBe(SKILLS.sub);
+    const stillFresh = (
+      db.prepare(`SELECT COUNT(*) AS count FROM item_instances WHERE child_id = ? AND template_id = 'sub-2d-inline'`).get(child.id) as {
+        count: number;
+      }
+    ).count;
+    expect(stillFresh).toBe(1);
+    expect(stillFresh).toBeLessThan(eligibleDraws(inline, 1).length);
   });
 
   it("issues every fresh template before repeating one", () => {
@@ -4024,7 +4131,9 @@ describe("item templates and issuance", () => {
     expect(pools.reduce((sum, row) => sum + row.issued, 0)).toBe(rows.length);
     for (const pool of pools) {
       expect(pool.exhaustedRepeat).toBe(0);
-      expect(pool.switchRate).toBe(pool.issued === 0 ? 0 : pool.exhaustedSwitch / pool.issued);
+      expect(pool.switchRate).toBe(
+        pool.issued === 0 ? 0 : (pool.templateSwitch + pool.exhaustedSwitch) / pool.issued,
+      );
     }
     const home = getChildHome(db, guardian.id, child.id);
     const summary = readParentSummary(db, guardian.id, child.id, end);
@@ -4082,9 +4191,13 @@ describe("item templates and issuance", () => {
     assertCohortLimits(result);
     for (const rows of result.perChild) {
       const compare = rows.find((row) => row.skill === SKILLS.compare);
-      expect(compare).toMatchObject({ issued: 9, exhaustedSwitch: 0 });
+      expect(compare).toMatchObject({ issued: 9, templateSwitch: 0, exhaustedSwitch: 0 });
     }
-    expect(result.summary.filter((row) => row.overall !== 0 || row.worst !== 0)).toEqual([]);
+    expect(
+      result.summary.filter(
+        (row) => row.overall !== 0 || row.worst !== 0 || row.templateSwitch !== 0 || row.exhaustedSwitch !== 0,
+      ),
+    ).toEqual([]);
   }, 120_000);
 
   it("gives 20 children a heavy rotation week under the switch cap", () => {
@@ -4098,9 +4211,13 @@ describe("item templates and issuance", () => {
     assertCohortLimits(result);
     for (const rows of result.perChild) {
       const compare = rows.find((row) => row.skill === SKILLS.compare);
-      expect(compare).toMatchObject({ issued: 19, exhaustedSwitch: 0 });
+      expect(compare).toMatchObject({ issued: 19, templateSwitch: 0, exhaustedSwitch: 0 });
     }
-    expect(result.summary.filter((row) => row.overall !== 0 || row.worst !== 0)).toEqual([]);
+    expect(
+      result.summary.filter(
+        (row) => row.overall !== 0 || row.worst !== 0 || row.templateSwitch !== 0 || row.exhaustedSwitch !== 0,
+      ),
+    ).toEqual([]);
   }, 120_000);
 
   it("gives every pool a heavy week with zero exhausted repeats", () => {
@@ -4191,6 +4308,71 @@ describe("item templates and issuance", () => {
       .prepare(`SELECT requested_skill_id AS skill FROM item_instances WHERE item_instance_id = ?`)
       .get("old-instance") as { skill: string | null };
     expect(requested.skill).toBeNull();
+    db.close();
+  });
+
+  it("stores template_switch on a database created before that reason", () => {
+    const db = new Database(":memory:");
+    db.exec(`
+      CREATE TABLE item_instances (
+        item_instance_id TEXT PRIMARY KEY,
+        child_id TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        template_id TEXT NOT NULL,
+        template_version INTEGER NOT NULL,
+        difficulty_step INTEGER NOT NULL,
+        operands_json TEXT NOT NULL,
+        operand_key TEXT NOT NULL,
+        canonical_answer TEXT NOT NULL,
+        answer_line TEXT NOT NULL,
+        prompt TEXT NOT NULL,
+        presentation_json TEXT NOT NULL,
+        evidence_eligible INTEGER NOT NULL,
+        repeat_forced INTEGER NOT NULL,
+        issue_reason TEXT NOT NULL DEFAULT 'normal' CHECK (
+          issue_reason IN ('normal', 'exhausted_switch', 'exhausted_repeat')
+        ),
+        requested_skill_id TEXT,
+        issue_idempotency_key TEXT NOT NULL,
+        issued_at TEXT NOT NULL,
+        consumed_at TEXT,
+        consumed_by_attempt_key TEXT,
+        require_form TEXT,
+        compare_mode TEXT NOT NULL,
+        bug_hits_json TEXT NOT NULL,
+        default_focus TEXT,
+        why_it_works TEXT,
+        UNIQUE (session_id, issue_idempotency_key)
+      );
+      INSERT INTO item_instances (
+        item_instance_id, child_id, session_id, template_id, template_version, difficulty_step,
+        operands_json, operand_key, canonical_answer, answer_line, prompt, presentation_json,
+        evidence_eligible, repeat_forced, issue_reason, issue_idempotency_key, issued_at, compare_mode, bug_hits_json
+      ) VALUES (
+        'old-reason', 'child-1', 'session-1', 'add-2d-v0', 0, 1,
+        '{}', 'a=1', '2', '2', '1 + 1', '{}',
+        1, 0, 'normal', 'old-reason-key', '2026-06-01T00:00:00.000Z', 'exact', '[]'
+      );
+    `);
+    migrateItemTemplates(db);
+    db.prepare(
+      `INSERT INTO item_instances (
+         item_instance_id, child_id, session_id, template_id, template_version, difficulty_step,
+         operands_json, operand_key, canonical_answer, answer_line, prompt, presentation_json,
+         evidence_eligible, repeat_forced, issue_reason, issue_idempotency_key, issued_at, compare_mode, bug_hits_json
+       ) VALUES (
+         'new-reason', 'child-1', 'session-1', 'add-2d-inline', 1, 1,
+         '{}', 'a=2', '3', '3', '1 + 2', '{}',
+         1, 0, 'template_switch', 'new-reason-key', '2026-06-01T00:00:01.000Z', 'exact', '[]'
+       )`,
+    ).run();
+    const reasons = db
+      .prepare(`SELECT item_instance_id AS id, issue_reason AS reason FROM item_instances ORDER BY issued_at`)
+      .all() as Array<{ id: string; reason: string }>;
+    expect(reasons).toEqual([
+      { id: "old-reason", reason: "normal" },
+      { id: "new-reason", reason: "template_switch" },
+    ]);
     db.close();
   });
 });

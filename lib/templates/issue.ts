@@ -18,7 +18,7 @@ import type { AnswerKind } from "@/lib/unparseable";
 /** Progression stays rules-v0 and assigns difficulty step 1. */
 export const PROGRESSION_DIFFICULTY_STEP = 1 as const;
 
-export type IssueReason = "normal" | "exhausted_switch" | "exhausted_repeat";
+export type IssueReason = "normal" | "template_switch" | "exhausted_switch" | "exhausted_repeat";
 
 /**
  * The step this skill is assigned right now.
@@ -365,18 +365,24 @@ function issuedOperandKeys(
   return new Set(rows.map((row) => `${row.templateId}\0${row.operandKey}`));
 }
 
-function lastTemplateId(db: Database.Database, sessionId: string): string | null {
+/**
+ * Template on the child's latest issued instance. Seen time is `issued_at`
+ * on `item_instances`. There is no per-child template counter.
+ */
+function lastSeenTemplateId(db: Database.Database, childId: string): string | null {
   const row = db
     .prepare(
-      `SELECT template_id FROM item_instances
-       WHERE session_id = ?
-       ORDER BY rowid DESC
+      `SELECT template_id AS templateId
+       FROM item_instances
+       WHERE child_id = ?
+       ORDER BY issued_at DESC, rowid DESC
        LIMIT 1`,
     )
-    .get(sessionId) as { template_id: string } | undefined;
-  return row?.template_id ?? null;
+    .get(childId) as { templateId: string } | undefined;
+  return row?.templateId ?? null;
 }
 
+/** Oldest `issued_at` per template, from the same issued-instance log. */
 function lastIssuedAtByTemplate(
   db: Database.Database,
   childId: string,
@@ -494,38 +500,37 @@ function pickFreshTemplate<T extends { choice: ActiveTemplate }>(
   return shuffleWith(tied, rng)[0];
 }
 
-function drawFresh(
+type SkillDraw =
+  | { status: "drawn"; draw: FrozenDraw }
+  | { status: "template_switch" }
+  | { status: "exhausted" };
+
+/**
+ * (b) Least-recently-seen template that still has an unseen item, excluding
+ * the template the child just had. (c) First item of that template's shuffled
+ * unseen list. A template with no unseen item is omitted. That omission is
+ * not a switch. `template_switch` means the only template that still has an
+ * unseen item is the one just used. `exhausted` means none do.
+ */
+function drawAtSkill(
   db: Database.Database,
   input: {
     childId: string;
-    sessionId: string;
     templates: ActiveTemplate[];
     step: 1 | 2 | 3;
     rng: Rng;
     since: string;
   },
-): FrozenDraw | null {
-  const previous = lastTemplateId(db, input.sessionId);
-  const others = input.templates.filter((item) => item.template.templateId !== previous);
-  // When this skill has another template, the previous one is blocked. If those
-  // others have no fresh item, return null so the caller records exhausted_switch
-  // even though the blocked template still has items. A skill whose only template
-  // is that previous one keeps issuing it until its fresh items are gone.
-  const pool = others.length > 0 ? others : input.templates;
+): SkillDraw {
+  const justHad = lastSeenTemplateId(db, input.childId);
   const issued = issuedOperandKeys(
     db,
     input.childId,
-    pool.map((item) => item.template.templateId),
+    input.templates.map((item) => item.template.templateId),
     input.since,
   );
-  // Round-robin only among templates that still have an item this child has
-  // not seen. A template that has run out is skipped. That skip is neither
-  // exhausted_switch nor exhausted_repeat; those apply only when no template
-  // of this skill still has an unseen item. Equal template weight is
-  // least-recently-used: never-issued first, then oldest issued_at. The seeded
-  // shuffle breaks ties. The item is the first of that template's shuffled unseen list.
   const fresh: Array<{ choice: ActiveTemplate; unseen: ReturnType<typeof eligibleDraws> }> = [];
-  for (const choice of pool) {
+  for (const choice of input.templates) {
     const unseen = cachedEligibleDraws(choice.template, input.step).filter((draw) => {
       const key = operandKey(draw.operands, draw.canonicalAnswer);
       return !issued.has(`${choice.template.templateId}\0${key}`);
@@ -533,32 +538,38 @@ function drawFresh(
     if (unseen.length === 0) continue;
     fresh.push({ choice, unseen });
   }
-  if (fresh.length === 0) return null;
+  const candidates = fresh.filter((item) => item.choice.template.templateId !== justHad);
+  if (candidates.length === 0) {
+    return { status: fresh.length > 0 ? "template_switch" : "exhausted" };
+  }
   const lastAt = lastIssuedAtByTemplate(
     db,
     input.childId,
-    fresh.map((item) => item.choice.template.templateId),
+    candidates.map((item) => item.choice.template.templateId),
   );
-  const picked = pickFreshTemplate(fresh, lastAt, input.rng);
-  if (!picked) return null;
+  const picked = pickFreshTemplate(candidates, lastAt, input.rng);
+  if (!picked) return { status: "exhausted" };
   const draw = shuffleWith(picked.unseen, input.rng)[0];
-  if (!draw) return null;
+  if (!draw) return { status: "exhausted" };
   const choice = picked.choice;
   return {
-    templateId: choice.template.templateId,
-    templateVersion: choice.template.version,
-    evidenceEligible: choice.evidenceEligible,
-    operands: draw.operands,
-    canonicalAnswer: draw.canonicalAnswer,
-    answerLine: draw.answerLine,
-    prompt: draw.prompt,
-    presentation: presentationFor(choice.template, draw, input.step),
-    bugHits: draw.bugs,
-    repeatForced: false,
-    requireForm: choice.template.requireForm ?? null,
-    compareMode: choice.template.spec.compare,
-    defaultFocus: choice.template.defaultFocus ?? null,
-    whyItWorks: choice.template.whyItWorks ?? null,
+    status: "drawn",
+    draw: {
+      templateId: choice.template.templateId,
+      templateVersion: choice.template.version,
+      evidenceEligible: choice.evidenceEligible,
+      operands: draw.operands,
+      canonicalAnswer: draw.canonicalAnswer,
+      answerLine: draw.answerLine,
+      prompt: draw.prompt,
+      presentation: presentationFor(choice.template, draw, input.step),
+      bugHits: draw.bugs,
+      repeatForced: false,
+      requireForm: choice.template.requireForm ?? null,
+      compareMode: choice.template.spec.compare,
+      defaultFocus: choice.template.defaultFocus ?? null,
+      whyItWorks: choice.template.whyItWorks ?? null,
+    },
   };
 }
 
@@ -586,20 +597,19 @@ function skillsAfter(skillId: string): string[] {
   return [...skills.slice(start + 1), ...skills.slice(0, start)];
 }
 
-function tryFresh(
+function trySkill(
   db: Database.Database,
   input: {
     childId: string;
-    sessionId: string;
     skillId: string;
     step: 1 | 2 | 3;
     rng: Rng;
     since: string;
   },
-): FrozenDraw | null {
+): SkillDraw {
   const templates = loadActiveTemplates(db, input.skillId, input.step);
-  if (templates.length === 0) return null;
-  return drawFresh(db, { ...input, templates });
+  if (templates.length === 0) return { status: "exhausted" };
+  return drawAtSkill(db, { ...input, templates });
 }
 
 /** Last time each item of this skill and step was seen inside the no-repeat window. */
@@ -739,26 +749,37 @@ export function issueForProgression(
   const since = new Date(Date.parse(issuedAt) - REPEAT_WINDOW_MS).toISOString();
   const rng = seeded(hashSeed(`${input.idempotencyKey}:${input.childId}`));
   const requestedStep = assignedStepForSkill(input.skillId);
-  // Assigned step, then the next rotation skill at its assigned step, then the oldest item.
-  const choices: Array<{ skillId: string; step: 1 | 2 | 3; reason: IssueReason }> = [
-    { skillId: input.skillId, step: requestedStep, reason: "normal" },
-  ];
-  for (const skillId of skillsAfter(input.skillId)) {
-    choices.push({ skillId, step: assignedStepForSkill(skillId), reason: "exhausted_switch" });
-  }
+  // (a) Stay on the requested skill at its assigned step.
+  // (b) Least-recently-seen template with an unseen item, excluding the one just had.
+  // (c) Shuffled unseen item from that template.
+  // A switch happens only when (b) finds no template. The reason is template_switch
+  // when the only fresh template is the one just used, otherwise exhausted_switch.
+  // A repeat is the last resort.
   let picked: { step: 1 | 2 | 3; reason: IssueReason; draw: FrozenDraw } | null = null;
-  for (const choice of choices) {
-    const draw = tryFresh(db, {
-      childId: input.childId,
-      sessionId: input.sessionId,
-      skillId: choice.skillId,
-      step: choice.step,
-      rng,
-      since,
-    });
-    if (!draw) continue;
-    picked = { step: choice.step, reason: choice.reason, draw };
-    break;
+  const stayed = trySkill(db, {
+    childId: input.childId,
+    skillId: input.skillId,
+    step: requestedStep,
+    rng,
+    since,
+  });
+  if (stayed.status === "drawn") {
+    picked = { step: requestedStep, reason: "normal", draw: stayed.draw };
+  } else {
+    const reason: IssueReason = stayed.status === "template_switch" ? "template_switch" : "exhausted_switch";
+    for (const skillId of skillsAfter(input.skillId)) {
+      const step = assignedStepForSkill(skillId);
+      const next = trySkill(db, {
+        childId: input.childId,
+        skillId,
+        step,
+        rng,
+        since,
+      });
+      if (next.status !== "drawn") continue;
+      picked = { step, reason, draw: next.draw };
+      break;
+    }
   }
   if (!picked) {
     const draw = repeatOldest(db, input.childId, input.skillId, requestedStep, since);
