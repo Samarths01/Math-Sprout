@@ -4,20 +4,23 @@ import path from "node:path";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type Database from "better-sqlite3";
+import Database from "better-sqlite3";
 import type { AttemptResult } from "@/lib/attempt-contract";
 import { currentAppBuildSha } from "@/lib/app-build";
 import { parseAnswer, rationalsEqual } from "@/lib/answer-parser";
 import { parseSubmitAttempt, startPracticeSession, submitAnswer, submitAttempt } from "@/lib/attempts";
 import { AnswerBlank } from "@/components/answer-blank";
+import { PracticeProblem } from "@/components/practice-problem";
 import { PracticeFeedback } from "@/components/practice-feedback";
 import { openDatabase } from "@/lib/db";
-import { DomainError, createChild, createGuardian, setConsent } from "@/lib/domain";
+import { DomainError, createChild, createGuardian, getChildHome, setConsent } from "@/lib/domain";
 import { publicErrorBody } from "@/lib/http";
-import { SKILLS, TEMPLATE_VERSIONS, generatedTemplates } from "@/lib/templates/catalog";
+import { readParentSummary } from "@/lib/parent-summary";
+import { SKILLS, TEMPLATE_VERSIONS, generatedTemplates, newestTemplate } from "@/lib/templates/catalog";
 import {
   ambiguousBugs,
   canonicalAllowedForForm,
+  classifySlotDraws,
   drawAccepted,
   drawOnce,
   eligibleDraws,
@@ -27,15 +30,23 @@ import {
   validateTemplate,
 } from "@/lib/templates/engine";
 import { cueText } from "@/lib/templates/cues";
-import { exactRepeatRate, formatRejectRates, stepsPracticed } from "@/lib/templates/instruments";
+import {
+  exactRepeatRate,
+  exhaustionEventCounts,
+  formatRejectRates,
+  poolIssuanceCounts,
+  stepsPracticed,
+} from "@/lib/templates/instruments";
 import {
   ISSUE_BATCH_CAP,
   OUTSTANDING_UNANSWERED_CAP,
   PROGRESSION_DIFFICULTY_STEP,
+  assignedStepForSkill,
   focusForStoredAnswer,
   gradeStoredAnswer,
   issueForProgression,
   issueItemBatch,
+  publicItemForInstance,
   pickOldestExposure,
   presentIssuedItem,
   readItemInstance,
@@ -45,11 +56,18 @@ import {
   type ItemInstance,
 } from "@/lib/templates/issue";
 import { answerKindForTemplate, formatExampleFor } from "@/lib/templates/format-example";
+import {
+  MIN_PER_SKILL_STEP,
+  MIN_PER_TEMPLATE_STEP,
+  SKILL_POOL_GAPS,
+  TEMPLATE_POOL_GAPS,
+  enginePools,
+  skillStepPools,
+} from "@/lib/templates/pools";
 import { ITEM_CATALOG, itemAt } from "@/lib/item-catalog";
 import { answersMatch } from "@/lib/templates/rational";
-import { ISSUANCE_TEMPLATE_COLUMNS, issuanceTemplateSelect, seedTemplateVersions } from "@/lib/templates/store";
+import { ISSUANCE_TEMPLATE_COLUMNS, issuanceTemplateSelect, migrateItemTemplates, seedTemplateVersions } from "@/lib/templates/store";
 import type { TemplateVersion } from "@/lib/templates/types";
-import { feedbackFrames } from "@/lib/feedback-frame";
 import { evidenceForSkill, readSkillClientView } from "@/lib/learner-state";
 import {
   classifyAttemptFailure,
@@ -66,6 +84,7 @@ import {
   isFormatRejected,
   UNPARSEABLE_BEHAVIOR,
 } from "@/lib/unparseable";
+import { feedbackFrames } from "@/lib/feedback-frame";
 import {
   WRONG_FORM_LOCK_IN,
   WRONG_FORM_ONE_FOCUS,
@@ -114,6 +133,193 @@ function xpCount(db: Database.Database, attemptId?: string): number {
       })
     : (db.prepare(`SELECT COUNT(*) AS count FROM xp_events`).get() as { count: number });
   return row.count;
+}
+
+const MAX_SKILL_SWITCH_RATE = 0.1;
+
+type SkillSwitchRate = {
+  skill: string;
+  issued: number;
+  exhaustedSwitch: number;
+  exhaustedRepeat: number;
+  rate: number;
+};
+
+/** Switch rate is exhausted_switch divided by items requested for that skill. */
+function skillSwitchRates(db: Database.Database, childId: string): SkillSwitchRate[] {
+  const totals = new Map<string, { issued: number; exhaustedSwitch: number; exhaustedRepeat: number }>();
+  for (const pool of poolIssuanceCounts(db, childId)) {
+    const row = totals.get(pool.skill) ?? { issued: 0, exhaustedSwitch: 0, exhaustedRepeat: 0 };
+    row.issued += pool.issued;
+    row.exhaustedSwitch += pool.exhaustedSwitch;
+    row.exhaustedRepeat += pool.exhaustedRepeat;
+    totals.set(pool.skill, row);
+  }
+  return [...totals.entries()]
+    .map(([skill, row]) => ({
+      skill,
+      ...row,
+      rate: row.issued === 0 ? 0 : row.exhaustedSwitch / row.issued,
+    }))
+    .sort((left, right) => (left.skill < right.skill ? -1 : left.skill > right.skill ? 1 : 0));
+}
+
+function formatSkillSwitchRate(row: SkillSwitchRate): string {
+  return `${row.skill}: ${(row.rate * 100).toFixed(1)}% (${row.exhaustedSwitch}/${row.issued})`;
+}
+
+type SessionSwitchLog = {
+  label: string;
+  switches: string[];
+};
+
+function skillOfIssued(db: Database.Database, templateId: string, templateVersion: number): string {
+  const row = db
+    .prepare(
+      `SELECT skill_id AS skill FROM item_template_versions
+       WHERE template_id = ? AND template_version = ?`,
+    )
+    .get(templateId, templateVersion) as { skill: string } | undefined;
+  if (!row) throw new Error(`missing template ${templateId}@${templateVersion}`);
+  return row.skill;
+}
+
+function openRotationSession(
+  db: Database.Database,
+  childId: string,
+  sessionId: string,
+  startedAt: string,
+): void {
+  db.prepare(
+    `INSERT INTO practice_sessions (
+       id, child_id, status, item_index, slot_seq, started_at, practice_lane, phase, policy_version
+     ) VALUES (?, ?, 'active', 0, 0, ?, 'recommended', 'practicing', ?)`,
+  ).run(sessionId, childId, startedAt, POLICY_VERSION);
+}
+
+/** One catalog rotation. Each practice is its own 15-item session. */
+function issueRotationWeek(
+  db: Database.Database,
+  childId: string,
+  stampStart: number,
+  input: { sessionsPerDay: number; itemsPerSession: number; days: number; keyPrefix: string },
+): { stamp: number; sessions: SessionSwitchLog[] } {
+  let stamp = stampStart;
+  let slot = 0;
+  const sessions: SessionSwitchLog[] = [];
+  for (let day = 0; day < input.days; day += 1) {
+    for (let practice = 0; practice < input.sessionsPerDay; practice += 1) {
+      const label = `day ${day + 1} session ${practice + 1}`;
+      const sessionId = `${input.keyPrefix}-d${day}-s${practice}`;
+      stamp += 1000;
+      openRotationSession(db, childId, sessionId, new Date(stamp).toISOString());
+      const switches: string[] = [];
+      for (let item = 0; item < input.itemsPerSession; item += 1) {
+        stamp += 1000;
+        const requested = itemAt(slot).skill;
+        const issued = issueForProgression(db, {
+          childId,
+          sessionId,
+          skillId: requested,
+          idempotencyKey: `${sessionId}-n${item}`,
+          now: new Date(stamp).toISOString(),
+        });
+        slot += 1;
+        expect(issued.issueReason, label).not.toBe("exhausted_repeat");
+        expect(issued.repeatForced, label).toBe(false);
+        expect(issued.difficultyStep, label).toBe(1);
+        expect(issued.requestedSkillId, label).toBe(requested);
+        const issuedSkill = skillOfIssued(db, issued.templateId, issued.templateVersion);
+        if (issuedSkill !== requested || issued.issueReason === "exhausted_switch") {
+          expect(issued.issueReason, `${label}: ${requested} -> ${issuedSkill}`).toBe("exhausted_switch");
+          expect(issuedSkill, `${label}: ${requested}`).not.toBe(requested);
+          switches.push(`${requested} -> ${issuedSkill}`);
+        }
+      }
+      sessions.push({ label, switches });
+    }
+  }
+  expect(slot).toBe(input.sessionsPerDay * input.itemsPerSession * input.days);
+  return { stamp, sessions };
+}
+
+const MIN_DISTINCT_TEMPLATES = 3;
+
+function distinctTemplatesBySkill(
+  db: Database.Database,
+  childId: string,
+): Array<{ skill: string; templates: number }> {
+  const rows = db
+    .prepare(
+      `SELECT COALESCE(i.requested_skill_id, t.skill_id) AS skill,
+              COUNT(DISTINCT i.template_id) AS templates
+       FROM item_instances i
+       JOIN item_template_versions t
+         ON t.template_id = i.template_id AND t.template_version = i.template_version
+       WHERE i.child_id = ?
+       GROUP BY COALESCE(i.requested_skill_id, t.skill_id)
+       ORDER BY skill ASC`,
+    )
+    .all(childId) as Array<{ skill: string; templates: number }>;
+  const seen = new Map(rows.map((row) => [row.skill, row.templates]));
+  return ITEM_CATALOG.map((item) => ({ skill: item.skill, templates: seen.get(item.skill) ?? 0 }));
+}
+
+function assertDistinctTemplates(db: Database.Database, childId: string): Array<{ skill: string; templates: number }> {
+  const rows = distinctTemplatesBySkill(db, childId);
+  const short = rows.filter((row) => row.templates < MIN_DISTINCT_TEMPLATES);
+  expect(
+    short.map((row) => `${row.skill}: ${row.templates} distinct templates`),
+    "fewer than 3 distinct templates in the week",
+  ).toEqual([]);
+  return rows;
+}
+
+function assertAtMostOneSwitch(sessions: SessionSwitchLog[]): number {
+  const over = sessions.filter((session) => session.switches.length > 1);
+  expect(
+    over.map((session) => `${session.label}: ${session.switches.length} (${session.switches.join("; ")})`),
+    "more than 1 switch in a session",
+  ).toEqual([]);
+  return sessions.reduce((max, session) => Math.max(max, session.switches.length), 0);
+}
+
+function assertRotationLimits(db: Database.Database, childId: string): SkillSwitchRate[] {
+  const rows = db
+    .prepare(
+      `SELECT template_id AS templateId, operand_key AS operandKey, repeat_forced AS repeatForced
+       FROM item_instances WHERE child_id = ?`,
+    )
+    .all(childId) as Array<{ templateId: string; operandKey: string; repeatForced: number }>;
+  const keys = rows.map((row) => `${row.templateId}:${row.operandKey}`);
+  const duplicate = keys.find((key, index) => keys.indexOf(key) !== index);
+  expect(duplicate ?? "", "exact repeat").toBe("");
+  expect(new Set(keys).size).toBe(keys.length);
+  expect(rows.every((row) => row.repeatForced === 0)).toBe(true);
+  const rates = skillSwitchRates(db, childId);
+  const repeats = rates.filter((row) => row.exhaustedRepeat !== 0);
+  expect(
+    repeats.map((row) => `${row.skill}: ${row.exhaustedRepeat} exhausted_repeat`),
+    "exhausted_repeat",
+  ).toEqual([]);
+  const over = rates.filter((row) => row.rate > MAX_SKILL_SWITCH_RATE);
+  expect(over.map(formatSkillSwitchRate), "switch rate above 10%").toEqual([]);
+  return rates;
+}
+
+function repeatPoolReport(db: Database.Database, childId: string): string[] {
+  const rows = db
+    .prepare(
+      `SELECT t.skill_id AS skill, i.template_id AS templateId, i.difficulty_step AS step, COUNT(*) AS count
+       FROM item_instances i
+       JOIN item_template_versions t
+         ON t.template_id = i.template_id AND t.template_version = i.template_version
+       WHERE i.child_id = ? AND i.issue_reason = 'exhausted_repeat'
+       GROUP BY t.skill_id, i.template_id, i.difficulty_step
+       ORDER BY t.skill_id ASC, i.template_id ASC, i.difficulty_step ASC`,
+    )
+    .all(childId) as Array<{ skill: string; templateId: string; step: number; count: number }>;
+  return rows.map((row) => `${row.skill} / ${row.templateId} step ${row.step} × ${row.count}`);
 }
 
 function qeCount(db: Database.Database, attemptId: string): number {
@@ -184,6 +390,8 @@ function stubInstance(canonical: string, answerKind: "whole" | "fraction" = "who
     },
     evidenceEligible: true,
     repeatForced: false,
+    issueReason: "normal",
+    requestedSkillId: null,
     issueIdempotencyKey: "issue-key",
     issuedAt: WHEN,
     consumedAt: null,
@@ -338,7 +546,12 @@ describe("item templates and issuance", () => {
       expect(generated.length).toBeGreaterThanOrEqual(3);
       expect(generated.every((template) => template.version >= 1 && !template.spec.legacy)).toBe(true);
       expect(legacy.length).toBeLessThan(3);
-      expect(rows.length - legacy.length).toBe(generated.length);
+      const generatedIds = new Set(
+        rows
+          .filter((template) => template.version >= 1 && !template.spec.legacy)
+          .map((template) => template.templateId),
+      );
+      expect(generatedIds.size).toBe(generated.length);
     }
     expect(generatedTemplates(SKILLS.equiv).map((template) => template.templateId).sort()).toEqual(
       ["frac-equiv-improper", "frac-equiv-lowest", "frac-equiv-mixed", "frac-equiv-scale"].sort(),
@@ -476,6 +689,8 @@ describe("item templates and issuance", () => {
       },
       evidenceEligible: true,
       repeatForced: false,
+      issueReason: "normal",
+      requestedSkillId: null,
       issueIdempotencyKey: "issue-key",
       issuedAt: WHEN,
       consumedAt: null,
@@ -517,9 +732,44 @@ describe("item templates and issuance", () => {
     const forms = TEMPLATE_VERSIONS.filter((template) => template.requireForm);
     expect(forms.map((template) => `${template.templateId}:${template.requireForm}`).sort()).toEqual([
       "frac-equiv-improper:improper",
+      "frac-equiv-improper:improper",
+      "frac-equiv-improper:improper",
+      "frac-equiv-improper:improper",
       "frac-equiv-lowest:lowest_terms",
       "frac-equiv-mixed:mixed",
+      "frac-equiv-mixed:mixed",
+      "frac-equiv-mixed:mixed",
     ]);
+  });
+
+  it("keeps the step-1 denominator set when the improper whole part is capped", () => {
+    function improper(version: number) {
+      const template = TEMPLATE_VERSIONS.find(
+        (item) => item.templateId === "frac-equiv-improper" && item.version === version,
+      );
+      if (!template) throw new Error(`missing frac-equiv-improper@${version}`);
+      return template;
+    }
+    function denominators(version: number): number[] {
+      const values = new Set(
+        eligibleDraws(improper(version), 1).map((draw) => {
+          const slash = draw.canonicalAnswer.lastIndexOf("/");
+          return Number(draw.canonicalAnswer.slice(slash + 1));
+        }),
+      );
+      return [...values].sort((left, right) => left - right);
+    }
+    const version3 = improper(3);
+    const version4 = improper(4);
+    const step3 = version3.spec.steps.find((variant) => variant.assignedStep === 1);
+    const step4 = version4.spec.steps.find((variant) => variant.assignedStep === 1);
+    if (!step3 || !step4) throw new Error("missing step 1");
+    expect(step4.slots.d).toEqual(step3.slots.d);
+    expect(step4.slots.n).toEqual(step3.slots.n);
+    expect(step3.slots.whole).toEqual({ min: 1, max: 6 });
+    expect(step4.slots.whole).toEqual({ min: 1, max: 3 });
+    expect(denominators(4)).toEqual(denominators(3));
+    expect(denominators(3)).toEqual([5, 6]);
   });
 
   it("leaves parent prior null and does not let issuance read it", () => {
@@ -621,7 +871,7 @@ describe("item templates and issuance", () => {
       `UPDATE item_template_versions SET active = 0
        WHERE skill_id = ? AND template_id != 'add-2d-v0'`,
     ).run(SKILLS.add);
-    const { child, session } = granted(db);
+    const { guardian, child, session } = granted(db);
     const first = readItemInstance(db, session.item.itemInstanceId ?? "");
     if (!first) throw new Error("session did not issue");
     const second = issueForProgression(db, {
@@ -632,18 +882,41 @@ describe("item templates and issuance", () => {
       now: WHEN,
     });
     expect(first.templateId).toBe("add-2d-v0");
+    expect(first.issueReason).toBe("normal");
     expect(first.repeatForced).toBe(false);
-    expect(second.templateId).toBe("add-2d-v0");
-    expect(second.operandKey).toBe(first.operandKey);
-    expect(second.canonicalAnswer).toBe(first.canonicalAnswer);
-    expect(second.repeatForced).toBe(true);
+    expect(second.templateId).not.toBe("add-2d-v0");
+    expect(second.issueReason).toBe("exhausted_switch");
+    expect(second.evidenceEligible).toBe(true);
+    expect(second.difficultyStep).toBe(assignedStepForSkill(SKILLS.sub));
+    expect(second.repeatForced).toBe(false);
+    expect(second.operandKey).not.toBe(first.operandKey);
+    const scored = submitAnswer(
+      db,
+      guardian.id,
+      child.id,
+      {
+        idempotencyKey: "exhaust-switch-score",
+        sessionId: session.sessionId,
+        itemId: session.item.id,
+        itemInstanceId: second.itemInstanceId,
+        answer: second.canonicalAnswer,
+        shownAt: shown(),
+        submittedAt: WHEN,
+      },
+      { now: WHEN },
+    );
+    if (isFormatRejected(scored)) throw new Error("a readable answer was rejected");
+    expect(scored.correct).toBe(true);
+    const attempt = db
+      .prepare(`SELECT estimator_evidence AS evidence FROM attempts WHERE id = ?`)
+      .get(scored.attemptId) as { evidence: number };
+    expect(attempt.evidence).toBe(1);
     const rate = exactRepeatRate(db, child.id, WHEN);
-    expect(rate.forced).toBeGreaterThan(0);
-    expect(rate.rate).toBeGreaterThan(0);
+    expect(rate.forced).toBe(0);
   });
 
   it("never issues a whole answer from a mixed require_form template", () => {
-    const mixed = TEMPLATE_VERSIONS.find((template) => template.templateId === "frac-equiv-mixed");
+    const mixed = newestTemplate("frac-equiv-mixed");
     if (!mixed) throw new Error("missing mixed template");
     const variant = mixed.spec.steps.find((step) => step.assignedStep === 1);
     if (!variant) throw new Error("missing mixed step");
@@ -711,7 +984,6 @@ describe("item templates and issuance", () => {
     const { child, session } = granted(db);
     const seen = new Set<string>();
     let previousKey = "";
-    let oldestKey = "";
     for (let index = 0; index < filtered.length; index += 1) {
       const issued = issueForProgression(db, {
         childId: child.id,
@@ -726,23 +998,22 @@ describe("item templates and issuance", () => {
       expect(isWholeCanonical(issued.canonicalAnswer)).toBe(false);
       expect(seen.has(issued.operandKey)).toBe(false);
       if (previousKey) expect(issued.operandKey).not.toBe(previousKey);
-      if (index === 0) oldestKey = issued.operandKey;
       previousKey = issued.operandKey;
       seen.add(issued.operandKey);
     }
     expect(seen.size).toBe(filtered.length);
-    const forced = issueForProgression(db, {
+    const switched = issueForProgression(db, {
       childId: child.id,
       sessionId: session.sessionId,
       skillId: SKILLS.equiv,
-      idempotencyKey: "mixed-pool-forced",
+      idempotencyKey: "mixed-pool-switch",
       now: new Date(Date.parse(WHEN) + filtered.length * 1000).toISOString(),
     });
-    expect(forced.repeatForced).toBe(true);
-    expect(forced.operandKey).toBe(oldestKey);
-    expect(isWholeCanonical(forced.canonicalAnswer)).toBe(false);
-    const repeat = exactRepeatRate(db, child.id, forced.issuedAt);
-    expect(repeat.forced).toBeGreaterThan(0);
+    expect(switched.issueReason).toBe("exhausted_switch");
+    expect(switched.templateId).not.toBe("frac-equiv-mixed");
+    expect(switched.repeatForced).toBe(false);
+    const repeat = exactRepeatRate(db, child.id, switched.issuedAt);
+    expect(repeat.forced).toBe(0);
     for (let seed = 0; seed < 12; seed += 1) {
       const fresh = granted(db, `mixed-seed-${seed}@example.com`);
       const issued = issueForProgression(db, {
@@ -1657,7 +1928,9 @@ describe("item templates and issuance", () => {
 
   it("uses distinct rejected items as the format-reject headline", () => {
     const db = tempDb();
-    db.prepare(`UPDATE item_template_versions SET active = 0 WHERE template_version = 0`).run();
+    db.prepare(
+      `UPDATE item_template_versions SET active = 0 WHERE template_version = 0 OR template_version >= 2`,
+    ).run();
     const { guardian, child, session } = granted(db);
     const first = issueForProgression(db, {
       childId: child.id,
@@ -1941,7 +2214,6 @@ describe("item templates and issuance", () => {
     const { child, session } = granted(db);
     const seen = new Set<string>();
     let previousKey = "";
-    let oldestKey = "";
     for (let index = 0; index < filtered.length; index += 1) {
       const issued = issueForProgression(db, {
         childId: child.id,
@@ -1951,25 +2223,26 @@ describe("item templates and issuance", () => {
         now: new Date(Date.parse(WHEN) + index * 1000).toISOString(),
       });
       expect(issued.templateId).toBe("frac-equiv-lowest");
+      expect(issued.issueReason).toBe("normal");
       expect(issued.repeatForced).toBe(false);
       expect(isProperFraction(issued.canonicalAnswer)).toBe(true);
       expect(seen.has(issued.operandKey)).toBe(false);
       if (previousKey) expect(issued.operandKey).not.toBe(previousKey);
-      if (index === 0) oldestKey = issued.operandKey;
       previousKey = issued.operandKey;
       seen.add(issued.operandKey);
     }
     expect(seen.size).toBe(7);
-    const forced = issueForProgression(db, {
+    const switched = issueForProgression(db, {
       childId: child.id,
       sessionId: session.sessionId,
       skillId: SKILLS.equiv,
-      idempotencyKey: "lowest-pool-forced",
+      idempotencyKey: "lowest-pool-switch",
       now: new Date(Date.parse(WHEN) + filtered.length * 1000).toISOString(),
     });
-    expect(forced.repeatForced).toBe(true);
-    expect(forced.operandKey).toBe(oldestKey);
-    expect(isProperFraction(forced.canonicalAnswer)).toBe(true);
+    expect(switched.issueReason).toBe("exhausted_switch");
+    expect(switched.templateId).not.toBe("frac-equiv-lowest");
+    expect(switched.difficultyStep).toBe(1);
+    expect(switched.repeatForced).toBe(false);
   });
 
   it("accepts a reduced mixed number on lowest_terms", () => {
@@ -2948,6 +3221,841 @@ describe("item templates and issuance", () => {
     expect(replay.replayed).toBe(true);
     expect(replay.reason).toBeNull();
     expect(replay.correct).toBe(first.correct);
+  });
+
+  it("keeps every step-1 template and skill pool at the floor except the allowlist", () => {
+    const pools = enginePools();
+    expect(pools.length).toBeGreaterThan(0);
+    const stepOne = pools.filter((pool) => pool.step === 1);
+    expect(TEMPLATE_POOL_GAPS.every((gap) => gap.step === 1)).toBe(true);
+    const gaps = new Map(
+      TEMPLATE_POOL_GAPS.map((gap) => [`${gap.templateId}@${gap.version}#${gap.step}`, gap.reason]),
+    );
+    for (const pool of stepOne) {
+      const key = `${pool.templateId}@${pool.version}#${pool.step}`;
+      const reason = gaps.get(key);
+      if (reason) {
+        expect(reason.length, key).toBeGreaterThan(0);
+        expect(pool.size, key).toBeLessThan(MIN_PER_TEMPLATE_STEP);
+      } else {
+        expect(pool.size, `${pool.skill} ${key}`).toBeGreaterThanOrEqual(MIN_PER_TEMPLATE_STEP);
+      }
+    }
+    expect([...gaps.keys()].sort()).toEqual(
+      stepOne
+        .filter((pool) => pool.size < MIN_PER_TEMPLATE_STEP)
+        .map((pool) => `${pool.templateId}@${pool.version}#${pool.step}`)
+        .sort(),
+    );
+    const newestMixed = pools.find(
+      (pool) => pool.templateId === "frac-equiv-mixed" && pool.version === 3 && pool.step === 1,
+    );
+    const lowest = pools.find((pool) => pool.templateId === "frac-equiv-lowest" && pool.step === 1);
+    expect(newestMixed?.size).toBe(2);
+    expect(lowest?.size).toBe(7);
+    for (const template of TEMPLATE_VERSIONS) {
+      for (const variant of template.spec.steps) {
+        const audit = classifySlotDraws(template, variant.assignedStep);
+        expect(audit.matchesOtherStep, `${template.templateId}@${template.version}#${variant.assignedStep}`).toBe(0);
+        expect(audit.matchesNoStep, `${template.templateId}@${template.version}#${variant.assignedStep}`).toBe(0);
+      }
+    }
+
+    const skills = skillStepPools().filter((pool) => pool.step === 1);
+    expect(SKILL_POOL_GAPS.every((gap) => gap.step === 1)).toBe(true);
+    const skillGaps = new Map(SKILL_POOL_GAPS.map((gap) => [`${gap.skill}#${gap.step}`, gap.reason]));
+    for (const pool of skills) {
+      const key = `${pool.skill}#${pool.step}`;
+      const reason = skillGaps.get(key);
+      if (reason) {
+        expect(reason.length, key).toBeGreaterThan(0);
+        expect(pool.size, key).toBeLessThan(MIN_PER_SKILL_STEP);
+      } else {
+        expect(pool.size, key).toBeGreaterThanOrEqual(MIN_PER_SKILL_STEP);
+      }
+    }
+    expect([...skillGaps.keys()].sort()).toEqual(
+      skills
+        .filter((pool) => pool.size < MIN_PER_SKILL_STEP)
+        .map((pool) => `${pool.skill}#${pool.step}`)
+        .sort(),
+    );
+    expect(skills.find((pool) => pool.skill === SKILLS.compare && pool.step === 1)?.size).toBe(19);
+  });
+
+  it("switches skills before repeating, and never issues a harder step", () => {
+    const db = tempDb();
+    const { child, session } = granted(db);
+    db.prepare(
+      `UPDATE item_template_versions SET active = 0
+       WHERE skill_id = ? AND template_id != 'frac-equiv-lowest'`,
+    ).run(SKILLS.equiv);
+    const beforeProgress = db.prepare(`SELECT * FROM learner_progress WHERE child_id = ?`).all(child.id);
+    const beforeSkills = db.prepare(`SELECT * FROM learner_skill_state WHERE child_id = ?`).all(child.id);
+    expect(beforeProgress).toEqual([expect.objectContaining({ difficulty_step: 0 })]);
+    const lowest = newestTemplate("frac-equiv-lowest");
+    if (!lowest) throw new Error("missing lowest template");
+    const pool = eligibleDraws(lowest, 1);
+    expect(eligibleDraws(lowest, 2).length).toBeGreaterThan(0);
+    const filled: string[] = [];
+    for (let index = 0; index < pool.length; index += 1) {
+      const issued = issueForProgression(db, {
+        childId: child.id,
+        sessionId: session.sessionId,
+        skillId: SKILLS.equiv,
+        idempotencyKey: `order-fill-${index}`,
+        now: new Date(Date.parse(WHEN) + index * 1000).toISOString(),
+      });
+      expect(issued.issueReason).toBe("normal");
+      expect(issued.templateId).toBe("frac-equiv-lowest");
+      expect(issued.difficultyStep).toBe(1);
+      expect(issued.evidenceEligible).toBe(true);
+      filled.push(issued.operandKey);
+    }
+    const switched = issueForProgression(db, {
+      childId: child.id,
+      sessionId: session.sessionId,
+      skillId: SKILLS.equiv,
+      idempotencyKey: "order-switch",
+      now: new Date(Date.parse(WHEN) + pool.length * 1000).toISOString(),
+    });
+    expect(switched.issueReason).toBe("exhausted_switch");
+    expect(switched.templateId).not.toBe("frac-equiv-lowest");
+    expect(switched.difficultyStep).toBe(1);
+    expect(switched.evidenceEligible).toBe(true);
+    expect(switched.repeatForced).toBe(false);
+    const switchedSkill = db
+      .prepare(
+        `SELECT skill_id AS skill FROM item_template_versions
+         WHERE template_id = ? AND template_version = ?`,
+      )
+      .get(switched.templateId, switched.templateVersion) as { skill: string };
+    expect(switchedSkill.skill).not.toBe(SKILLS.equiv);
+    const switchedCatalog = ITEM_CATALOG.find((item) => item.skill === switchedSkill.skill);
+    if (!switchedCatalog) throw new Error("missing switched catalog item");
+    const switchHtml = renderToStaticMarkup(
+      createElement(PracticeProblem, { item: toPublicItem(switchedCatalog, switched) }),
+    );
+    expect(switchHtml).toContain(`data-testid="concept-name">${switchedSkill.skill}</span>`);
+    expect(switchHtml).toContain("Warm-up");
+    expect(switchHtml).not.toContain("mint-toast");
+    expect(switchHtml).not.toMatch(/Level up|level-up|Switched|switched to/);
+    expect(JSON.stringify(toPublicItem(switchedCatalog, switched))).not.toMatch(
+      /issue_reason|issueReason|exhausted_switch|exhausted_repeat|exhausted_stepup|switchRate|poolIssuance|evidence_eligible|evidenceEligible/,
+    );
+
+    db.prepare(`UPDATE item_template_versions SET active = 0 WHERE template_id != 'frac-equiv-lowest'`).run();
+    const repeated = issueForProgression(db, {
+      childId: child.id,
+      sessionId: session.sessionId,
+      skillId: SKILLS.equiv,
+      idempotencyKey: "order-repeat",
+      now: new Date(Date.parse(WHEN) + (pool.length + 1) * 1000).toISOString(),
+    });
+    expect(repeated.issueReason).toBe("exhausted_repeat");
+    expect(repeated.templateId).toBe("frac-equiv-lowest");
+    expect(repeated.templateVersion).toBe(lowest.version);
+    expect(repeated.difficultyStep).toBe(1);
+    expect(repeated.repeatForced).toBe(true);
+    expect(repeated.evidenceEligible).toBe(false);
+    expect(repeated.operandKey).toBe(filled[0]);
+    const harder = db
+      .prepare(`SELECT COUNT(*) AS count FROM item_instances WHERE child_id = ? AND difficulty_step > 1`)
+      .get(child.id) as { count: number };
+    expect(harder.count).toBe(0);
+    expect(assignedStepForSkill(SKILLS.equiv)).toBe(PROGRESSION_DIFFICULTY_STEP);
+    expect(db.prepare(`SELECT * FROM learner_progress WHERE child_id = ?`).all(child.id)).toEqual(beforeProgress);
+    expect(db.prepare(`SELECT * FROM learner_skill_state WHERE child_id = ?`).all(child.id)).toEqual(beforeSkills);
+    const counts = exhaustionEventCounts(db, child.id);
+    expect(counts.filter((row) => row.reason === "exhausted_switch")).toHaveLength(1);
+    expect(counts.filter((row) => row.reason === "exhausted_repeat")).toEqual([
+      expect.objectContaining({
+        skill: SKILLS.equiv,
+        templateId: "frac-equiv-lowest",
+        templateVersion: lowest.version,
+        step: 1,
+        count: 1,
+      }),
+    ]);
+    const lowestPool = poolIssuanceCounts(db, child.id).find(
+      (row) => row.templateId === "frac-equiv-lowest" && row.step === 1,
+    );
+    expect(lowestPool).toEqual(
+      expect.objectContaining({
+        skill: SKILLS.equiv,
+        templateVersion: lowest.version,
+        issued: pool.length + 1,
+        exhaustedSwitch: 0,
+        exhaustedRepeat: 1,
+        switchRate: 0,
+      }),
+    );
+    const switchedPool = poolIssuanceCounts(db, child.id).find(
+      (row) => row.templateId === switched.templateId && row.templateVersion === switched.templateVersion,
+    );
+    expect(switchedPool?.exhaustedSwitch).toBe(1);
+    expect(switchedPool?.switchRate).toBe(1 / (switchedPool?.issued ?? 1));
+    expect(repeatPoolReport(db, child.id)).toEqual([
+      `${SKILLS.equiv} / frac-equiv-lowest step 1 × 1`,
+    ]);
+  });
+
+  it("records no evidence when a repeat is answered correctly", () => {
+    const db = tempDb();
+    db.prepare(`UPDATE item_template_versions SET active = 0 WHERE template_id != 'sub-2d-v0'`).run();
+    const { guardian, child, session } = granted(db);
+    const original = readItemInstance(db, session.item.itemInstanceId ?? "");
+    if (!original) throw new Error("session did not issue");
+    expect(original.issueReason).toBe("exhausted_switch");
+    expect(original.templateId).toBe("sub-2d-v0");
+    expect(original.evidenceEligible).toBe(true);
+    const originalAt = new Date(Date.parse(original.issuedAt) + 3_000).toISOString();
+    const originalScore = submitAnswer(
+      db,
+      guardian.id,
+      child.id,
+      {
+        idempotencyKey: "repeat-original-score",
+        sessionId: session.sessionId,
+        itemId: session.item.id,
+        itemInstanceId: original.itemInstanceId,
+        answer: original.canonicalAnswer,
+        shownAt: new Date(Date.parse(originalAt) - 2_000).toISOString(),
+        submittedAt: originalAt,
+      },
+      { now: originalAt },
+    );
+    if (isFormatRejected(originalScore)) throw new Error("a readable answer was rejected");
+    expect(originalScore.correct).toBe(true);
+    const originalAttempt = db
+      .prepare(`SELECT estimator_evidence AS evidence FROM attempts WHERE id = ?`)
+      .get(originalScore.attemptId) as { evidence: number };
+    expect(originalAttempt.evidence).toBe(1);
+    const evidenceAfterOriginal = evidenceForSkill(db, child.id, SKILLS.sub);
+    expect(evidenceAfterOriginal).toHaveLength(1);
+    const skillStateAfterOriginal = db
+      .prepare(`SELECT * FROM learner_skill_state WHERE child_id = ? ORDER BY skill`)
+      .all(child.id);
+
+    const repeated = issueForProgression(db, {
+      childId: child.id,
+      sessionId: session.sessionId,
+      skillId: SKILLS.sub,
+      idempotencyKey: "repeat-no-evidence",
+      now: new Date(Date.parse(originalAt) + 1_000).toISOString(),
+    });
+    expect(repeated.issueReason).toBe("exhausted_repeat");
+    expect(repeated.itemInstanceId).not.toBe(original.itemInstanceId);
+    expect(repeated.operandKey).toBe(original.operandKey);
+    expect(repeated.difficultyStep).toBe(1);
+    const issuedFlag = db
+      .prepare(`SELECT evidence_eligible AS eligible FROM item_instances WHERE item_instance_id = ?`)
+      .get(repeated.itemInstanceId) as { eligible: number };
+    expect(issuedFlag.eligible).toBe(0);
+    const originalFlag = db
+      .prepare(`SELECT evidence_eligible AS eligible FROM item_instances WHERE item_instance_id = ?`)
+      .get(original.itemInstanceId) as { eligible: number };
+    expect(originalFlag.eligible).toBe(1);
+    db.prepare(`UPDATE item_template_versions SET active = 1 WHERE template_id != 'sub-2d-v0'`).run();
+
+    const repeatAt = new Date(Date.parse(repeated.issuedAt) + 3_000).toISOString();
+    const scored = submitAnswer(
+      db,
+      guardian.id,
+      child.id,
+      {
+        idempotencyKey: "repeat-no-evidence-score",
+        sessionId: session.sessionId,
+        itemId: session.item.id,
+        itemInstanceId: repeated.itemInstanceId,
+        answer: repeated.canonicalAnswer,
+        shownAt: new Date(Date.parse(repeatAt) - 2_000).toISOString(),
+        submittedAt: repeatAt,
+      },
+      { now: repeatAt },
+    );
+    if (isFormatRejected(scored)) throw new Error("a readable answer was rejected");
+    expect(scored.correct).toBe(true);
+    const repeatAttempt = db
+      .prepare(`SELECT estimator_evidence AS evidence FROM attempts WHERE id = ?`)
+      .get(scored.attemptId) as { evidence: number };
+    expect(repeatAttempt.evidence).toBe(0);
+    expect(evidenceForSkill(db, child.id, SKILLS.sub)).toEqual(evidenceAfterOriginal);
+    expect(
+      db.prepare(`SELECT * FROM learner_skill_state WHERE child_id = ? ORDER BY skill`).all(child.id),
+    ).toEqual(skillStateAfterOriginal);
+    expect(
+      (db.prepare(`SELECT estimator_evidence AS evidence FROM attempts WHERE id = ?`).get(originalScore.attemptId) as {
+        evidence: number;
+      }).evidence,
+    ).toBe(1);
+    const catalog = ITEM_CATALOG.find((item) => item.skill === SKILLS.sub);
+    if (!catalog) throw new Error("missing subtract catalog item");
+    const payload = JSON.stringify(toPublicItem(catalog, repeated));
+    const sealed = [payload, JSON.stringify(scored), JSON.stringify(scored.clientView)].join("\n");
+    expect(sealed).not.toMatch(/evidence_eligible|evidenceEligible/);
+    const home = getChildHome(db, guardian.id, child.id);
+    const summary = readParentSummary(db, guardian.id, child.id, repeatAt);
+    const surfaces = JSON.stringify({ home, summary });
+    expect(surfaces).not.toMatch(/switchRate|poolIssuance|exhaustedSwitch|evidence_eligible|evidenceEligible/);
+  });
+
+  it("keeps the saved band when a correct repeat follows a miss", () => {
+    const db = tempDb();
+    db.prepare(`UPDATE item_template_versions SET active = 0 WHERE template_id != 'sub-2d-v0'`).run();
+    const { guardian, child, session } = granted(db, "repeat-band@example.com");
+    const original = readItemInstance(db, session.item.itemInstanceId ?? "");
+    if (!original) throw new Error("session did not issue");
+    expect(original.evidenceEligible).toBe(true);
+    expect(original.templateId).toBe("sub-2d-v0");
+    const missAt = new Date(Date.parse(original.issuedAt) + 3_000).toISOString();
+    const wrong = original.canonicalAnswer === "0" ? "1" : "0";
+    const missed = submitAnswer(
+      db,
+      guardian.id,
+      child.id,
+      {
+        idempotencyKey: "repeat-band-miss",
+        sessionId: session.sessionId,
+        itemId: session.item.id,
+        itemInstanceId: original.itemInstanceId,
+        answer: wrong,
+        shownAt: new Date(Date.parse(missAt) - 2_000).toISOString(),
+        submittedAt: missAt,
+      },
+      { now: missAt },
+    );
+    if (isFormatRejected(missed)) throw new Error("a readable answer was rejected");
+    expect(missed.correct).toBe(false);
+    expect(missed.clientView.bandLabel).toBe("Still learning");
+    const saved = readSkillClientView(db, child.id, SKILLS.sub);
+    expect(saved?.bandLabel).toBe("Still learning");
+    const storedAfterMiss = db
+      .prepare(`SELECT * FROM learner_skill_state WHERE child_id = ? AND skill = ?`)
+      .get(child.id, SKILLS.sub);
+
+    const repeated = issueForProgression(db, {
+      childId: child.id,
+      sessionId: session.sessionId,
+      skillId: SKILLS.sub,
+      idempotencyKey: "repeat-band-issue",
+      now: new Date(Date.parse(missAt) + 1_000).toISOString(),
+    });
+    expect(repeated.issueReason).toBe("exhausted_repeat");
+    expect(repeated.evidenceEligible).toBe(false);
+    expect(repeated.requestedSkillId).toBe(SKILLS.sub);
+    expect(repeated.difficultyStep).toBe(1);
+    expect(repeated.presentation.stepWord).toBe("Warm-up");
+    const progressAfterMiss = db
+      .prepare(`SELECT difficulty_step AS step FROM learner_progress WHERE child_id = ?`)
+      .get(child.id);
+    const boundaryAfterMiss = (
+      db.prepare(`SELECT COUNT(*) AS count FROM boundary_events WHERE child_id = ?`).get(child.id) as {
+        count: number;
+      }
+    ).count;
+    db.prepare(`UPDATE item_template_versions SET active = 1 WHERE template_id != 'sub-2d-v0'`).run();
+    const repeatAt = new Date(Date.parse(repeated.issuedAt) + 3_000).toISOString();
+    const scored = submitAnswer(
+      db,
+      guardian.id,
+      child.id,
+      {
+        idempotencyKey: "repeat-band-correct",
+        sessionId: session.sessionId,
+        itemId: session.item.id,
+        itemInstanceId: repeated.itemInstanceId,
+        answer: repeated.canonicalAnswer,
+        shownAt: new Date(Date.parse(repeatAt) - 2_000).toISOString(),
+        submittedAt: repeatAt,
+      },
+      { now: repeatAt },
+    );
+    if (isFormatRejected(scored)) throw new Error("a readable answer was rejected");
+    expect(scored.correct).toBe(true);
+    expect(scored.clientView.bandLabel).toBe("Still learning");
+    expect(scored.celebrationTier).toBe("full");
+    const storedView = db
+      .prepare(`SELECT client_view_json AS view FROM attempts WHERE id = ?`)
+      .get(scored.attemptId) as { view: string };
+    expect(JSON.parse(storedView.view).bandLabel).toBe("Still learning");
+    expect(readSkillClientView(db, child.id, SKILLS.sub)).toEqual(saved);
+    expect(
+      db.prepare(`SELECT * FROM learner_skill_state WHERE child_id = ? AND skill = ?`).get(child.id, SKILLS.sub),
+    ).toEqual(storedAfterMiss);
+    const kinds = (
+      db.prepare(`SELECT kind FROM qualifying_events WHERE attempt_id = ? ORDER BY rowid`).all(scored.attemptId) as Array<{
+        kind: string;
+      }>
+    ).map((row) => row.kind);
+    expect(kinds).toContain("HonestAttempt");
+    expect(kinds).not.toContain("ConceptProgressTick");
+    expect(kinds).not.toContain("MasteryBandTransition");
+    expect(kinds).not.toContain("BadgeMilestone");
+    expect(scored.xpAmount).toBeGreaterThan(0);
+    expect(scored.fuel?.credit).toBeGreaterThan(0);
+    expect(
+      db.prepare(`SELECT difficulty_step AS step FROM learner_progress WHERE child_id = ?`).get(child.id),
+    ).toEqual(progressAfterMiss);
+    expect(
+      (db.prepare(`SELECT COUNT(*) AS count FROM boundary_events WHERE child_id = ?`).get(child.id) as {
+        count: number;
+      }).count,
+    ).toBe(boundaryAfterMiss);
+    const attemptStep = db
+      .prepare(`SELECT difficulty_step AS step FROM attempts WHERE id = ?`)
+      .get(scored.attemptId) as { step: number };
+    expect(attemptStep.step).toBe(1);
+  });
+
+  it("drops a replay of a repeat without recording evidence", () => {
+    const db = tempDb();
+    db.prepare(`UPDATE item_template_versions SET active = 0 WHERE template_id != 'sub-2d-v0'`).run();
+    const { guardian, child, session } = granted(db);
+    const first = readItemInstance(db, session.item.itemInstanceId ?? "");
+    if (!first) throw new Error("session did not issue");
+    expect(first.issueReason).toBe("exhausted_switch");
+    expect(first.templateId).toBe("sub-2d-v0");
+    expect(first.difficultyStep).toBe(1);
+    const repeated = issueForProgression(db, {
+      childId: child.id,
+      sessionId: session.sessionId,
+      skillId: SKILLS.sub,
+      idempotencyKey: "repeat-evidence",
+      now: new Date(Date.parse(first.issuedAt) + 1000).toISOString(),
+    });
+    expect(repeated.issueReason).toBe("exhausted_repeat");
+    expect(repeated.difficultyStep).toBe(1);
+    expect(repeated.operandKey).toBe(first.operandKey);
+    expect(repeated.itemInstanceId).not.toBe(first.itemInstanceId);
+    expect(repeated.evidenceEligible).toBe(false);
+    expect(assignedStepForSkill(SKILLS.sub)).toBe(PROGRESSION_DIFFICULTY_STEP);
+    const submittedAt = new Date(Date.parse(repeated.issuedAt) + 3_000).toISOString();
+    const scored = submitAnswer(
+      db,
+      guardian.id,
+      child.id,
+      {
+        idempotencyKey: "repeat-evidence-score",
+        sessionId: session.sessionId,
+        itemId: session.item.id,
+        itemInstanceId: repeated.itemInstanceId,
+        answer: repeated.canonicalAnswer,
+        shownAt: new Date(Date.parse(submittedAt) - 2_000).toISOString(),
+        submittedAt,
+      },
+      { now: submittedAt },
+    );
+    if (isFormatRejected(scored)) throw new Error("a readable answer was rejected");
+    expect(scored.correct).toBe(true);
+    expect(scored.replayed).toBe(false);
+    const attempt = db
+      .prepare(`SELECT estimator_evidence AS evidence, difficulty_step AS step FROM attempts WHERE id = ?`)
+      .get(scored.attemptId) as { evidence: number; step: number };
+    expect(attempt).toEqual({ evidence: 0, step: 1 });
+    expect(evidenceForSkill(db, child.id, SKILLS.sub)).toHaveLength(0);
+    const replay = submitAnswer(
+      db,
+      guardian.id,
+      child.id,
+      {
+        idempotencyKey: "repeat-evidence-score",
+        sessionId: session.sessionId,
+        itemId: session.item.id,
+        itemInstanceId: repeated.itemInstanceId,
+        answer: repeated.canonicalAnswer,
+        shownAt: new Date(Date.parse(submittedAt) - 2_000).toISOString(),
+        submittedAt,
+      },
+      { now: submittedAt },
+    );
+    if (isFormatRejected(replay)) throw new Error("a readable answer was rejected");
+    expect(replay.replayed).toBe(true);
+    expect(evidenceForSkill(db, child.id, SKILLS.sub)).toHaveLength(0);
+    expect((db.prepare(`SELECT COUNT(*) AS count FROM attempts WHERE child_id = ?`).get(child.id) as { count: number }).count).toBe(1);
+    expect(
+      (db.prepare(`SELECT difficulty_step AS step FROM learner_progress WHERE child_id = ?`).get(child.id) as {
+        step: number;
+      }).step,
+    ).toBe(0);
+    expect(exhaustionEventCounts(db, child.id).some((row) => row.reason === "exhausted_repeat")).toBe(true);
+  });
+
+  it("switches to the next rotation skill and skips an exhausted one", () => {
+    const db = tempDb();
+    const { child, session } = granted(db, "next-skill@example.com");
+    db.prepare(
+      `UPDATE item_template_versions SET active = 0
+       WHERE skill_id = ? AND template_id != 'frac-equiv-lowest'`,
+    ).run(SKILLS.equiv);
+    db.prepare(
+      `UPDATE item_template_versions SET active = 0
+       WHERE skill_id = ? AND template_id != 'frac-add-like-v0'`,
+    ).run(SKILLS.addLike);
+    const lowest = newestTemplate("frac-equiv-lowest");
+    if (!lowest) throw new Error("missing lowest template");
+    const pool = eligibleDraws(lowest, 1);
+    expect(pool.length).toBeGreaterThan(0);
+    for (let index = 0; index < pool.length; index += 1) {
+      const issued = issueForProgression(db, {
+        childId: child.id,
+        sessionId: session.sessionId,
+        skillId: SKILLS.equiv,
+        idempotencyKey: `next-fill-${index}`,
+        now: new Date(Date.parse(WHEN) + index * 1000).toISOString(),
+      });
+      expect(issued.issueReason).toBe("normal");
+      expect(issued.templateId).toBe("frac-equiv-lowest");
+    }
+    const next = issueForProgression(db, {
+      childId: child.id,
+      sessionId: session.sessionId,
+      skillId: SKILLS.equiv,
+      idempotencyKey: "next-rotation-slot",
+      now: new Date(Date.parse(WHEN) + pool.length * 1000).toISOString(),
+    });
+    expect(next.issueReason).toBe("exhausted_switch");
+    expect(next.difficultyStep).toBe(assignedStepForSkill(SKILLS.addLike));
+    expect(skillOfIssued(db, next.templateId, next.templateVersion)).toBe(SKILLS.addLike);
+    expect(next.templateId).toBe("frac-add-like-v0");
+
+    const skipped = issueForProgression(db, {
+      childId: child.id,
+      sessionId: session.sessionId,
+      skillId: SKILLS.equiv,
+      idempotencyKey: "next-rotation-skip",
+      now: new Date(Date.parse(WHEN) + (pool.length + 1) * 1000).toISOString(),
+    });
+    expect(skipped.issueReason).toBe("exhausted_switch");
+    expect(skipped.difficultyStep).toBe(assignedStepForSkill(SKILLS.addUnlike));
+    const skippedSkill = skillOfIssued(db, skipped.templateId, skipped.templateVersion);
+    expect(skippedSkill).toBe(SKILLS.addUnlike);
+    expect(skippedSkill).not.toBe(SKILLS.add);
+    expect(skippedSkill).not.toBe(SKILLS.addLike);
+  });
+
+  it("counts a switch when only the previous template still has fresh items", () => {
+    const improper = newestTemplate("frac-equiv-improper");
+    const mixed = newestTemplate("frac-equiv-mixed");
+    if (!improper || !mixed) throw new Error("missing equivalent-fraction templates");
+    const improperPool = eligibleDraws(improper, 1);
+    const mixedPool = eligibleDraws(mixed, 1);
+    expect(improperPool.length).toBeGreaterThan(mixedPool.length);
+    expect(mixedPool.length).toBeGreaterThan(0);
+    const db = tempDb();
+    db.prepare(
+      `UPDATE item_template_versions SET active = 0
+       WHERE skill_id = ? AND template_id != 'frac-equiv-mixed'`,
+    ).run(SKILLS.equiv);
+    const { child, session } = granted(db);
+    for (let index = 0; index < mixedPool.length; index += 1) {
+      const issued = issueForProgression(db, {
+        childId: child.id,
+        sessionId: session.sessionId,
+        skillId: SKILLS.equiv,
+        idempotencyKey: `improper-left-mixed-${index}`,
+        now: new Date(Date.parse(WHEN) + index * 1000).toISOString(),
+      });
+      expect(issued.templateId).toBe("frac-equiv-mixed");
+      expect(issued.issueReason).toBe("normal");
+    }
+    db.prepare(
+      `UPDATE item_template_versions SET active = 1
+       WHERE template_id = 'frac-equiv-improper'
+         AND template_version = (
+           SELECT MAX(template_version) FROM item_template_versions WHERE template_id = 'frac-equiv-improper'
+         )`,
+    ).run();
+    const stillFresh = issueForProgression(db, {
+      childId: child.id,
+      sessionId: session.sessionId,
+      skillId: SKILLS.equiv,
+      idempotencyKey: "improper-left-one",
+      now: new Date(Date.parse(WHEN) + mixedPool.length * 1000).toISOString(),
+    });
+    expect(stillFresh.templateId).toBe("frac-equiv-improper");
+    expect(stillFresh.issueReason).toBe("normal");
+    expect(stillFresh.difficultyStep).toBe(1);
+    const switched = issueForProgression(db, {
+      childId: child.id,
+      sessionId: session.sessionId,
+      skillId: SKILLS.equiv,
+      idempotencyKey: "improper-left-switch",
+      now: new Date(Date.parse(WHEN) + (mixedPool.length + 1) * 1000).toISOString(),
+    });
+    expect(switched.issueReason).toBe("exhausted_switch");
+    expect(switched.templateId).not.toBe("frac-equiv-improper");
+    expect(skillOfIssued(db, switched.templateId, switched.templateVersion)).toBe(SKILLS.addLike);
+    expect(switched.difficultyStep).toBe(assignedStepForSkill(SKILLS.addLike));
+    const improperIssued = (
+      db.prepare(`SELECT COUNT(*) AS count FROM item_instances WHERE child_id = ? AND template_id = 'frac-equiv-improper'`).get(child.id) as {
+        count: number;
+      }
+    ).count;
+    expect(improperIssued).toBe(1);
+    expect(improperIssued).toBeLessThan(improperPool.length);
+    expect(switched.requestedSkillId).toBe(SKILLS.equiv);
+    const fallback = ITEM_CATALOG.find((item) => item.skill === SKILLS.equiv);
+    if (!fallback) throw new Error("missing equivalent-fraction catalog item");
+    const labeled = publicItemForInstance(db, switched, fallback);
+    expect(labeled.skill).toBe(SKILLS.addLike);
+    const route = readFileSync(
+      path.join(process.cwd(), "app/api/children/[id]/sessions/[sessionId]/items/route.ts"),
+      "utf8",
+    );
+    expect(route).toContain("publicItemForInstance");
+    const rates = skillSwitchRates(db, child.id);
+    expect(rates.find((row) => row.skill === SKILLS.equiv)?.exhaustedSwitch).toBe(1);
+    expect(rates.find((row) => row.skill === SKILLS.addLike)?.exhaustedSwitch ?? 0).toBe(0);
+  });
+
+  it("gives a 7-day dogfood run zero exact repeats", () => {
+    // Simulation (a): 15 items per session, one session a day, for 7 days.
+    // Skills follow the current 11-slot catalog rotation.
+    const itemsPerSession = 15;
+    const days = 7;
+    const db = tempDb();
+    const { guardian, child, session } = granted(db);
+    const opened = readItemInstance(db, session.item.itemInstanceId ?? "");
+    if (!opened) throw new Error("session did not issue");
+    const rotation = issueRotationWeek(db, child.id, Date.parse(opened.issuedAt), {
+      sessionsPerDay: 1,
+      itemsPerSession,
+      days,
+      keyPrefix: "dogfood",
+    });
+    const stamp = rotation.stamp;
+    const maxSwitches = assertAtMostOneSwitch(rotation.sessions);
+    expect(maxSwitches).toBeLessThanOrEqual(1);
+    const distinct = assertDistinctTemplates(db, child.id);
+    expect(distinct.every((row) => row.templates >= MIN_DISTINCT_TEMPLATES)).toBe(true);
+    expect(ITEM_CATALOG).toHaveLength(11);
+    const rows = db
+      .prepare(
+        `SELECT template_id AS templateId, operand_key AS operandKey, issue_reason AS issueReason, repeat_forced AS repeatForced
+         FROM item_instances WHERE child_id = ?`,
+      )
+      .all(child.id) as Array<{
+      templateId: string;
+      operandKey: string;
+      issueReason: string;
+      repeatForced: number;
+    }>;
+    const keys = rows.map((row) => `${row.templateId}:${row.operandKey}`);
+    expect(new Set(keys).size).toBe(keys.length);
+    expect(rows.every((row) => row.repeatForced === 0)).toBe(true);
+    expect(repeatPoolReport(db, child.id), repeatPoolReport(db, child.id).join("; ")).toEqual([]);
+    const rates = assertRotationLimits(db, child.id);
+    expect(rates.every((row) => row.rate <= MAX_SKILL_SWITCH_RATE)).toBe(true);
+    const end = new Date(stamp).toISOString();
+    expect(exactRepeatRate(db, child.id, end).forced).toBe(0);
+    const pools = poolIssuanceCounts(db, child.id);
+    expect(pools.reduce((sum, row) => sum + row.issued, 0)).toBe(rows.length);
+    for (const pool of pools) {
+      expect(pool.exhaustedRepeat).toBe(0);
+      expect(pool.switchRate).toBe(pool.issued === 0 ? 0 : pool.exhaustedSwitch / pool.issued);
+    }
+    const home = getChildHome(db, guardian.id, child.id);
+    const summary = readParentSummary(db, guardian.id, child.id, end);
+    expect(JSON.stringify({ home, summary, pools: "hidden" })).not.toMatch(
+      /switchRate|poolIssuance|exhaustedSwitch|exhaustedRepeat/,
+    );
+    const surfaceFiles = [
+      "app/parent/page.tsx",
+      "app/api/children/[id]/parent-summary/route.ts",
+      "app/api/children/[id]/home/route.ts",
+      "lib/parent-summary.ts",
+      "components/parent-one-breath.tsx",
+      "components/practice-problem.tsx",
+      "components/practice-session.tsx",
+    ];
+    for (const file of surfaceFiles) {
+      const source = readFileSync(path.join(process.cwd(), file), "utf8");
+      expect(source, file).not.toMatch(/poolIssuanceCounts|exhaustionEventCounts|switchRate/);
+    }
+  });
+
+  it("gives a heavy rotation week zero repeats and a switch rate of at most 10%", () => {
+    // Simulation (c): 2 sessions of 15 items a day, for 7 days, on the 11-slot rotation.
+    const sessionsPerDay = 2;
+    const itemsPerSession = 15;
+    const days = 7;
+    const db = tempDb();
+    const { child, session } = granted(db, "heavy-rotation@example.com");
+    const opened = readItemInstance(db, session.item.itemInstanceId ?? "");
+    if (!opened) throw new Error("session did not issue");
+    const rotation = issueRotationWeek(db, child.id, Date.parse(opened.issuedAt), {
+      sessionsPerDay,
+      itemsPerSession,
+      days,
+      keyPrefix: "heavy-rot",
+    });
+    const maxSwitches = assertAtMostOneSwitch(rotation.sessions);
+    expect(maxSwitches).toBeLessThanOrEqual(1);
+    const distinct = assertDistinctTemplates(db, child.id);
+    expect(distinct.every((row) => row.templates >= MIN_DISTINCT_TEMPLATES)).toBe(true);
+    expect(ITEM_CATALOG).toHaveLength(11);
+    const rates = assertRotationLimits(db, child.id);
+    expect(rates.every((row) => row.rate <= MAX_SKILL_SWITCH_RATE)).toBe(true);
+    expect(repeatPoolReport(db, child.id)).toEqual([]);
+  }, 30_000);
+
+  it("gives 20 children a heavy rotation week under the switch cap", () => {
+    // Each child id is fixed, so the draw seed hashSeed(idempotencyKey:childId) is distinct and stable.
+    // The week is 2 sessions of 15 items for 7 days on the 11-slot rotation, with no session opener.
+    const childCount = 20;
+    const db = tempDb();
+    const guardian = createGuardian(db, {
+      email: "cohort@example.com",
+      password: "correct-horse",
+      timezone: "America/Los_Angeles",
+    });
+    const insertChild = db.prepare(
+      `INSERT INTO children (id, guardian_id, display_name, timezone, created_at)
+       VALUES (?, ?, ?, 'America/Los_Angeles', ?)`,
+    );
+    const perChild: SkillSwitchRate[][] = [];
+    let worstSessionSwitches = 0;
+    for (let index = 0; index < childCount; index += 1) {
+      const childId = `cohort-${String(index).padStart(2, "0")}`;
+      insertChild.run(childId, guardian.id, `Child ${index}`, WHEN);
+      const rotation = issueRotationWeek(db, childId, Date.parse(WHEN), {
+        sessionsPerDay: 2,
+        itemsPerSession: 15,
+        days: 7,
+        keyPrefix: childId,
+      });
+      worstSessionSwitches = Math.max(worstSessionSwitches, assertAtMostOneSwitch(rotation.sessions));
+      assertDistinctTemplates(db, childId);
+      perChild.push(assertRotationLimits(db, childId));
+    }
+    expect(worstSessionSwitches).toBeLessThanOrEqual(1);
+    const skills = perChild[0]?.map((row) => row.skill) ?? [];
+    const summary = skills.map((skill) => {
+      let issued = 0;
+      let exhaustedSwitch = 0;
+      let worstRate = 0;
+      let worstChild = "";
+      for (let index = 0; index < perChild.length; index += 1) {
+        const row = perChild[index]?.find((item) => item.skill === skill);
+        if (!row) continue;
+        issued += row.issued;
+        exhaustedSwitch += row.exhaustedSwitch;
+        if (row.rate > worstRate) {
+          worstRate = row.rate;
+          worstChild = `cohort-${String(index).padStart(2, "0")}`;
+        }
+      }
+      return {
+        skill,
+        overall: issued === 0 ? 0 : exhaustedSwitch / issued,
+        overallText: `${exhaustedSwitch}/${issued}`,
+        worst: worstRate,
+        worstChild,
+      };
+    });
+    const over = summary.filter((row) => row.overall > MAX_SKILL_SWITCH_RATE || row.worst > MAX_SKILL_SWITCH_RATE);
+    expect(
+      over.map((row) => `${row.skill}: overall ${row.overallText}, worst ${(row.worst * 100).toFixed(1)}% (${row.worstChild})`),
+      "cohort switch rate above 10%",
+    ).toEqual([]);
+    expect(summary).toHaveLength(ITEM_CATALOG.length);
+    for (const rows of perChild) {
+      const compare = rows.find((row) => row.skill === SKILLS.compare);
+      expect(compare).toMatchObject({ issued: 19, exhaustedSwitch: 0 });
+    }
+    expect(summary.filter((row) => row.overall !== 0 || row.worst !== 0)).toEqual([]);
+  }, 120_000);
+
+  it("gives every pool a heavy week with zero exhausted repeats", () => {
+    // Simulation (b): 2 sessions of 15 items a day, for 7 days.
+    // Each skill is its own pool, including allowlisted ones. A repeat names that pool.
+    const sessionsPerDay = 2;
+    const itemsPerSession = 15;
+    const days = 7;
+    const total = sessionsPerDay * itemsPerSession * days;
+    const db = tempDb();
+    const failures: string[] = [];
+    for (const item of ITEM_CATALOG) {
+      const { child, session } = granted(db, `${item.id}@example.com`);
+      const opened = readItemInstance(db, session.item.itemInstanceId ?? "");
+      if (!opened) throw new Error("session did not issue");
+      let stamp = Date.parse(opened.issuedAt);
+      for (let index = 0; index < total; index += 1) {
+        stamp += 1000;
+        const issued = issueForProgression(db, {
+          childId: child.id,
+          sessionId: session.sessionId,
+          skillId: item.skill,
+          idempotencyKey: `pool-${item.id}-${index}`,
+          now: new Date(stamp).toISOString(),
+        });
+        expect(issued.difficultyStep, item.skill).toBe(1);
+        expect(issued.repeatForced, item.skill).toBe(false);
+      }
+      const repeats = repeatPoolReport(db, child.id);
+      if (repeats.length > 0) failures.push(...repeats);
+      const rows = db
+        .prepare(
+          `SELECT template_id AS templateId, operand_key AS operandKey
+           FROM item_instances WHERE child_id = ?`,
+        )
+        .all(child.id) as Array<{ templateId: string; operandKey: string }>;
+      const keys = rows.map((row) => `${row.templateId}:${row.operandKey}`);
+      if (new Set(keys).size !== keys.length) failures.push(`${item.skill}: exact repeat`);
+    }
+    expect(failures, failures.join("\n")).toEqual([]);
+    expect(ITEM_CATALOG).toHaveLength(11);
+  }, 60_000);
+
+  it("defaults an older item instance to issue_reason normal", () => {
+    const db = new Database(":memory:");
+    db.exec(`
+      CREATE TABLE item_instances (
+        item_instance_id TEXT PRIMARY KEY,
+        child_id TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        template_id TEXT NOT NULL,
+        template_version INTEGER NOT NULL,
+        difficulty_step INTEGER NOT NULL,
+        operands_json TEXT NOT NULL,
+        operand_key TEXT NOT NULL,
+        canonical_answer TEXT NOT NULL,
+        answer_line TEXT NOT NULL,
+        prompt TEXT NOT NULL,
+        presentation_json TEXT NOT NULL,
+        evidence_eligible INTEGER NOT NULL,
+        repeat_forced INTEGER NOT NULL,
+        issue_idempotency_key TEXT NOT NULL,
+        issued_at TEXT NOT NULL,
+        consumed_at TEXT,
+        consumed_by_attempt_key TEXT,
+        require_form TEXT,
+        compare_mode TEXT NOT NULL,
+        bug_hits_json TEXT NOT NULL,
+        default_focus TEXT,
+        why_it_works TEXT
+      );
+      INSERT INTO item_instances (
+        item_instance_id, child_id, session_id, template_id, template_version, difficulty_step,
+        operands_json, operand_key, canonical_answer, answer_line, prompt, presentation_json,
+        evidence_eligible, repeat_forced, issue_idempotency_key, issued_at, compare_mode, bug_hits_json
+      ) VALUES (
+        'old-instance', 'child-1', 'session-1', 'add-2d-v0', 0, 1,
+        '{}', 'a=1', '2', '2', '1 + 1', '{}',
+        1, 0, 'old-issue-key', '2026-06-01T00:00:00.000Z', 'exact', '[]'
+      );
+    `);
+    migrateItemTemplates(db);
+    const row = db.prepare(`SELECT issue_reason FROM item_instances WHERE item_instance_id = ?`).get("old-instance") as {
+      issue_reason: string;
+    };
+    expect(row.issue_reason).toBe("normal");
+    const requested = db
+      .prepare(`SELECT requested_skill_id AS skill FROM item_instances WHERE item_instance_id = ?`)
+      .get("old-instance") as { skill: string | null };
+    expect(requested.skill).toBeNull();
+    db.close();
   });
 });
 

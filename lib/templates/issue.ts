@@ -2,9 +2,9 @@ import { randomUUID } from "node:crypto";
 import type Database from "better-sqlite3";
 import type { PublicItem } from "@/lib/attempt-contract";
 import { DomainError } from "@/lib/domain";
-import { itemAt } from "@/lib/item-catalog";
+import { ITEM_CATALOG, itemAt } from "@/lib/item-catalog";
 import { answersMatch, canonicalValueKey, type RequireForm } from "@/lib/templates/rational";
-import { drawAccepted, seeded, type Rng } from "@/lib/templates/engine";
+import { eligibleDraws, seeded, type Rng } from "@/lib/templates/engine";
 import {
   issuanceTemplateSelect,
   parseIssuanceTemplate,
@@ -15,16 +15,19 @@ import { cueText, tryNextFromCue } from "@/lib/templates/cues";
 import { answerKindForTemplate, formatExampleFor } from "@/lib/templates/format-example";
 import type { AnswerKind } from "@/lib/unparseable";
 
-/** Progression stays rules-v0 and serves difficulty step 1 only. */
+/** Progression stays rules-v0 and assigns difficulty step 1. */
 export const PROGRESSION_DIFFICULTY_STEP = 1 as const;
-export const REPEAT_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+
+export type IssueReason = "normal" | "exhausted_switch" | "exhausted_repeat";
+
 /**
- * Fresh draws before a 7-day repeat is forced.
- * Each try keeps the first eligible pair, then skips it when that pair
- * was already issued. Lowest-terms step 1 has 7 such pairs, so the last
- * unseen one needs many tries: (6/7)^80 is about one in 300,000.
+ * The step this skill is assigned right now.
+ * Issuance reads it and must not write learner state or this assignment.
  */
-export const DRAW_RETRY_BOUND = 80;
+export function assignedStepForSkill(_skillId: string): 1 | 2 | 3 {
+  return PROGRESSION_DIFFICULTY_STEP;
+}
+export const REPEAT_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 export const ISSUE_BATCH_CAP = 3;
 
 /**
@@ -60,6 +63,10 @@ export type ItemInstance = {
   presentation: ItemPresentation;
   evidenceEligible: boolean;
   repeatForced: boolean;
+  /** Why this row was issued. Never copied onto the child payload. */
+  issueReason: IssueReason;
+  /** Skill the child was asking for. A switch is credited here, not to the template skill. */
+  requestedSkillId: string | null;
   issueIdempotencyKey: string;
   issuedAt: string;
   consumedAt: string | null;
@@ -88,6 +95,8 @@ type InstanceRow = {
   presentation_json: string;
   evidence_eligible: number;
   repeat_forced: number;
+  issue_reason: IssueReason;
+  requested_skill_id: string | null;
   issue_idempotency_key: string;
   issued_at: string;
   consumed_at: string | null;
@@ -184,6 +193,8 @@ function mapInstance(db: Database.Database, row: InstanceRow): ItemInstance {
     presentation: JSON.parse(row.presentation_json) as ItemPresentation,
     evidenceEligible: row.evidence_eligible === 1,
     repeatForced: row.repeat_forced === 1,
+    issueReason: row.issue_reason,
+    requestedSkillId: row.requested_skill_id,
     issueIdempotencyKey: row.issue_idempotency_key,
     issuedAt: row.issued_at,
     consumedAt: row.consumed_at,
@@ -199,7 +210,8 @@ function mapInstance(db: Database.Database, row: InstanceRow): ItemInstance {
 
 const INSTANCE_SELECT = `SELECT item_instance_id, child_id, session_id, template_id, template_version,
   difficulty_step, operands_json, operand_key, canonical_answer, answer_line, prompt,
-  presentation_json, evidence_eligible, repeat_forced, issue_idempotency_key, issued_at,
+  presentation_json, evidence_eligible, repeat_forced, issue_reason, requested_skill_id,
+  issue_idempotency_key, issued_at,
   consumed_at, consumed_by_attempt_key, require_form, compare_mode, bug_hits_json,
   default_focus, why_it_works
   FROM item_instances`;
@@ -223,6 +235,17 @@ function readByIdempotency(
     .prepare(`${INSTANCE_SELECT} WHERE session_id = ? AND issue_idempotency_key = ?`)
     .get(sessionId, idempotencyKey) as InstanceRow | undefined;
   return row ? mapInstance(db, row) : null;
+}
+
+/** Child payload for an issued instance. The skill is the instance's, with the slot as a fallback. */
+export function publicItemForInstance(
+  db: Database.Database,
+  instance: ItemInstance,
+  fallback: PublicItem,
+): PublicItem {
+  const skillId = templateSkillId(db, instance.templateId, instance.templateVersion);
+  const shown = ITEM_CATALOG.find((item) => item.skill === skillId) ?? fallback;
+  return toPublicItem(shown, instance);
 }
 
 export function toPublicItem(catalog: PublicItem, instance: ItemInstance): PublicItem {
@@ -254,6 +277,20 @@ export function toPublicItem(catalog: PublicItem, instance: ItemInstance): Publi
   };
 }
 
+function templateSkillId(
+  db: Database.Database,
+  templateId: string,
+  templateVersion: number,
+): string | null {
+  const row = db
+    .prepare(
+      `SELECT skill_id FROM item_template_versions
+       WHERE template_id = ? AND template_version = ?`,
+    )
+    .get(templateId, templateVersion) as { skill_id: string } | undefined;
+  return row?.skill_id ?? null;
+}
+
 export function presentIssuedItem(
   db: Database.Database,
   childId: string,
@@ -269,7 +306,7 @@ export function presentIssuedItem(
     idempotencyKey: sessionSlotKey(sessionId, itemIndex),
     now,
   });
-  return toPublicItem(catalog, instance);
+  return publicItemForInstance(db, instance, catalog);
 }
 
 type ActiveTemplate = {
@@ -302,21 +339,22 @@ function loadActiveTemplates(
   return ready;
 }
 
-function recentlyIssued(
+function issuedOperandKeys(
   db: Database.Database,
   childId: string,
-  templateId: string,
-  key: string,
+  templateIds: readonly string[],
   since: string,
-): boolean {
-  const row = db
+): Set<string> {
+  if (templateIds.length === 0) return new Set();
+  const placeholders = templateIds.map(() => "?").join(", ");
+  const rows = db
     .prepare(
-      `SELECT 1 AS hit FROM item_instances
-       WHERE child_id = ? AND template_id = ? AND operand_key = ? AND issued_at >= ?
-       LIMIT 1`,
+      `SELECT template_id AS templateId, operand_key AS operandKey
+       FROM item_instances
+       WHERE child_id = ? AND issued_at >= ? AND template_id IN (${placeholders})`,
     )
-    .get(childId, templateId, key, since) as { hit: number } | undefined;
-  return Boolean(row);
+    .all(childId, since, ...templateIds) as Array<{ templateId: string; operandKey: string }>;
+  return new Set(rows.map((row) => `${row.templateId}\0${row.operandKey}`));
 }
 
 function lastTemplateId(db: Database.Database, sessionId: string): string | null {
@@ -363,6 +401,28 @@ function presentationFor(template: TemplateVersion, draw: {
   };
 }
 
+const eligibleCache = new Map<string, ReturnType<typeof eligibleDraws>>();
+
+function cachedEligibleDraws(template: TemplateVersion, step: 1 | 2 | 3) {
+  const key = `${template.templateId}@${template.version}:${step}`;
+  const hit = eligibleCache.get(key);
+  if (hit) return hit;
+  const draws = eligibleDraws(template, step);
+  eligibleCache.set(key, draws);
+  return draws;
+}
+
+function shuffleWith<T>(items: readonly T[], rng: Rng): T[] {
+  const copy = items.slice();
+  for (let index = copy.length - 1; index > 0; index -= 1) {
+    const swap = Math.floor(rng() * (index + 1));
+    const current = copy[index];
+    copy[index] = copy[swap] as T;
+    copy[swap] = current as T;
+  }
+  return copy;
+}
+
 function drawFresh(
   db: Database.Database,
   input: {
@@ -375,85 +435,147 @@ function drawFresh(
   },
 ): FrozenDraw | null {
   const previous = lastTemplateId(db, input.sessionId);
-  for (let attempt = 0; attempt < DRAW_RETRY_BOUND; attempt += 1) {
-    const notPrevious = input.templates.filter((item) => item.template.templateId !== previous);
-    const pool = notPrevious.length > 0 ? notPrevious : input.templates;
-    const choice = pool[Math.floor(input.rng() * pool.length)];
-    if (!choice) return null;
-    const draw = drawAccepted(choice.template, input.step, input.rng, 16);
-    if (!draw || draw.ambiguous) continue;
-    const key = operandKey(draw.operands, draw.canonicalAnswer);
-    if (recentlyIssued(db, input.childId, choice.template.templateId, key, input.since)) continue;
-    return {
-      templateId: choice.template.templateId,
-      templateVersion: choice.template.version,
-      evidenceEligible: choice.evidenceEligible,
-      operands: draw.operands,
-      canonicalAnswer: draw.canonicalAnswer,
-      answerLine: draw.answerLine,
-      prompt: draw.prompt,
-      presentation: presentationFor(choice.template, draw, input.step),
-      bugHits: draw.bugs,
-      repeatForced: false,
-      requireForm: choice.template.requireForm ?? null,
-      compareMode: choice.template.spec.compare,
-      defaultFocus: choice.template.defaultFocus ?? null,
-      whyItWorks: choice.template.whyItWorks ?? null,
-    };
+  const others = input.templates.filter((item) => item.template.templateId !== previous);
+  // When this skill has another template, the previous one is blocked. If those
+  // others have no fresh item, return null so the caller records exhausted_switch
+  // even though the blocked template still has items. A skill whose only template
+  // is that previous one keeps issuing it until its fresh items are gone.
+  const pool = others.length > 0 ? others : input.templates;
+  const issued = issuedOperandKeys(
+    db,
+    input.childId,
+    pool.map((item) => item.template.templateId),
+    input.since,
+  );
+  // Stable order: templates are sorted by id, and eligible draws follow slot order.
+  // Shuffling that unseen list and taking the first cannot skip a fresh item.
+  const unseen: Array<{ choice: ActiveTemplate; draw: ReturnType<typeof eligibleDraws>[number] }> = [];
+  for (const choice of pool) {
+    for (const draw of cachedEligibleDraws(choice.template, input.step)) {
+      const key = operandKey(draw.operands, draw.canonicalAnswer);
+      if (issued.has(`${choice.template.templateId}\0${key}`)) continue;
+      unseen.push({ choice, draw });
+    }
   }
-  return null;
+  const picked = shuffleWith(unseen, input.rng)[0];
+  if (!picked) return null;
+  const { choice, draw } = picked;
+  return {
+    templateId: choice.template.templateId,
+    templateVersion: choice.template.version,
+    evidenceEligible: choice.evidenceEligible,
+    operands: draw.operands,
+    canonicalAnswer: draw.canonicalAnswer,
+    answerLine: draw.answerLine,
+    prompt: draw.prompt,
+    presentation: presentationFor(choice.template, draw, input.step),
+    bugHits: draw.bugs,
+    repeatForced: false,
+    requireForm: choice.template.requireForm ?? null,
+    compareMode: choice.template.spec.compare,
+    defaultFocus: choice.template.defaultFocus ?? null,
+    whyItWorks: choice.template.whyItWorks ?? null,
+  };
 }
 
-function drawExhausted(
+/** Catalog order, one entry per skill. This is the practice rotation. */
+function rotationSkillIds(): string[] {
+  const seen = new Set<string>();
+  const skills: string[] = [];
+  for (const item of ITEM_CATALOG) {
+    if (seen.has(item.skill)) continue;
+    seen.add(item.skill);
+    skills.push(item.skill);
+  }
+  return skills;
+}
+
+/**
+ * Skills after `skillId` in the catalog, then the skills before it.
+ * A switch walks this list and skips a skill whose pool has no fresh item.
+ * It does not rank pools or search from the start of the catalog.
+ */
+function skillsAfter(skillId: string): string[] {
+  const skills = rotationSkillIds();
+  const start = skills.indexOf(skillId);
+  if (start < 0) return skills;
+  return [...skills.slice(start + 1), ...skills.slice(0, start)];
+}
+
+function tryFresh(
   db: Database.Database,
   input: {
     childId: string;
-    templates: ActiveTemplate[];
+    sessionId: string;
+    skillId: string;
     step: 1 | 2 | 3;
+    rng: Rng;
+    since: string;
   },
 ): FrozenDraw | null {
-  if (input.templates.length === 0) return null;
-  const ids = input.templates.map((item) => item.template.templateId);
-  const placeholders = ids.map(() => "?").join(", ");
-  const rows = db
+  const templates = loadActiveTemplates(db, input.skillId, input.step);
+  if (templates.length === 0) return null;
+  return drawFresh(db, { ...input, templates });
+}
+
+/** Last time each item of this skill and step was seen inside the no-repeat window. */
+function exposuresForSkillStep(
+  db: Database.Database,
+  childId: string,
+  skillId: string,
+  step: 1 | 2 | 3,
+  since: string,
+): Exposure[] {
+  return db
     .prepare(
-      `SELECT template_id AS templateId, operand_key AS operandKey, MAX(issued_at) AS lastAt
-       FROM item_instances
-       WHERE child_id = ? AND difficulty_step = ? AND template_id IN (${placeholders})
-       GROUP BY template_id, operand_key`,
+      `SELECT i.template_id AS templateId, i.operand_key AS operandKey, MAX(i.issued_at) AS lastAt
+       FROM item_instances i
+       JOIN item_template_versions t
+         ON t.template_id = i.template_id AND t.template_version = i.template_version
+       WHERE i.child_id = ? AND t.skill_id = ? AND i.difficulty_step = ? AND i.issued_at >= ?
+       GROUP BY i.template_id, i.operand_key`,
     )
-    .all(input.childId, input.step, ...ids) as Exposure[];
-  const picked = pickOldestExposure(rows);
-  if (!picked) return null;
-  const prior = db
+    .all(childId, skillId, step, since) as Exposure[];
+}
+
+/**
+ * Reissue the same skill and step as a new instance, copied from the row
+ * seen longest ago. The copy keeps that row's template version and step.
+ * `evidence_eligible` is false on the new row at issue time, so an attempt
+ * on the repeat is never evidence. The original row is left unchanged.
+ */
+function repeatOldest(
+  db: Database.Database,
+  childId: string,
+  skillId: string,
+  step: 1 | 2 | 3,
+  since: string,
+): FrozenDraw | null {
+  const oldest = pickOldestExposure(exposuresForSkillStep(db, childId, skillId, step, since));
+  if (!oldest) return null;
+  const row = db
     .prepare(
       `${INSTANCE_SELECT}
-       WHERE child_id = ? AND template_id = ? AND operand_key = ? AND issued_at = ?
-       ORDER BY item_instance_id ASC
-       LIMIT 1`,
+       WHERE child_id = ? AND template_id = ? AND operand_key = ? AND difficulty_step = ? AND issued_at = ?`,
     )
-    .get(input.childId, picked.templateId, picked.operandKey, picked.lastAt) as
-    | InstanceRow
-    | undefined;
-  if (!prior) return null;
-  const current = input.templates.find((item) => item.template.templateId === picked.templateId);
-  if (!current) return null;
-  const previous = mapInstance(db, prior);
+    .get(childId, oldest.templateId, oldest.operandKey, step, oldest.lastAt) as InstanceRow | undefined;
+  if (!row || row.difficulty_step !== step) return null;
+  const instance = mapInstance(db, row);
   return {
-    templateId: previous.templateId,
-    templateVersion: previous.templateVersion,
-    evidenceEligible: current.evidenceEligible,
-    operands: previous.operands,
-    canonicalAnswer: previous.canonicalAnswer,
-    answerLine: previous.answerLine,
-    prompt: previous.prompt,
-    presentation: previous.presentation,
-    bugHits: previous.bugHits,
+    templateId: instance.templateId,
+    templateVersion: instance.templateVersion,
+    evidenceEligible: false,
+    operands: instance.operands,
+    canonicalAnswer: instance.canonicalAnswer,
+    answerLine: instance.answerLine,
+    prompt: instance.prompt,
+    presentation: instance.presentation,
+    bugHits: instance.bugHits,
     repeatForced: true,
-    requireForm: previous.requireForm,
-    compareMode: previous.compareMode,
-    defaultFocus: previous.defaultFocus,
-    whyItWorks: previous.whyItWorks,
+    requireForm: instance.requireForm,
+    compareMode: instance.compareMode,
+    defaultFocus: instance.defaultFocus,
+    whyItWorks: instance.whyItWorks,
   };
 }
 
@@ -466,6 +588,8 @@ function insertInstance(
     issuedAt: string;
     step: number;
     draw: FrozenDraw;
+    issueReason: IssueReason;
+    requestedSkillId: string;
   },
 ): ItemInstance {
   const id = randomUUID();
@@ -474,12 +598,14 @@ function insertInstance(
     `INSERT INTO item_instances (
        item_instance_id, child_id, session_id, template_id, template_version,
        difficulty_step, operands_json, operand_key, canonical_answer, answer_line,
-       prompt, presentation_json, evidence_eligible, repeat_forced, issue_idempotency_key,
+       prompt, presentation_json, evidence_eligible, repeat_forced, issue_reason, requested_skill_id,
+       issue_idempotency_key,
        issued_at, require_form, compare_mode, bug_hits_json, default_focus, why_it_works
      ) VALUES (
        @item_instance_id, @child_id, @session_id, @template_id, @template_version,
        @difficulty_step, @operands_json, @operand_key, @canonical_answer, @answer_line,
-       @prompt, @presentation_json, @evidence_eligible, @repeat_forced, @issue_idempotency_key,
+       @prompt, @presentation_json, @evidence_eligible, @repeat_forced, @issue_reason, @requested_skill_id,
+       @issue_idempotency_key,
        @issued_at, @require_form, @compare_mode, @bug_hits_json, @default_focus, @why_it_works
      )`,
   ).run({
@@ -497,6 +623,8 @@ function insertInstance(
     presentation_json: JSON.stringify(input.draw.presentation),
     evidence_eligible: input.draw.evidenceEligible ? 1 : 0,
     repeat_forced: input.draw.repeatForced ? 1 : 0,
+    issue_reason: input.issueReason,
+    requested_skill_id: input.requestedSkillId,
     issue_idempotency_key: input.idempotencyKey,
     issued_at: input.issuedAt,
     // Frozen at issue. Reading a reason later uses this column, not the live template.
@@ -523,38 +651,46 @@ export function issueForProgression(
 ): ItemInstance {
   const existing = readByIdempotency(db, input.sessionId, input.idempotencyKey);
   if (existing) return existing;
-  const step = PROGRESSION_DIFFICULTY_STEP;
   const issuedAt = input.now ?? new Date().toISOString();
   const since = new Date(Date.parse(issuedAt) - REPEAT_WINDOW_MS).toISOString();
-  const templates = loadActiveTemplates(db, input.skillId, step);
-  if (templates.length === 0) {
-    throw new DomainError("No template is available for this skill.", 500);
-  }
   const rng = seeded(hashSeed(`${input.idempotencyKey}:${input.childId}`));
-  const fresh = drawFresh(db, {
-    childId: input.childId,
-    sessionId: input.sessionId,
-    templates,
-    step,
-    rng,
-    since,
-  });
-  const draw =
-    fresh ??
-    drawExhausted(db, {
+  const requestedStep = assignedStepForSkill(input.skillId);
+  // Assigned step, then the next rotation skill at its assigned step, then the oldest item.
+  const choices: Array<{ skillId: string; step: 1 | 2 | 3; reason: IssueReason }> = [
+    { skillId: input.skillId, step: requestedStep, reason: "normal" },
+  ];
+  for (const skillId of skillsAfter(input.skillId)) {
+    choices.push({ skillId, step: assignedStepForSkill(skillId), reason: "exhausted_switch" });
+  }
+  let picked: { step: 1 | 2 | 3; reason: IssueReason; draw: FrozenDraw } | null = null;
+  for (const choice of choices) {
+    const draw = tryFresh(db, {
       childId: input.childId,
-      templates,
-      step,
+      sessionId: input.sessionId,
+      skillId: choice.skillId,
+      step: choice.step,
+      rng,
+      since,
     });
-  if (!draw) throw new DomainError("No problem is available.", 500);
+    if (!draw) continue;
+    picked = { step: choice.step, reason: choice.reason, draw };
+    break;
+  }
+  if (!picked) {
+    const draw = repeatOldest(db, input.childId, input.skillId, requestedStep, since);
+    if (draw) picked = { step: requestedStep, reason: "exhausted_repeat", draw };
+  }
+  if (!picked) throw new DomainError("No problem is available.", 500);
   try {
     return insertInstance(db, {
       childId: input.childId,
       sessionId: input.sessionId,
       idempotencyKey: input.idempotencyKey,
       issuedAt,
-      step,
-      draw,
+      step: picked.step,
+      draw: picked.draw,
+      issueReason: picked.reason,
+      requestedSkillId: input.skillId,
     });
   } catch (error) {
     const raced = readByIdempotency(db, input.sessionId, input.idempotencyKey);

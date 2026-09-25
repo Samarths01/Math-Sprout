@@ -4,7 +4,7 @@ import { DomainError, getChild } from "@/lib/domain";
 import { asRecord, assertSameOrigin, errorResponse, readJson, requireGuardian } from "@/lib/http";
 import { readPracticeSession } from "@/lib/learner-state";
 import { itemAt } from "@/lib/item-catalog";
-import { ISSUE_BATCH_CAP, issueItemBatch, toPublicItem } from "@/lib/templates/issue";
+import { ISSUE_BATCH_CAP, issueItemBatch, publicItemForInstance } from "@/lib/templates/issue";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -37,7 +37,9 @@ export async function POST(request: Request, context: Context) {
       itemIndex: session.item_index,
     });
     return NextResponse.json({
-      items: instances.map((instance, index) => toPublicItem(itemAt(session.item_index + index), instance)),
+      items: instances.map((instance, index) =>
+        publicItemForInstance(db, instance, itemAt(session.item_index + index)),
+      ),
     });
   } catch (error) {
     return errorResponse(error);

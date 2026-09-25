@@ -68,6 +68,10 @@ CREATE TABLE IF NOT EXISTS item_instances (
   presentation_json TEXT NOT NULL,
   evidence_eligible INTEGER NOT NULL CHECK (evidence_eligible IN (0, 1)),
   repeat_forced INTEGER NOT NULL CHECK (repeat_forced IN (0, 1)),
+  issue_reason TEXT NOT NULL DEFAULT 'normal' CHECK (
+    issue_reason IN ('normal', 'exhausted_switch', 'exhausted_repeat')
+  ),
+  requested_skill_id TEXT,
   issue_idempotency_key TEXT NOT NULL,
   issued_at TEXT NOT NULL,
   consumed_at TEXT,
@@ -152,7 +156,31 @@ export function migrateItemTemplates(db: Database.Database): void {
   if (addSessionColumn(db, "slot_seq", "slot_seq INTEGER NOT NULL DEFAULT 0")) {
     db.exec(`UPDATE practice_sessions SET slot_seq = item_index`);
   }
+  addIssueReason(db);
+  addRequestedSkill(db);
   seedTemplateVersions(db);
+}
+
+/** Existing rows predate the column. They were ordinary draws, so they default to normal. */
+function addIssueReason(db: Database.Database): void {
+  const columns = new Set(
+    (db.pragma("table_info(item_instances)") as Array<{ name: string }>).map((row) => row.name),
+  );
+  if (columns.size === 0 || columns.has("issue_reason")) return;
+  db.exec(
+    `ALTER TABLE item_instances ADD COLUMN issue_reason TEXT NOT NULL DEFAULT 'normal' CHECK (
+       issue_reason IN ('normal', 'exhausted_switch', 'exhausted_repeat')
+     )`,
+  );
+}
+
+/** Older rows have no stored request. Callers fall back to the template skill. */
+function addRequestedSkill(db: Database.Database): void {
+  const columns = new Set(
+    (db.pragma("table_info(item_instances)") as Array<{ name: string }>).map((row) => row.name),
+  );
+  if (columns.size === 0 || columns.has("requested_skill_id")) return;
+  db.exec(`ALTER TABLE item_instances ADD COLUMN requested_skill_id TEXT`);
 }
 
 function addSessionColumn(db: Database.Database, name: string, ddl: string): boolean {
