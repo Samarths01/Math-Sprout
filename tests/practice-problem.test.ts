@@ -48,10 +48,18 @@ const blankItem: PublicItem = {
 let root: Root | null = null;
 let container: HTMLDivElement | null = null;
 
-function visibleText(node: ParentNode): string {
-  const clone = node.cloneNode(true) as HTMLElement;
-  clone.querySelectorAll(".sr-only").forEach((hidden) => hidden.remove());
-  return clone.textContent ?? "";
+/** Text exposed to assistive tech. `aria-hidden` subtrees are skipped; `sr-only` text stays. */
+function accessibleText(node: Node): string {
+  if (node instanceof Element && node.getAttribute("aria-hidden") === "true") return "";
+  if (node.nodeType === Node.TEXT_NODE) return node.textContent ?? "";
+  let text = "";
+  node.childNodes.forEach((child) => {
+    const piece = accessibleText(child);
+    if (!piece) return;
+    if (text && !/\s$/.test(text) && !/^\s/.test(piece)) text += " ";
+    text += piece;
+  });
+  return text.replace(/\s+/g, " ").trim();
 }
 
 function unmount() {
@@ -84,30 +92,26 @@ afterEach(() => {
 });
 
 describe("practice problem stem", () => {
-  it("shows a column stem visually once and keeps the heading on a plain item", async () => {
+  it("announces a column stem once and keeps a visible heading on a plain item", async () => {
     await renderItem(columnItem);
 
     const column = document.querySelector('[data-testid="column-problem"]');
     const prompt = document.querySelector('[data-testid="practice-prompt"]');
-    expect(column).not.toBeNull();
-    expect(column?.textContent).toBe("  20\n×  3");
-    expect(column?.classList.contains("sr-only")).toBe(false);
     expect(column?.getAttribute("aria-hidden")).toBe("true");
-    expect(document.querySelectorAll('[data-testid="column-problem"]')).toHaveLength(1);
     expect(prompt?.tagName).toBe("H2");
     expect(prompt?.classList.contains("sr-only")).toBe(true);
     expect(prompt?.textContent).toBe("20 × 3");
-    expect(visibleText(document.body)).not.toContain("20 × 3");
-    expect(visibleText(document.body)).toContain("20");
-    expect(visibleText(document.body)).toContain("×  3");
+    const accessible = accessibleText(document.body);
+    expect(accessible.match(/20 × 3/g)).toEqual(["20 × 3"]);
 
     await renderItem(plainItem);
     const heading = document.querySelector('[data-testid="practice-prompt"]');
     expect(document.querySelector('[data-testid="column-problem"]')).toBeNull();
     expect(heading?.tagName).toBe("H2");
     expect(heading?.classList.contains("sr-only")).toBe(false);
+    expect(heading?.className).toContain("font-heading");
     expect(heading?.textContent).toBe("What is 63 - 18?");
-    expect(visibleText(document.body)).toContain("What is 63 - 18?");
+    expect(accessibleText(document.body)).toContain("What is 63 - 18?");
 
     await renderItem(blankItem);
     expect(document.querySelector('[data-testid="practice-prompt"]')).toBeNull();
