@@ -38,9 +38,11 @@ import {
   stepsPracticed,
 } from "@/lib/templates/instruments";
 import {
+  DEFAULT_TEMPLATE_DRAW_WEIGHT,
   ISSUE_BATCH_CAP,
   OUTSTANDING_UNANSWERED_CAP,
   PROGRESSION_DIFFICULTY_STEP,
+  TEMPLATE_DRAW_WEIGHTS,
   assignedStepForSkill,
   focusForStoredAnswer,
   gradeStoredAnswer,
@@ -3916,6 +3918,47 @@ describe("item templates and issuance", () => {
     const rates = skillSwitchRates(db, child.id);
     expect(rates.find((row) => row.skill === SKILLS.equiv)?.exhaustedSwitch).toBe(1);
     expect(rates.find((row) => row.skill === SKILLS.addLike)?.exhaustedSwitch ?? 0).toBe(0);
+  });
+
+  it("weights every template equally", () => {
+    expect(DEFAULT_TEMPLATE_DRAW_WEIGHT).toBe(1);
+    expect(TEMPLATE_DRAW_WEIGHTS).toEqual({});
+  });
+
+  it("skips a spent 1-item subtract template without a switch or a repeat", () => {
+    const db = tempDb();
+    const { child, session } = granted(db, "sub-seed-skip@example.com");
+    const issued: ItemInstance[] = [];
+    for (let index = 0; index < 8; index += 1) {
+      issued.push(
+        issueForProgression(db, {
+          childId: child.id,
+          sessionId: session.sessionId,
+          skillId: SKILLS.sub,
+          idempotencyKey: `sub-seed-${index}`,
+          now: new Date(Date.parse(WHEN) + index * 1000).toISOString(),
+        }),
+      );
+    }
+    const seedAt = issued.findIndex((row) => row.templateId === "sub-2d-v0");
+    expect(seedAt).toBeGreaterThanOrEqual(0);
+    expect(seedAt).toBeLessThan(4);
+    const next = issued[seedAt + 1];
+    if (!next) throw new Error("no draw after the 1-item subtract template");
+    expect(next.templateId).not.toBe("sub-2d-v0");
+    expect(next.issueReason).toBe("normal");
+    expect(skillOfIssued(db, next.templateId, next.templateVersion)).toBe(SKILLS.sub);
+    expect(issued.filter((row) => row.templateId === "sub-2d-v0")).toHaveLength(1);
+    expect(issued.every((row) => row.issueReason === "normal" && row.repeatForced === false)).toBe(true);
+    const reasons = db
+      .prepare(
+        `SELECT issue_reason AS reason, COUNT(*) AS count
+         FROM item_instances
+         WHERE child_id = ? AND requested_skill_id = ?
+         GROUP BY issue_reason`,
+      )
+      .all(child.id, SKILLS.sub) as Array<{ reason: string; count: number }>;
+    expect(reasons).toEqual([{ reason: "normal", count: 8 }]);
   });
 
   it("issues every fresh template before repeating one", () => {

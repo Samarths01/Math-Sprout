@@ -37,6 +37,14 @@ export const ISSUE_BATCH_CAP = 3;
  */
 export const OUTSTANDING_UNANSWERED_CAP = 3;
 
+/**
+ * Relative draw weight of one template. Ids omitted here use
+ * `DEFAULT_TEMPLATE_DRAW_WEIGHT`. Equal weights are pure least-recently-used.
+ * This map is the only weighting knob.
+ */
+export const DEFAULT_TEMPLATE_DRAW_WEIGHT = 1;
+export const TEMPLATE_DRAW_WEIGHTS: Readonly<Record<string, number>> = {};
+
 export type StepWord = "Warm-up" | "Steady" | "Stretch";
 
 export type ItemPresentation = {
@@ -441,6 +449,51 @@ function shuffleWith<T>(items: readonly T[], rng: Rng): T[] {
   return copy;
 }
 
+function templateDrawWeight(templateId: string): number {
+  const weight = TEMPLATE_DRAW_WEIGHTS[templateId] ?? DEFAULT_TEMPLATE_DRAW_WEIGHT;
+  if (!Number.isFinite(weight) || weight <= 0) {
+    throw new DomainError(`Template draw weight must be positive: ${templateId}`, 500);
+  }
+  return weight;
+}
+
+/**
+ * Equal weights pick the least-recently issued template. Never-issued templates
+ * come first. The seeded shuffle breaks a tie. Unequal weights are not a
+ * second policy; a later ruling replaces this function.
+ */
+function pickFreshTemplate<T extends { choice: ActiveTemplate }>(
+  fresh: readonly T[],
+  lastAt: ReadonlyMap<string, string>,
+  rng: Rng,
+): T | undefined {
+  const weights = fresh.map((item) => templateDrawWeight(item.choice.template.templateId));
+  const baseline = weights[0];
+  if (baseline === undefined || weights.some((weight) => weight !== baseline)) {
+    throw new DomainError(
+      "Unequal template draw weights need a ruled policy. Equal weight is least-recently-used.",
+      500,
+    );
+  }
+  const neverIssued = fresh.filter((item) => !lastAt.has(item.choice.template.templateId));
+  const oldestAt =
+    neverIssued.length > 0
+      ? null
+      : fresh.reduce((best, candidate) => {
+          const bestAt = lastAt.get(best.choice.template.templateId) ?? "";
+          const candidateAt = lastAt.get(candidate.choice.template.templateId) ?? "";
+          return candidateAt < bestAt ? candidate : best;
+        });
+  const tied =
+    oldestAt === null
+      ? neverIssued
+      : fresh.filter(
+          (item) =>
+            lastAt.get(item.choice.template.templateId) === lastAt.get(oldestAt.choice.template.templateId),
+        );
+  return shuffleWith(tied, rng)[0];
+}
+
 function drawFresh(
   db: Database.Database,
   input: {
@@ -465,9 +518,12 @@ function drawFresh(
     pool.map((item) => item.template.templateId),
     input.since,
   );
-  // Round-robin across templates. A template with no fresh item is skipped.
-  // Never-issued templates come first. Equal recency is broken by the seeded
-  // shuffle, then the first item comes from that template's shuffled unseen list.
+  // Round-robin only among templates that still have an item this child has
+  // not seen. A template that has run out is skipped. That skip is neither
+  // exhausted_switch nor exhausted_repeat; those apply only when no template
+  // of this skill still has an unseen item. Equal template weight is
+  // least-recently-used: never-issued first, then oldest issued_at. The seeded
+  // shuffle breaks ties. The item is the first of that template's shuffled unseen list.
   const fresh: Array<{ choice: ActiveTemplate; unseen: ReturnType<typeof eligibleDraws> }> = [];
   for (const choice of pool) {
     const unseen = cachedEligibleDraws(choice.template, input.step).filter((draw) => {
@@ -483,23 +539,7 @@ function drawFresh(
     input.childId,
     fresh.map((item) => item.choice.template.templateId),
   );
-  const neverIssued = fresh.filter((item) => !lastAt.has(item.choice.template.templateId));
-  const oldestAt =
-    neverIssued.length > 0
-      ? null
-      : fresh.reduce((best, candidate) => {
-          const bestAt = lastAt.get(best.choice.template.templateId) ?? "";
-          const candidateAt = lastAt.get(candidate.choice.template.templateId) ?? "";
-          return candidateAt < bestAt ? candidate : best;
-        });
-  const tied =
-    oldestAt === null
-      ? neverIssued
-      : fresh.filter(
-          (item) =>
-            lastAt.get(item.choice.template.templateId) === lastAt.get(oldestAt.choice.template.templateId),
-        );
-  const picked = shuffleWith(tied, input.rng)[0];
+  const picked = pickFreshTemplate(fresh, lastAt, input.rng);
   if (!picked) return null;
   const draw = shuffleWith(picked.unseen, input.rng)[0];
   if (!draw) return null;
