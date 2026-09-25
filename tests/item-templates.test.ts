@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { appendFileSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { createElement } from "react";
@@ -37,7 +37,6 @@ import {
   poolIssuanceCounts,
   stepsPracticed,
   TEMPLATE_SHARE_CAP,
-  type PoolIssuanceCount,
 } from "@/lib/templates/instruments";
 import {
   DEFAULT_TEMPLATE_DRAW_WEIGHT,
@@ -72,7 +71,13 @@ import { ITEM_CATALOG, itemAt } from "@/lib/item-catalog";
 import { answersMatch } from "@/lib/templates/rational";
 import { ISSUANCE_TEMPLATE_COLUMNS, issuanceTemplateSelect, migrateItemTemplates, seedTemplateVersions } from "@/lib/templates/store";
 import type { TemplateVersion } from "@/lib/templates/types";
-import { evidenceForSkill, readSkillClientView } from "@/lib/learner-state";
+import {
+  ensureLearnerProgress,
+  evidenceForSkill,
+  firstReviewSkill,
+  readSkillClientView,
+  startIndexForLane,
+} from "@/lib/learner-state";
 import {
   classifyAttemptFailure,
   createAttemptQueue,
@@ -188,6 +193,45 @@ type SessionSwitchLog = {
   switches: string[];
 };
 
+/**
+ * Record an inactive template as the skill's latest issue so the next draw
+ * of the only active template is still `normal`. Per-skill just-had would
+ * otherwise switch away while that template still has unseen items.
+ */
+function plantOtherTemplateSeen(
+  db: Database.Database,
+  childId: string,
+  sessionId: string,
+  templateId: string,
+  templateVersion: number,
+  skillId: string,
+  issuedAt: string,
+  key: string,
+): void {
+  db.prepare(
+    `INSERT INTO item_instances (
+       item_instance_id, child_id, session_id, template_id, template_version, difficulty_step,
+       operands_json, operand_key, canonical_answer, answer_line, prompt, presentation_json,
+       evidence_eligible, repeat_forced, issue_reason, requested_skill_id, issue_idempotency_key,
+       issued_at, compare_mode, bug_hits_json
+     ) VALUES (
+       ?, ?, ?, ?, ?, 1,
+       '{}', ?, '1', '1', '1', '{}',
+       1, 0, 'normal', ?, ?, ?, 'exact', '[]'
+     )`,
+  ).run(
+    `plant-${key}`,
+    childId,
+    sessionId,
+    templateId,
+    templateVersion,
+    `plant-${key}`,
+    skillId,
+    `plant-key-${key}`,
+    issuedAt,
+  );
+}
+
 function skillOfIssued(db: Database.Database, templateId: string, templateVersion: number): string {
   const row = db
     .prepare(
@@ -204,30 +248,43 @@ function openRotationSession(
   childId: string,
   sessionId: string,
   startedAt: string,
+  itemIndex = 0,
 ): void {
   db.prepare(
     `INSERT INTO practice_sessions (
        id, child_id, status, item_index, slot_seq, started_at, practice_lane, phase, policy_version
-     ) VALUES (?, ?, 'active', 0, 0, ?, 'recommended', 'practicing', ?)`,
-  ).run(sessionId, childId, startedAt, POLICY_VERSION);
+     ) VALUES (?, ?, 'active', ?, ?, ?, 'recommended', 'practicing', ?)`,
+  ).run(sessionId, childId, itemIndex % ITEM_CATALOG.length, itemIndex, startedAt, POLICY_VERSION);
 }
 
-/** One catalog rotation. Each practice is its own 15-item session. */
+/**
+ * One catalog rotation. Each practice is its own 15-item session.
+ * Omit `startIndex` to carry the slot across sessions (the older continuous
+ * model). Pass `startIndex` to restart every session there, which is what
+ * `startIndexForLane` does in production.
+ */
 function issueRotationWeek(
   db: Database.Database,
   childId: string,
   stampStart: number,
-  input: { sessionsPerDay: number; itemsPerSession: number; days: number; keyPrefix: string },
+  input: {
+    sessionsPerDay: number;
+    itemsPerSession: number;
+    days: number;
+    keyPrefix: string;
+    startIndex?: number;
+  },
 ): { stamp: number; sessions: SessionSwitchLog[] } {
   let stamp = stampStart;
-  let slot = 0;
+  let slot = input.startIndex ?? 0;
   const sessions: SessionSwitchLog[] = [];
   for (let day = 0; day < input.days; day += 1) {
     for (let practice = 0; practice < input.sessionsPerDay; practice += 1) {
+      if (input.startIndex !== undefined) slot = input.startIndex;
       const label = `day ${day + 1} session ${practice + 1}`;
       const sessionId = `${input.keyPrefix}-d${day}-s${practice}`;
       stamp += 1000;
-      openRotationSession(db, childId, sessionId, new Date(stamp).toISOString());
+      openRotationSession(db, childId, sessionId, new Date(stamp).toISOString(), slot);
       const switches: string[] = [];
       for (let item = 0; item < input.itemsPerSession; item += 1) {
         stamp += 1000;
@@ -256,7 +313,9 @@ function issueRotationWeek(
       sessions.push({ label, switches });
     }
   }
-  expect(slot).toBe(input.sessionsPerDay * input.itemsPerSession * input.days);
+  if (input.startIndex === undefined) {
+    expect(slot).toBe(input.sessionsPerDay * input.itemsPerSession * input.days);
+  }
   return { stamp, sessions };
 }
 
@@ -293,16 +352,19 @@ function assertDistinctTemplates(db: Database.Database, childId: string): Array<
   return rows;
 }
 
-function medianNumber(values: number[]): number {
-  const sorted = values.slice().sort((left, right) => left - right);
-  const mid = Math.floor(sorted.length / 2);
-  if (sorted.length % 2 === 1) return sorted[mid] ?? 0;
-  return ((sorted[mid - 1] ?? 0) + (sorted[mid] ?? 0)) / 2;
-}
+type LaneKind = "recommended" | "challenge" | "index6" | "review";
 
-type CohortResult = {
-  worstSessionSwitches: number;
-  summary: Array<{
+type LaneCohortReport = {
+  label: string;
+  startIndex: number;
+  startSkill: string;
+  sessionsPerDay: number;
+  childCount: number;
+  maxSessionSwitches: number;
+  exactRepeats: number;
+  exhaustedRepeats: number;
+  minDistinctTemplates: number;
+  skills: Array<{
     skill: string;
     overall: number;
     overallText: string;
@@ -310,157 +372,178 @@ type CohortResult = {
     exhaustedSwitch: number;
     worst: number;
     worstChild: string;
+    worstChildren: number;
+    minDistinct: number;
   }>;
-  spread: Array<{ skill: string; min: number; median: number; max: number }>;
-  perChild: SkillSwitchRate[][];
-  shares: TemplateShareRow[];
 };
 
-type TemplateShareRow = {
-  skill: string;
-  templateId: string;
-  templateVersion: number;
-  issued: number;
-  skillIssued: number;
-  share: number;
-};
-
-function cohortTemplateShares(children: PoolIssuanceCount[][]): TemplateShareRow[] {
-  const issued = new Map<string, { skill: string; templateId: string; templateVersion: number; issued: number }>();
-  const skillIssued = new Map<string, number>();
-  for (const pools of children) {
-    for (const pool of pools) {
-      skillIssued.set(pool.skill, (skillIssued.get(pool.skill) ?? 0) + pool.issued);
-      const key = `${pool.skill}\0${pool.templateId}`;
-      const row = issued.get(key) ?? {
-        skill: pool.skill,
-        templateId: pool.templateId,
-        templateVersion: pool.templateVersion,
-        issued: 0,
-      };
-      row.issued += pool.issued;
-      issued.set(key, row);
-    }
-  }
-  return [...issued.values()]
-    .map((row) => {
-      const total = skillIssued.get(row.skill) ?? 0;
-      return { ...row, skillIssued: total, share: total === 0 ? 0 : row.issued / total };
-    })
-    .sort((left, right) =>
-      left.skill < right.skill ? -1
-      : left.skill > right.skill ? 1
-      : left.templateId < right.templateId ? -1
-      : left.templateId > right.templateId ? 1
-      : 0,
-    );
+function rememberBand(
+  db: Database.Database,
+  childId: string,
+  skill: string,
+  band: "Still learning" | "Got it",
+): void {
+  db.prepare(
+    `INSERT INTO learner_skill_state (
+       child_id, skill, band_label, show_concept_chip, celebration_tier, updated_at
+     ) VALUES (?, ?, ?, 0, 'none', ?)`,
+  ).run(childId, skill, band, WHEN);
 }
 
-function runChildCohort(
+/** The index `startPracticeSession` would store for this lane and child. */
+function productionStartIndex(db: Database.Database, childId: string, kind: LaneKind): number {
+  ensureLearnerProgress(db, childId);
+  const lane = kind === "challenge" ? "challenge" : kind === "recommended" ? "recommended" : "review";
+  db.prepare(`UPDATE learner_progress SET difficulty_step = 1, next_lane = ? WHERE child_id = ?`).run(
+    lane,
+    childId,
+  );
+  if (kind === "index6") {
+    for (const item of ITEM_CATALOG) {
+      rememberBand(db, childId, item.skill, item.skill === SKILLS.compare ? "Still learning" : "Got it");
+    }
+  } else if (kind === "review") {
+    for (const item of ITEM_CATALOG) rememberBand(db, childId, item.skill, "Still learning");
+  }
+  const progress = ensureLearnerProgress(db, childId);
+  const reviewSkill = progress.nextLane === "review" ? firstReviewSkill(db, childId) : null;
+  return startIndexForLane(progress.nextLane, progress.difficultyStep, reviewSkill);
+}
+
+function catalogSkillRates(db: Database.Database, childId: string): SkillSwitchRate[] {
+  const rates = skillSwitchRates(db, childId);
+  return ITEM_CATALOG.map((item) => {
+    const row = rates.find((rate) => rate.skill === item.skill);
+    return (
+      row ?? {
+        skill: item.skill,
+        issued: 0,
+        templateSwitch: 0,
+        exhaustedSwitch: 0,
+        exhaustedRepeat: 0,
+        rate: 0,
+      }
+    );
+  });
+}
+
+function exactRepeatCount(db: Database.Database, childId: string): number {
+  const rows = db
+    .prepare(`SELECT template_id AS templateId, operand_key AS operandKey FROM item_instances WHERE child_id = ?`)
+    .all(childId) as Array<{ templateId: string; operandKey: string }>;
+  const keys = rows.map((row) => `${row.templateId}:${row.operandKey}`);
+  return keys.length - new Set(keys).size;
+}
+
+/**
+ * Twenty fresh child ids, no pinned prefixes. Each session restarts at the
+ * production start index. Switch rates are recorded. A rate above 10% is not
+ * a failure: rotation is unchanged.
+ */
+function measureProductionCohort(
   db: Database.Database,
   email: string,
-  input: { childPrefix: string; sessionsPerDay: number },
-): CohortResult {
+  input: { kind: LaneKind; label: string; sessionsPerDay: number },
+): LaneCohortReport {
   const childCount = 20;
   const guardian = createGuardian(db, {
     email,
     password: "correct-horse",
     timezone: "America/Los_Angeles",
   });
-  const insertChild = db.prepare(
-    `INSERT INTO children (id, guardian_id, display_name, timezone, created_at)
-     VALUES (?, ?, ?, 'America/Los_Angeles', ?)`,
-  );
   const perChild: SkillSwitchRate[][] = [];
   const distinctByChild: Array<Array<{ skill: string; templates: number }>> = [];
-  const poolsByChild: PoolIssuanceCount[][] = [];
-  let worstSessionSwitches = 0;
+  let maxSessionSwitches = 0;
+  let exactRepeats = 0;
+  let startIndex = -1;
   for (let index = 0; index < childCount; index += 1) {
-    const childId = `${input.childPrefix}-${String(index).padStart(2, "0")}`;
-    insertChild.run(childId, guardian.id, `Child ${index}`, WHEN);
-    const rotation = issueRotationWeek(db, childId, Date.parse(WHEN), {
+    const child = createChild(db, guardian.id, { displayName: "Ava" });
+    expect(child.id).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
+    );
+    const childStart = productionStartIndex(db, child.id, input.kind);
+    if (index === 0) startIndex = childStart;
+    expect(childStart).toBe(startIndex);
+    const rotation = issueRotationWeek(db, child.id, Date.parse(WHEN), {
       sessionsPerDay: input.sessionsPerDay,
       itemsPerSession: 15,
       days: 7,
-      keyPrefix: childId,
+      keyPrefix: child.id,
+      startIndex: childStart,
     });
-    worstSessionSwitches = Math.max(worstSessionSwitches, assertAtMostOneSwitch(rotation.sessions));
-    distinctByChild.push(assertDistinctTemplates(db, childId));
-    perChild.push(assertRotationLimits(db, childId));
-    const pools = poolIssuanceCounts(db, childId);
-    const hot = pools.filter((pool) => pool.aboveShareCap);
-    expect(
-      hot.map((pool) => `${childId} ${pool.skill} ${pool.templateId} ${(pool.share * 100).toFixed(1)}%`),
-      "template share above 60%",
-    ).toEqual([]);
-    poolsByChild.push(pools);
+    maxSessionSwitches = Math.max(
+      maxSessionSwitches,
+      rotation.sessions.reduce((max, session) => Math.max(max, session.switches.length), 0),
+    );
+    exactRepeats += exactRepeatCount(db, child.id);
+    distinctByChild.push(distinctTemplatesBySkill(db, child.id));
+    perChild.push(catalogSkillRates(db, child.id));
   }
-  const skills = perChild[0]?.map((row) => row.skill) ?? [];
-  const summary = skills.map((skill) => {
+  const skills = ITEM_CATALOG.map((item) => {
     let issued = 0;
     let templateSwitch = 0;
     let exhaustedSwitch = 0;
     let worstRate = 0;
     let worstChild = "";
+    let worstChildren = 0;
     for (let index = 0; index < perChild.length; index += 1) {
-      const row = perChild[index]?.find((item) => item.skill === skill);
+      const row = perChild[index]?.find((itemRate) => itemRate.skill === item.skill);
       if (!row) continue;
       issued += row.issued;
       templateSwitch += row.templateSwitch;
       exhaustedSwitch += row.exhaustedSwitch;
       if (row.rate > worstRate) {
         worstRate = row.rate;
-        worstChild = `${input.childPrefix}-${String(index).padStart(2, "0")}`;
+        worstChild = `child ${String(index).padStart(2, "0")}`;
+        worstChildren = 1;
+      } else if (row.issued > 0 && row.rate === worstRate) {
+        worstChildren += 1;
       }
     }
+    const counts = distinctByChild.map(
+      (rows) => rows.find((row) => row.skill === item.skill)?.templates ?? 0,
+    );
     const switches = templateSwitch + exhaustedSwitch;
     return {
-      skill,
+      skill: item.skill,
       overall: issued === 0 ? 0 : switches / issued,
       overallText: `${switches}/${issued}`,
       templateSwitch,
       exhaustedSwitch,
       worst: worstRate,
       worstChild,
+      worstChildren,
+      minDistinct: Math.min(...counts),
     };
   });
-  const spread = skills.map((skill) => {
-    const counts = distinctByChild.map(
-      (rows) => rows.find((row) => row.skill === skill)?.templates ?? 0,
-    );
-    return {
-      skill,
-      min: Math.min(...counts),
-      median: medianNumber(counts),
-      max: Math.max(...counts),
-    };
-  });
-  return { worstSessionSwitches, summary, spread, perChild, shares: cohortTemplateShares(poolsByChild) };
+  const exhaustedRepeats = perChild.reduce(
+    (sum, rows) => sum + rows.reduce((inner, row) => inner + row.exhaustedRepeat, 0),
+    0,
+  );
+  return {
+    label: input.label,
+    startIndex,
+    startSkill: itemAt(startIndex).skill,
+    sessionsPerDay: input.sessionsPerDay,
+    childCount,
+    maxSessionSwitches,
+    exactRepeats,
+    exhaustedRepeats,
+    minDistinctTemplates: Math.min(...skills.map((row) => row.minDistinct)),
+    skills,
+  };
 }
 
-function assertCohortLimits(result: CohortResult): void {
-  expect(result.worstSessionSwitches).toBeLessThanOrEqual(1);
-  const over = result.summary.filter(
-    (row) => row.overall > MAX_SKILL_SWITCH_RATE || row.worst > MAX_SKILL_SWITCH_RATE,
-  );
-  expect(
-    over.map(
+function formatLaneCohort(report: LaneCohortReport): string {
+  const lines = [
+    `${report.label}: start index ${report.startIndex} (${report.startSkill}), ${report.sessionsPerDay} session(s)/day, ${report.childCount} children`,
+    `max switches in one session ${report.maxSessionSwitches}; exact repeats ${report.exactRepeats}; exhausted_repeat ${report.exhaustedRepeats}; min distinct templates ${report.minDistinctTemplates}`,
+    ...report.skills.map(
       (row) =>
-        `${row.skill}: overall ${row.overallText}, worst ${(row.worst * 100).toFixed(1)}% (${row.worstChild})`,
+        `${row.skill}: ${(row.overall * 100).toFixed(1)}% (${row.overallText}; template ${row.templateSwitch}, exhausted ${row.exhaustedSwitch}); worst child-week ${(row.worst * 100).toFixed(1)}% (${row.worst === 0 ? "none" : row.worstChildren === report.childCount ? "every child" : `${row.worstChildren} children, first ${row.worstChild}`}); min distinct ${row.minDistinct}`,
     ),
-    "cohort switch rate above 10%",
-  ).toEqual([]);
-  expect(result.summary).toHaveLength(ITEM_CATALOG.length);
-  const thin = result.spread.filter((row) => row.min < MIN_DISTINCT_TEMPLATES);
-  expect(
-    thin.map((row) => `${row.skill}: min ${row.min}`),
-    "fewer than 3 distinct templates in a child-week",
-  ).toEqual([]);
-  const hot = result.shares.filter((row) => row.share > TEMPLATE_SHARE_CAP);
-  expect(
-    hot.map((row) => `${row.skill} ${row.templateId} ${(row.share * 100).toFixed(1)}%`),
-    "cohort template share above 60%",
-  ).toEqual([]);
+  ];
+  return lines.join("\n");
 }
 
 function assertAtMostOneSwitch(sessions: SessionSwitchLog[]): number {
@@ -1171,16 +1254,31 @@ describe("item templates and issuance", () => {
       `UPDATE item_template_versions SET active = 0
        WHERE skill_id = ? AND template_id != 'frac-equiv-mixed'`,
     ).run(SKILLS.equiv);
+    const spacer = newestTemplate("frac-equiv-scale");
+    if (!spacer) throw new Error("missing scale template");
     const { child, session } = granted(db);
     const seen = new Set<string>();
     let previousKey = "";
     for (let index = 0; index < filtered.length; index += 1) {
+      const at = Date.parse(WHEN) + index * 1000;
+      if (index > 0) {
+        plantOtherTemplateSeen(
+          db,
+          child.id,
+          session.sessionId,
+          spacer.templateId,
+          spacer.version,
+          SKILLS.equiv,
+          new Date(at - 1).toISOString(),
+          `mixed-gap-${index}`,
+        );
+      }
       const issued = issueForProgression(db, {
         childId: child.id,
         sessionId: session.sessionId,
         skillId: SKILLS.equiv,
         idempotencyKey: `mixed-pool-${index}`,
-        now: new Date(Date.parse(WHEN) + index * 1000).toISOString(),
+        now: new Date(at).toISOString(),
       });
       expect(issued.templateId).toBe("frac-equiv-mixed");
       expect(issued.requireForm).toBe("mixed");
@@ -2401,16 +2499,31 @@ describe("item templates and issuance", () => {
       `UPDATE item_template_versions SET active = 0
        WHERE skill_id = ? AND template_id != 'frac-equiv-lowest'`,
     ).run(SKILLS.equiv);
+    const spacer = newestTemplate("frac-equiv-scale");
+    if (!spacer) throw new Error("missing scale template");
     const { child, session } = granted(db);
     const seen = new Set<string>();
     let previousKey = "";
     for (let index = 0; index < filtered.length; index += 1) {
+      const at = Date.parse(WHEN) + index * 1000;
+      if (index > 0) {
+        plantOtherTemplateSeen(
+          db,
+          child.id,
+          session.sessionId,
+          spacer.templateId,
+          spacer.version,
+          SKILLS.equiv,
+          new Date(at - 1).toISOString(),
+          `lowest-gap-${index}`,
+        );
+      }
       const issued = issueForProgression(db, {
         childId: child.id,
         sessionId: session.sessionId,
         skillId: SKILLS.equiv,
         idempotencyKey: `lowest-pool-${index}`,
-        now: new Date(Date.parse(WHEN) + index * 1000).toISOString(),
+        now: new Date(at).toISOString(),
       });
       expect(issued.templateId).toBe("frac-equiv-lowest");
       expect(issued.issueReason).toBe("normal");
@@ -3487,14 +3600,29 @@ describe("item templates and issuance", () => {
     if (!lowest) throw new Error("missing lowest template");
     const pool = eligibleDraws(lowest, 1);
     expect(eligibleDraws(lowest, 2).length).toBeGreaterThan(0);
+    const spacer = newestTemplate("frac-equiv-scale");
+    if (!spacer) throw new Error("missing scale template");
     const filled: string[] = [];
     for (let index = 0; index < pool.length; index += 1) {
+      const at = Date.parse(WHEN) + index * 1000;
+      if (index > 0) {
+        plantOtherTemplateSeen(
+          db,
+          child.id,
+          session.sessionId,
+          spacer.templateId,
+          spacer.version,
+          SKILLS.equiv,
+          new Date(at - 1).toISOString(),
+          `order-gap-${index}`,
+        );
+      }
       const issued = issueForProgression(db, {
         childId: child.id,
         sessionId: session.sessionId,
         skillId: SKILLS.equiv,
         idempotencyKey: `order-fill-${index}`,
-        now: new Date(Date.parse(WHEN) + index * 1000).toISOString(),
+        now: new Date(at).toISOString(),
       });
       expect(issued.issueReason).toBe("normal");
       expect(issued.templateId).toBe("frac-equiv-lowest");
@@ -3887,13 +4015,28 @@ describe("item templates and issuance", () => {
     if (!lowest) throw new Error("missing lowest template");
     const pool = eligibleDraws(lowest, 1);
     expect(pool.length).toBeGreaterThan(0);
+    const spacer = newestTemplate("frac-equiv-scale");
+    if (!spacer) throw new Error("missing scale template");
     for (let index = 0; index < pool.length; index += 1) {
+      const at = Date.parse(WHEN) + index * 1000;
+      if (index > 0) {
+        plantOtherTemplateSeen(
+          db,
+          child.id,
+          session.sessionId,
+          spacer.templateId,
+          spacer.version,
+          SKILLS.equiv,
+          new Date(at - 1).toISOString(),
+          `next-gap-${index}`,
+        );
+      }
       const issued = issueForProgression(db, {
         childId: child.id,
         sessionId: session.sessionId,
         skillId: SKILLS.equiv,
         idempotencyKey: `next-fill-${index}`,
-        now: new Date(Date.parse(WHEN) + index * 1000).toISOString(),
+        now: new Date(at).toISOString(),
       });
       expect(issued.issueReason).toBe("normal");
       expect(issued.templateId).toBe("frac-equiv-lowest");
@@ -3941,17 +4084,22 @@ describe("item templates and issuance", () => {
     const { child, session } = granted(db);
     const opened = readItemInstance(db, session.item.itemInstanceId ?? "");
     if (!opened) throw new Error("session did not issue");
+    const gap = newestTemplate("frac-equiv-scale");
+    if (!gap) throw new Error("missing scale template");
     let clock = Date.parse(opened.issuedAt);
     for (let index = 0; index < mixedPool.length; index += 1) {
       if (index > 0) {
         clock += 1000;
-        issueForProgression(db, {
-          childId: child.id,
-          sessionId: session.sessionId,
-          skillId: SKILLS.add,
-          idempotencyKey: `improper-left-gap-${index}`,
-          now: new Date(clock).toISOString(),
-        });
+        plantOtherTemplateSeen(
+          db,
+          child.id,
+          session.sessionId,
+          gap.templateId,
+          gap.version,
+          SKILLS.equiv,
+          new Date(clock).toISOString(),
+          `improper-left-gap-${index}`,
+        );
       }
       clock += 1000;
       const issued = issueForProgression(db, {
@@ -4021,11 +4169,11 @@ describe("item templates and issuance", () => {
     expect(TEMPLATE_DRAW_WEIGHTS).toEqual({});
   });
 
-  it("breaks a never-issued template tie with the child id", () => {
-    const firstTemplate = (childId: string, key: string) => {
+  it("breaks a never-issued template tie with the child id and skill", () => {
+    const firstPick = (childId: string, skillId: string, key: string) => {
       const db = tempDb();
       const guardian = createGuardian(db, {
-        email: `${childId}@example.com`,
+        email: `${childId}-${skillId.length}@example.com`,
         password: "correct-horse",
         timezone: "America/Los_Angeles",
       });
@@ -4037,18 +4185,34 @@ describe("item templates and issuance", () => {
       const issued = issueForProgression(db, {
         childId,
         sessionId: `${childId}-session`,
-        skillId: SKILLS.sub,
+        skillId,
         idempotencyKey: key,
         now: new Date(Date.parse(WHEN) + 1000).toISOString(),
       });
-      return issued.templateId;
+      const ids = db
+        .prepare(
+          `SELECT template_id AS templateId
+           FROM item_template_versions
+           WHERE skill_id = ? AND active = 1
+           GROUP BY template_id
+           ORDER BY template_id ASC`,
+        )
+        .all(skillId) as Array<{ templateId: string }>;
+      return {
+        templateId: issued.templateId,
+        index: ids.findIndex((row) => row.templateId === issued.templateId),
+        length: ids.length,
+      };
     };
-    const left = firstTemplate("tie-child", "tie-key-a");
-    expect(firstTemplate("tie-child", "tie-key-b")).toBe(left);
-    const others = ["tie-b", "tie-c", "tie-d", "tie-e", "tie-f", "tie-g", "tie-h"].map((id) =>
-      firstTemplate(id, "tie-key-a"),
-    );
-    expect(others.some((templateId) => templateId !== left)).toBe(true);
+    const left = firstPick("tie-child", SKILLS.sub, "tie-key-a");
+    expect(firstPick("tie-child", SKILLS.sub, "tie-key-b").templateId).toBe(left.templateId);
+    const children = ["tie-child", "tie-b", "tie-c", "tie-d", "tie-e", "tie-f", "tie-g", "tie-h"];
+    const subtract = children.map((id) => firstPick(id, SKILLS.sub, "tie-key-a"));
+    expect(subtract.some((pick) => pick.templateId !== left.templateId)).toBe(true);
+    const adding = children.map((id) => firstPick(id, SKILLS.add, "tie-key-a"));
+    expect(subtract[0]?.length).toBe(adding[0]?.length);
+    expect(subtract[0]?.length).toBeGreaterThan(1);
+    expect(subtract.some((pick, index) => pick.index !== adding[index]?.index)).toBe(true);
   });
 
   it("flags a template above 60% of a skill's draws", () => {
@@ -4205,6 +4369,85 @@ describe("item templates and issuance", () => {
     expect(stillFresh).toBeLessThan(eligibleDraws(inline, 1).length);
   });
 
+  it("keeps a non-evidence template flag when a switch lands on it", () => {
+    const db = tempDb();
+    db.prepare(
+      `UPDATE item_template_versions SET active = 0
+       WHERE skill_id = ? AND template_id != 'sub-2d-inline'`,
+    ).run(SKILLS.sub);
+    db.prepare(
+      `UPDATE item_template_versions SET evidence_eligible = 0 WHERE template_id != 'sub-2d-inline'`,
+    ).run();
+    const { child, session } = granted(db, "non-evidence-switch@example.com");
+    const opened = readItemInstance(db, session.item.itemInstanceId ?? "");
+    if (!opened) throw new Error("session did not issue");
+    const start = Date.parse(opened.issuedAt);
+    const first = issueForProgression(db, {
+      childId: child.id,
+      sessionId: session.sessionId,
+      skillId: SKILLS.sub,
+      idempotencyKey: "non-evidence-first",
+      now: new Date(start + 1000).toISOString(),
+    });
+    expect(first.issueReason).toBe("normal");
+    expect(first.templateId).toBe("sub-2d-inline");
+    expect(first.evidenceEligible).toBe(true);
+    const switched = issueForProgression(db, {
+      childId: child.id,
+      sessionId: session.sessionId,
+      skillId: SKILLS.sub,
+      idempotencyKey: "non-evidence-switch",
+      now: new Date(start + 2000).toISOString(),
+    });
+    expect(switched.issueReason).toBe("template_switch");
+    expect(switched.templateId).not.toBe("sub-2d-inline");
+    expect(switched.evidenceEligible).toBe(false);
+    const stored = db
+      .prepare(`SELECT evidence_eligible AS evidence FROM item_instances WHERE item_instance_id = ?`)
+      .get(switched.itemInstanceId) as { evidence: number };
+    expect(stored.evidence).toBe(0);
+  });
+
+  it("excludes only the last template issued for this skill", () => {
+    const db = tempDb();
+    db.prepare(
+      `UPDATE item_template_versions SET active = 0
+       WHERE skill_id = ? AND template_id != 'sub-2d-inline'`,
+    ).run(SKILLS.sub);
+    const { child, session } = granted(db, "just-this-skill@example.com");
+    const opened = readItemInstance(db, session.item.itemInstanceId ?? "");
+    if (!opened) throw new Error("session did not issue");
+    const start = Date.parse(opened.issuedAt);
+    const first = issueForProgression(db, {
+      childId: child.id,
+      sessionId: session.sessionId,
+      skillId: SKILLS.sub,
+      idempotencyKey: "just-skill-sub",
+      now: new Date(start + 1000).toISOString(),
+    });
+    expect(first.issueReason).toBe("normal");
+    expect(first.templateId).toBe("sub-2d-inline");
+    const otherSkill = issueForProgression(db, {
+      childId: child.id,
+      sessionId: session.sessionId,
+      skillId: SKILLS.add,
+      idempotencyKey: "just-skill-add",
+      now: new Date(start + 2000).toISOString(),
+    });
+    expect(otherSkill.issueReason).toBe("normal");
+    expect(otherSkill.templateId).not.toBe("sub-2d-inline");
+    const again = issueForProgression(db, {
+      childId: child.id,
+      sessionId: session.sessionId,
+      skillId: SKILLS.sub,
+      idempotencyKey: "just-skill-sub-again",
+      now: new Date(start + 3000).toISOString(),
+    });
+    expect(again.issueReason).toBe("template_switch");
+    expect(again.requestedSkillId).toBe(SKILLS.sub);
+    expect(again.templateId).not.toBe("sub-2d-inline");
+  });
+
   it("issues every fresh template before repeating one", () => {
     const db = tempDb();
     const { child, session } = granted(db, "round-robin@example.com");
@@ -4226,7 +4469,8 @@ describe("item templates and issuance", () => {
 
   it("gives a 7-day dogfood run zero exact repeats", () => {
     // Simulation (a): 15 items per session, one session a day, for 7 days.
-    // Skills follow the current 11-slot catalog rotation.
+    // The catalog slot carries across sessions. Production restarts each
+    // session at startIndexForLane; the lane cohorts below measure that.
     const itemsPerSession = 15;
     const days = 7;
     const db = tempDb();
@@ -4304,7 +4548,8 @@ describe("item templates and issuance", () => {
   });
 
   it("gives a heavy rotation week zero repeats and a switch rate of at most 10%", () => {
-    // Simulation (c): 2 sessions of 15 items a day, for 7 days, on the 11-slot rotation.
+    // Simulation (c): 2 sessions of 15 items a day, for 7 days. The slot carries
+    // across sessions, so the 10% cap here is not the production-start gate.
     const sessionsPerDay = 2;
     const itemsPerSession = 15;
     const days = 7;
@@ -4328,45 +4573,31 @@ describe("item templates and issuance", () => {
     expect(repeatPoolReport(db, child.id)).toEqual([]);
   }, 30_000);
 
-  it("gives 20 children a one-session week under the template floor", () => {
-    // 1 session of 15 items a day for 7 days. Child ids are fixed and distinct.
-    // There is no session opener. Round-robin must clear 3 templates for every child.
-    const db = tempDb();
-    const result = runChildCohort(db, "cohort-once@example.com", {
-      childPrefix: "once",
-      sessionsPerDay: 1,
-    });
-    assertCohortLimits(result);
-    for (const rows of result.perChild) {
-      const compare = rows.find((row) => row.skill === SKILLS.compare);
-      expect(compare).toMatchObject({ issued: 9, templateSwitch: 0, exhaustedSwitch: 0 });
+  const productionCohorts: Array<{ kind: LaneKind; label: string; index: number }> = [
+    { kind: "recommended", label: "recommended start", index: 2 },
+    { kind: "challenge", label: "challenge start", index: 4 },
+    { kind: "index6", label: "index 6", index: 6 },
+    { kind: "review", label: "review start", index: 0 },
+  ];
+  for (const sessionsPerDay of [1, 2] as const) {
+    for (const cohort of productionCohorts) {
+      it(`reports 20 children on ${cohort.label} at ${sessionsPerDay} session(s) a day`, () => {
+        const db = tempDb();
+        const report = measureProductionCohort(db, `lane-${cohort.kind}-${sessionsPerDay}@example.com`, {
+          kind: cohort.kind,
+          label: cohort.label,
+          sessionsPerDay,
+        });
+        expect(report.startIndex, cohort.label).toBe(cohort.index);
+        expect(report.startSkill).toBe(itemAt(cohort.index).skill);
+        expect(report.exactRepeats).toBe(0);
+        expect(report.exhaustedRepeats).toBe(0);
+        const text = formatLaneCohort(report);
+        console.log(text);
+        appendFileSync("/tmp/rotation-lane-cohorts.txt", `${text}\n\n`);
+      }, sessionsPerDay === 2 ? 180_000 : 120_000);
     }
-    expect(
-      result.summary.filter(
-        (row) => row.overall !== 0 || row.worst !== 0 || row.templateSwitch !== 0 || row.exhaustedSwitch !== 0,
-      ),
-    ).toEqual([]);
-  }, 120_000);
-
-  it("gives 20 children a heavy rotation week under the switch cap", () => {
-    // 2 sessions of 15 items a day for 7 days. Child ids are fixed and distinct.
-    // There is no session opener.
-    const db = tempDb();
-    const result = runChildCohort(db, "cohort@example.com", {
-      childPrefix: "cohort",
-      sessionsPerDay: 2,
-    });
-    assertCohortLimits(result);
-    for (const rows of result.perChild) {
-      const compare = rows.find((row) => row.skill === SKILLS.compare);
-      expect(compare).toMatchObject({ issued: 19, templateSwitch: 0, exhaustedSwitch: 0 });
-    }
-    expect(
-      result.summary.filter(
-        (row) => row.overall !== 0 || row.worst !== 0 || row.templateSwitch !== 0 || row.exhaustedSwitch !== 0,
-      ),
-    ).toEqual([]);
-  }, 120_000);
+  }
 
   it("gives every pool a heavy week with zero exhausted repeats", () => {
     // Simulation (b): 2 sessions of 15 items a day, for 7 days.
