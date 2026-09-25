@@ -2914,6 +2914,41 @@ describe("item templates and issuance", () => {
       .get(first.attemptId) as { outcome: string };
     expect(stored.outcome).toBe("correct");
   });
+
+  it("returns reason null for an old attempt with no instance", () => {
+    const attemptsSource = readFileSync(path.join(process.cwd(), "lib/attempts.ts"), "utf8");
+    const reader = attemptsSource.slice(
+      attemptsSource.indexOf("function wrongFormReasonFromAttempt"),
+      attemptsSource.indexOf("function resultFromRow"),
+    );
+    expect(reader.indexOf("if (!row.item_instance_id) return null")).toBeGreaterThan(-1);
+    expect(reader.indexOf("if (!row.item_instance_id) return null")).toBeLessThan(reader.indexOf("answersMatch"));
+    expect(reader).toContain("row.outcome != null");
+
+    const db = tempDb();
+    const { guardian, child, session } = granted(db, "no-instance-reason@example.com");
+    db.prepare(`DELETE FROM item_instances WHERE session_id = ?`).run(session.sessionId);
+    const input = {
+      idempotencyKey: "old-attempt-no-instance",
+      sessionId: session.sessionId,
+      itemId: session.item.id,
+      answer: "42",
+      shownAt: shown(),
+      submittedAt: WHEN,
+    };
+    const first = submitAnswer(db, guardian.id, child.id, input, { now: WHEN });
+    if (isFormatRejected(first)) throw new Error("a readable answer was rejected");
+    expect(first.reason).toBeNull();
+    const stored = db
+      .prepare(`SELECT item_instance_id AS instanceId, outcome FROM attempts WHERE id = ?`)
+      .get(first.attemptId) as { instanceId: string | null; outcome: string };
+    expect(stored.instanceId).toBeNull();
+    const replay = submitAnswer(db, guardian.id, child.id, input, { now: WHEN });
+    if (isFormatRejected(replay)) throw new Error("a readable answer was rejected");
+    expect(replay.replayed).toBe(true);
+    expect(replay.reason).toBeNull();
+    expect(replay.correct).toBe(first.correct);
+  });
 });
 
 function syncedAttempt(idempotencyKey: string): AttemptResult {

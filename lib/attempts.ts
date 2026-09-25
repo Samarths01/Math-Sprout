@@ -272,7 +272,19 @@ function wrongFormReasonFromAttempt(
   row: AttemptRow,
   flags: readonly IntegrityFlag[],
 ) {
+  // An attempt from before instances has nothing frozen. No lookup, no re-grade.
   if (!row.item_instance_id) return null;
+  if (row.outcome != null) {
+    const frozen = db
+      .prepare(`SELECT require_form FROM item_instances WHERE item_instance_id = ?`)
+      .get(row.item_instance_id) as { require_form: string | null } | undefined;
+    if (!frozen || frozen.require_form == null) return null;
+    return wrongFormReasonFor({
+      flags,
+      formMismatch: row.outcome === "form_mismatch",
+      required: frozen.require_form,
+    });
+  }
   const frozen = db
     .prepare(
       `SELECT canonical_answer, compare_mode, require_form
@@ -290,10 +302,9 @@ function wrongFormReasonFromAttempt(
     frozen.compare_mode,
     frozen.require_form as RequireForm,
   );
-  const gradeAgrees = row.outcome == null || row.outcome === verdict;
   return wrongFormReasonFor({
     flags,
-    formMismatch: verdict === "form_mismatch" && gradeAgrees,
+    formMismatch: verdict === "form_mismatch",
     required: frozen.require_form,
   });
 }
