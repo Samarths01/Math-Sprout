@@ -7,9 +7,11 @@ import type { BoundaryOptions, PracticeLane } from "@/lib/mastery";
 import { interfaceCopy } from "@/lib/interface-copy";
 import { PracticeFeedback } from "@/components/practice-feedback";
 import {
+  classifyAttemptFailure,
   consentQueueReason,
   createAttemptQueue,
   OFFLINE_QUEUE_CAP,
+  reloadLiveSession,
   storageQueueStore,
   type QueuedAttempt,
   type SyncPost,
@@ -77,6 +79,8 @@ async function postAttempt(childId: string, attempt: QueuedAttempt): Promise<Syn
     if (isFormatRejected(body)) {
       return { ok: false, reason: "format_rejected", rejected: body };
     }
+    const classified = classifyAttemptFailure(response.status, body);
+    if (classified) return classified;
     if (response.status === 403) {
       if (body?.queueDisposition === "hold") {
         // Receipt retries stay on hold. A failed POST never becomes a drop.
@@ -151,6 +155,9 @@ export function PracticeSession({
   async function flush() {
     const snapshot = await queue().reconcile((attempt) => postAttempt(childId, attempt));
     setPending(snapshot.pending.length);
+    if (reloadLiveSession(waitingKey.current, snapshot, () => window.location.reload())) {
+      return snapshot;
+    }
     if (snapshot.quietCredits) setQuietResume(true);
     if (snapshot.held) setHeldNotice(true);
     if (waitingKey.current) {

@@ -42,6 +42,7 @@ export type SyncPost =
   | { ok: false; reason: "hold"; message: string }
   | { ok: false; reason: "drop"; message: string }
   | { ok: false; reason: "format_rejected"; rejected: FormatRejected }
+  | { ok: false; reason: "invalid_attempt" }
   | { ok: false; reason: "error"; message: string };
 
 export type QueueSnapshot = QueueData & {
@@ -54,6 +55,8 @@ export type QueueSnapshot = QueueData & {
   capped?: boolean;
   /** An unreadable answer was not queued. It is not an attempt. */
   formatRejected?: boolean;
+  /** Queued tries dropped this pass because the server will never accept them. */
+  invalidAttemptKeys?: string[];
 };
 
 const SYNCED_CAP = 40;
@@ -78,6 +81,44 @@ export function consentQueueReason(
 ): "hold" | "drop" {
   if (body?.queueDisposition === "hold") return "hold";
   return "drop";
+}
+
+/**
+ * Missing or invalid instance ids are permanent. 5xx stays retryable.
+ * Other statuses return null so the caller keeps its existing mapping.
+ */
+export function classifyAttemptFailure(
+  status: number,
+  body: { error?: unknown; retryable?: unknown } | null,
+): Extract<SyncPost, { ok: false; reason: "invalid_attempt" | "error" }> | null {
+  if (status === 400 && body?.error === "invalid_attempt" && body.retryable === false) {
+    return { ok: false, reason: "invalid_attempt" };
+  }
+  if (status >= 500) {
+    return {
+      ok: false,
+      reason: "error",
+      message: typeof body?.error === "string" ? body.error : "Could not save that try.",
+    };
+  }
+  return null;
+}
+
+/** Dev console only. The argument is the idempotency key, never the answer. */
+export function warnDroppedAttempt(idempotencyKey: string): void {
+  if (process.env.NODE_ENV === "production") return;
+  console.warn(`Dropped queued attempt ${idempotencyKey}`);
+}
+
+/** A live tab reloads when the try it is waiting on can never sync. */
+export function reloadLiveSession(
+  waitingKey: string | null,
+  snapshot: QueueSnapshot,
+  reload: () => void,
+): boolean {
+  if (!waitingKey || !snapshot.invalidAttemptKeys?.includes(waitingKey)) return false;
+  reload();
+  return true;
 }
 
 function anonymize(attempt: QueuedAttempt): DroppedAttempt {
@@ -188,6 +229,7 @@ export function createAttemptQueue(store: QueueStore) {
       let stopped = false;
       let quietCredits = 0;
       let held = 0;
+      const invalidAttemptKeys: string[] = [];
       for (const attempt of data.pending) {
         if (stopped) {
           stillPending.push(attempt);
@@ -221,6 +263,12 @@ export function createAttemptQueue(store: QueueStore) {
         if (!posted.ok && posted.reason === "format_rejected") {
           continue;
         }
+        if (!posted.ok && posted.reason === "invalid_attempt") {
+          data.dropped.push(anonymize(attempt));
+          invalidAttemptKeys.push(attempt.idempotencyKey);
+          warnDroppedAttempt(attempt.idempotencyKey);
+          continue;
+        }
         if (!posted.ok) {
           stillPending.push(attempt);
           stopped = true;
@@ -242,6 +290,7 @@ export function createAttemptQueue(store: QueueStore) {
         ...(lastError ? { lastError } : {}),
         ...(quietCredits > 0 ? { quietCredits } : {}),
         ...(held > 0 ? { held } : {}),
+        ...(invalidAttemptKeys.length > 0 ? { invalidAttemptKeys } : {}),
       };
     },
   };

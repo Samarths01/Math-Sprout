@@ -18,8 +18,21 @@ import type { AnswerKind } from "@/lib/unparseable";
 /** Progression stays rules-v0 and serves difficulty step 1 only. */
 export const PROGRESSION_DIFFICULTY_STEP = 1 as const;
 export const REPEAT_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
-export const DRAW_RETRY_BOUND = 8;
+/**
+ * Fresh draws before a 7-day repeat is forced.
+ * Each try keeps the first eligible pair, then skips it when that pair
+ * was already issued. Lowest-terms step 1 has 7 such pairs, so the last
+ * unseen one needs many tries: (6/7)^80 is about one in 300,000.
+ */
+export const DRAW_RETRY_BOUND = 80;
 export const ISSUE_BATCH_CAP = 3;
+
+/**
+ * Unanswered instances one session may hold, including the item on screen.
+ * A fresh batch key stops at this cap so it cannot drain the 7-day pool
+ * or leave the current item behind.
+ */
+export const OUTSTANDING_UNANSWERED_CAP = 3;
 
 export type StepWord = "Warm-up" | "Steady" | "Stretch";
 
@@ -549,6 +562,31 @@ export function issueForProgression(
   }
 }
 
+function unansweredCount(db: Database.Database, sessionId: string): number {
+  const row = db
+    .prepare(
+      `SELECT COUNT(*) AS count FROM item_instances
+       WHERE session_id = ? AND consumed_at IS NULL`,
+    )
+    .get(sessionId) as { count: number };
+  return row.count;
+}
+
+function batchAlreadyIssued(
+  db: Database.Database,
+  sessionId: string,
+  idempotencyKey: string,
+  count: number,
+): ItemInstance[] | null {
+  const found: ItemInstance[] = [];
+  for (let slot = 0; slot < count; slot += 1) {
+    const row = readByIdempotency(db, sessionId, `${idempotencyKey}:${slot}`);
+    if (!row) return found.length > 0 ? found : null;
+    found.push(row);
+  }
+  return found;
+}
+
 export function issueItemBatch(
   db: Database.Database,
   input: {
@@ -563,8 +601,12 @@ export function issueItemBatch(
   if (!Number.isInteger(input.count) || input.count < 1 || input.count > ISSUE_BATCH_CAP) {
     throw new DomainError("A practice batch can hold at most 3 problems.", 400);
   }
+  const prior = batchAlreadyIssued(db, input.sessionId, input.idempotencyKey, input.count);
+  if (prior) return prior;
+  const room = OUTSTANDING_UNANSWERED_CAP - unansweredCount(db, input.sessionId);
+  const toIssue = Math.min(input.count, Math.max(0, room));
   const issued: ItemInstance[] = [];
-  for (let slot = 0; slot < input.count; slot += 1) {
+  for (let slot = 0; slot < toIssue; slot += 1) {
     const catalog = itemAt(input.itemIndex + slot);
     issued.push(
       issueForProgression(db, {

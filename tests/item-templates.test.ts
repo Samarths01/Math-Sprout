@@ -3,14 +3,16 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type Database from "better-sqlite3";
+import type { AttemptResult } from "@/lib/attempt-contract";
 import { currentAppBuildSha } from "@/lib/app-build";
 import { parseAnswer, rationalsEqual } from "@/lib/answer-parser";
 import { parseSubmitAttempt, startPracticeSession, submitAnswer, submitAttempt } from "@/lib/attempts";
 import { AnswerBlank } from "@/components/answer-blank";
 import { openDatabase } from "@/lib/db";
 import { DomainError, createChild, createGuardian, setConsent } from "@/lib/domain";
+import { publicErrorBody } from "@/lib/http";
 import { SKILLS, TEMPLATE_VERSIONS, generatedTemplates } from "@/lib/templates/catalog";
 import {
   ambiguousBugs,
@@ -27,6 +29,7 @@ import { cueText } from "@/lib/templates/cues";
 import { exactRepeatRate, formatRejectRates, stepsPracticed } from "@/lib/templates/instruments";
 import {
   ISSUE_BATCH_CAP,
+  OUTSTANDING_UNANSWERED_CAP,
   PROGRESSION_DIFFICULTY_STEP,
   focusForStoredAnswer,
   gradeStoredAnswer,
@@ -46,7 +49,13 @@ import { answersMatch } from "@/lib/templates/rational";
 import { ISSUANCE_TEMPLATE_COLUMNS, issuanceTemplateSelect, seedTemplateVersions } from "@/lib/templates/store";
 import type { TemplateVersion } from "@/lib/templates/types";
 import { evidenceForSkill, readSkillClientView } from "@/lib/learner-state";
-import { createAttemptQueue, memoryQueueStore } from "@/lib/offline-queue";
+import {
+  classifyAttemptFailure,
+  createAttemptQueue,
+  memoryQueueStore,
+  reloadLiveSession,
+  type QueuedAttempt,
+} from "@/lib/offline-queue";
 import { provisionalVerdict } from "@/lib/provisional-verdict";
 import { POLICY_VERSION } from "@/lib/policy";
 import {
@@ -1538,7 +1547,14 @@ describe("item templates and issuance", () => {
       now: WHEN,
     });
     expect(retry.map((item) => item.itemInstanceId)).toEqual(batch.map((item) => item.itemInstanceId));
-    expect(instanceCount(db, child.id)).toBe(before + 3);
+    const openBeforeScore = db
+      .prepare(
+        `SELECT COUNT(*) AS count FROM item_instances
+         WHERE session_id = ? AND consumed_at IS NULL`,
+      )
+      .get(session.sessionId) as { count: number };
+    expect(openBeforeScore.count).toBe(OUTSTANDING_UNANSWERED_CAP);
+    expect(instanceCount(db, child.id)).toBe(before + (OUTSTANDING_UNANSWERED_CAP - 1));
     expect(provisionalVerdict()).toEqual({ pending: true, revealsAnswer: false, mints: false });
     expect(xpCount(db)).toBe(0);
     const first = batch[0];
@@ -1715,6 +1731,52 @@ describe("item templates and issuance", () => {
         submittedAt: WHEN,
       }),
     ).toThrow(/issued problem id is required/);
+    let caught: unknown;
+    try {
+      submitAnswer(db, guardian.id, child.id, {
+        idempotencyKey: "missing-instance-body",
+        sessionId: session.sessionId,
+        itemId: session.item.id,
+        answer: "42",
+        shownAt: shown(),
+        submittedAt: WHEN,
+      });
+    } catch (error) {
+      caught = error;
+    }
+    expect(publicErrorBody(caught)).toEqual({
+      status: 400,
+      body: { error: "invalid_attempt", retryable: false },
+    });
+    expect(() =>
+      parseSubmitAttempt({
+        idempotencyKey: "bad-instance-format",
+        sessionId: session.sessionId,
+        itemId: session.item.id,
+        itemInstanceId: "nope",
+        answer: "1",
+        shownAt: shown(),
+        submittedAt: WHEN,
+      }),
+    ).toThrow(/not in this practice pack/);
+    let invalid: unknown;
+    try {
+      parseSubmitAttempt({
+        idempotencyKey: "bad-instance-body",
+        sessionId: session.sessionId,
+        itemId: session.item.id,
+        itemInstanceId: "nope",
+        answer: "1",
+        shownAt: shown(),
+        submittedAt: WHEN,
+      });
+    } catch (error) {
+      invalid = error;
+    }
+    expect(publicErrorBody(invalid)).toEqual({
+      status: 400,
+      body: { error: "invalid_attempt", retryable: false },
+    });
     expect(attemptCount(db)).toBe(beforeAttempts);
     expect(xpCount(db)).toBe(beforeXp);
     expect(qualifyingDays(db, child.id)).toBe(beforeDays);
@@ -1856,6 +1918,51 @@ describe("item templates and issuance", () => {
     expect(eligibleDraws(lowest, 2).some((draw) => !isProperFraction(draw.canonicalAnswer))).toBe(true);
   });
 
+  it("forces the oldest exposure when the lowest-terms step 1 pool is exhausted", () => {
+    const lowest = TEMPLATE_VERSIONS.find((template) => template.templateId === "frac-equiv-lowest");
+    if (!lowest) throw new Error("missing lowest template");
+    const filtered = eligibleDraws(lowest, 1);
+    expect(filtered).toHaveLength(7);
+    expect(filtered.every((draw) => isProperFraction(draw.canonicalAnswer))).toBe(true);
+    const db = tempDb();
+    db.prepare(
+      `UPDATE item_template_versions SET active = 0
+       WHERE skill_id = ? AND template_id != 'frac-equiv-lowest'`,
+    ).run(SKILLS.equiv);
+    const { child, session } = granted(db);
+    const seen = new Set<string>();
+    let previousKey = "";
+    let oldestKey = "";
+    for (let index = 0; index < filtered.length; index += 1) {
+      const issued = issueForProgression(db, {
+        childId: child.id,
+        sessionId: session.sessionId,
+        skillId: SKILLS.equiv,
+        idempotencyKey: `lowest-pool-${index}`,
+        now: new Date(Date.parse(WHEN) + index * 1000).toISOString(),
+      });
+      expect(issued.templateId).toBe("frac-equiv-lowest");
+      expect(issued.repeatForced).toBe(false);
+      expect(isProperFraction(issued.canonicalAnswer)).toBe(true);
+      expect(seen.has(issued.operandKey)).toBe(false);
+      if (previousKey) expect(issued.operandKey).not.toBe(previousKey);
+      if (index === 0) oldestKey = issued.operandKey;
+      previousKey = issued.operandKey;
+      seen.add(issued.operandKey);
+    }
+    expect(seen.size).toBe(7);
+    const forced = issueForProgression(db, {
+      childId: child.id,
+      sessionId: session.sessionId,
+      skillId: SKILLS.equiv,
+      idempotencyKey: "lowest-pool-forced",
+      now: new Date(Date.parse(WHEN) + filtered.length * 1000).toISOString(),
+    });
+    expect(forced.repeatForced).toBe(true);
+    expect(forced.operandKey).toBe(oldestKey);
+    expect(isProperFraction(forced.canonicalAnswer)).toBe(true);
+  });
+
   it("accepts a reduced mixed number on lowest_terms", () => {
     expect(answersMatch("3/2", "1 1/2", "rational", "lowest_terms")).toBe("correct");
     const db = tempDb();
@@ -1970,4 +2077,181 @@ describe("item templates and issuance", () => {
     expect(scored.lockIn).toBe("3");
     expect(scored.lockIn).not.toContain("3/1");
   });
+
+  it("stops issuing once a session has three unanswered instances", () => {
+    const db = tempDb();
+    const { child, session } = granted(db);
+    const index = db
+      .prepare(`SELECT item_index AS itemIndex FROM practice_sessions WHERE id = ?`)
+      .get(session.sessionId) as { itemIndex: number };
+    const unanswered = () =>
+      (
+        db
+          .prepare(
+            `SELECT COUNT(*) AS count FROM item_instances
+             WHERE session_id = ? AND consumed_at IS NULL`,
+          )
+          .get(session.sessionId) as { count: number }
+      ).count;
+    expect(unanswered()).toBe(1);
+    const first = issueItemBatch(db, {
+      childId: child.id,
+      sessionId: session.sessionId,
+      idempotencyKey: "cap-batch-a",
+      count: ISSUE_BATCH_CAP,
+      itemIndex: index.itemIndex,
+      now: WHEN,
+    });
+    expect(first).toHaveLength(OUTSTANDING_UNANSWERED_CAP - 1);
+    expect(unanswered()).toBe(OUTSTANDING_UNANSWERED_CAP);
+    const second = issueItemBatch(db, {
+      childId: child.id,
+      sessionId: session.sessionId,
+      idempotencyKey: "cap-batch-b",
+      count: ISSUE_BATCH_CAP,
+      itemIndex: index.itemIndex,
+      now: WHEN,
+    });
+    const third = issueItemBatch(db, {
+      childId: child.id,
+      sessionId: session.sessionId,
+      idempotencyKey: "cap-batch-c",
+      count: 1,
+      itemIndex: index.itemIndex,
+      now: WHEN,
+    });
+    expect(second).toEqual([]);
+    expect(third).toEqual([]);
+    expect(unanswered()).toBe(OUTSTANDING_UNANSWERED_CAP);
+    expect(instanceCount(db, child.id)).toBe(OUTSTANDING_UNANSWERED_CAP);
+    const current = readItemInstance(db, session.item.itemInstanceId ?? "");
+    expect(current?.consumedAt).toBeNull();
+  });
+
+  it("drops a queued attempt with no instance id after one 400 and keeps syncing", async () => {
+    const stale: QueuedAttempt = {
+      idempotencyKey: "queued-no-instance",
+      childId: "child-1",
+      sessionId: "session-1",
+      itemId: "ops-g2-add",
+      answer: "17",
+      shownAt: shown(),
+      submittedAt: WHEN,
+    };
+    const later: QueuedAttempt = {
+      ...stale,
+      idempotencyKey: "queued-with-instance",
+      itemInstanceId: "issued-instance-01",
+      answer: "42",
+    };
+    const queue = createAttemptQueue(memoryQueueStore());
+    queue.enqueue(stale);
+    queue.enqueue(later);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    let posts = 0;
+    const snapshot = await queue.reconcile(async (attempt) => {
+      posts += 1;
+      if (!attempt.itemInstanceId) {
+        const classified = classifyAttemptFailure(400, { error: "invalid_attempt", retryable: false });
+        if (!classified) throw new Error("expected a permanent invalid_attempt");
+        return classified;
+      }
+      return { ok: true as const, result: syncedAttempt(attempt.idempotencyKey) };
+    });
+    expect(posts).toBe(2);
+    expect(snapshot.pending).toEqual([]);
+    expect(snapshot.dropped).toEqual([
+      { idempotencyKey: stale.idempotencyKey, childId: stale.childId, sessionId: stale.sessionId },
+    ]);
+    expect(JSON.stringify(snapshot.dropped)).not.toContain(stale.answer);
+    expect(snapshot.synced.map((result) => result.idempotencyKey)).toEqual([later.idempotencyKey]);
+    expect(snapshot.invalidAttemptKeys).toEqual([stale.idempotencyKey]);
+    expect(warn).toHaveBeenCalledWith(`Dropped queued attempt ${stale.idempotencyKey}`);
+    expect(warn.mock.calls.flat().join(" ")).not.toContain(stale.answer);
+    warn.mockRestore();
+
+    let replayed = 0;
+    const again = await queue.reconcile(async () => {
+      replayed += 1;
+      return { ok: true as const, result: syncedAttempt(later.idempotencyKey) };
+    });
+    expect(replayed).toBe(0);
+    expect(again.pending).toEqual([]);
+    expect(again.dropped).toHaveLength(1);
+  });
+
+  it("retries a 5xx from the offline queue", async () => {
+    const attempt: QueuedAttempt = {
+      idempotencyKey: "queued-server-error",
+      childId: "child-1",
+      sessionId: "session-1",
+      itemId: "ops-g2-add",
+      answer: "42",
+      shownAt: shown(),
+      submittedAt: WHEN,
+      itemInstanceId: "issued-instance-01",
+    };
+    const queue = createAttemptQueue(memoryQueueStore());
+    queue.enqueue(attempt);
+    let posts = 0;
+    const waiting = await queue.reconcile(async () => {
+      posts += 1;
+      const classified = classifyAttemptFailure(500, { error: "Something went wrong." });
+      if (!classified) throw new Error("expected a retryable server error");
+      return classified;
+    });
+    expect(posts).toBe(1);
+    expect(waiting.pending).toHaveLength(1);
+    expect(waiting.dropped).toEqual([]);
+    expect(waiting.invalidAttemptKeys).toBeUndefined();
+    const reload = vi.fn();
+    expect(reloadLiveSession(attempt.idempotencyKey, waiting, reload)).toBe(false);
+    expect(reload).not.toHaveBeenCalled();
+
+    const synced = await queue.reconcile(async () => ({
+      ok: true as const,
+      result: syncedAttempt(attempt.idempotencyKey),
+    }));
+    expect(posts).toBe(1);
+    expect(synced.pending).toEqual([]);
+    expect(synced.synced.map((result) => result.idempotencyKey)).toEqual([attempt.idempotencyKey]);
+  });
+
+  it("reloads the live session when a queued try is permanently invalid", () => {
+    const reload = vi.fn();
+    const snapshot = {
+      version: 1 as const,
+      pending: [],
+      blocked: [],
+      dropped: [],
+      synced: [],
+      invalidAttemptKeys: ["live-waiting-key"],
+    };
+    expect(reloadLiveSession("live-waiting-key", snapshot, reload)).toBe(true);
+    expect(reload).toHaveBeenCalledOnce();
+    expect(reloadLiveSession(null, snapshot, reload)).toBe(false);
+    expect(reloadLiveSession("other-key", snapshot, reload)).toBe(false);
+    expect(reload).toHaveBeenCalledOnce();
+  });
 });
+
+function syncedAttempt(idempotencyKey: string): AttemptResult {
+  return {
+    whatWentWell: "",
+    oneFocus: "",
+    tryNext: "",
+    lockIn: "",
+    attemptId: `attempt-${idempotencyKey}`,
+    idempotencyKey,
+    replayed: false,
+    correct: true,
+    celebrationTier: "none",
+    lane: "celebrate",
+    flags: [],
+    eventIds: [],
+    xpAmount: 0,
+    fuel: { credit: 0, heatEventId: null, pieceEventIds: [] },
+    clientView: { bandLabel: "Still learning", showConceptChip: false, celebrationTier: "none" },
+    nextItem: { id: "ops-g2-add", pack: "operations", grade: 2, skill: "add", prompt: "1 + 1" },
+  };
+}

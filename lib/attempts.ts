@@ -11,7 +11,7 @@ import {
   SPAM_WINDOW_MS,
 } from "@/lib/attempt-contract";
 import { buildFourBeat } from "@/lib/beats";
-import { consentDenied, DomainError, getChild } from "@/lib/domain";
+import { consentDenied, DomainError, getChild, invalidAttemptError } from "@/lib/domain";
 import { catalogItem, ITEM_CATALOG } from "@/lib/item-catalog";
 import {
   assertBankMatchesCatalog,
@@ -150,7 +150,7 @@ export function parseSubmitAttempt(
       ? body.itemInstanceId.trim()
       : undefined;
   if (itemInstanceId && !KEY_PATTERN.test(itemInstanceId)) {
-    throw new DomainError("That problem is not in this practice pack.", 400);
+    throw invalidAttemptError("That problem is not in this practice pack.");
   }
   return {
     idempotencyKey,
@@ -442,7 +442,7 @@ export function submitAnswer(
       .prepare(`SELECT COUNT(*) AS count FROM item_instances WHERE session_id = ?`)
       .get(sessionId) as { count: number };
     if (issuedOnSession.count > 0 && !input.itemInstanceId) {
-      throw new DomainError("An issued problem id is required.", 400);
+      throw invalidAttemptError("An issued problem id is required.");
     }
 
     if (input.itemInstanceId) {
