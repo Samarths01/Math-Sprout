@@ -559,6 +559,7 @@ function measureProductionCohort(
   let startIndex = -1;
   for (let index = 0; index < childCount; index += 1) {
     const child = createChild(db, guardian.id, { displayName: "Ava" });
+    setConsent(db, guardian.id, child.id, "grant");
     expect(child.id).toMatch(
       /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
     );

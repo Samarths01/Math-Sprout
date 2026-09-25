@@ -60,9 +60,16 @@ export function readPracticeSession(
   childId: string,
   sessionId: string,
 ): PracticeSessionRow | undefined {
+  const columns = new Set(
+    (db.pragma("table_info(practice_sessions)") as Array<{ name: string }>).map((row) => row.name),
+  );
+  const slotSql = columns.has("slot_seq") ? "slot_seq" : "item_index";
+  const laneStartSql = columns.has("lane_start") ? "lane_start" : "0";
+  const overflowSql = columns.has("overflow_offset") ? "overflow_offset" : "0";
   const row = db
     .prepare(
-      `SELECT id, item_index, slot_seq, lane_start, overflow_offset, practice_lane, phase, progression
+      `SELECT id, item_index, ${slotSql} AS slot_seq, ${laneStartSql} AS lane_start,
+              ${overflowSql} AS overflow_offset, practice_lane, phase, progression
        FROM practice_sessions
        WHERE id = ? AND child_id = ? AND status = 'active'`,
     )
