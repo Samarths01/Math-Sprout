@@ -319,13 +319,14 @@ export function createAttemptQueue(store: QueueStore) {
       }
       const data = store.load();
       // One live entry per issued item. A second Check while that entry is
-      // pending is ignored. The first answer stays. This guard is in the
-      // queue, not only on the disabled Check button.
-      const samePendingItem =
+      // pending, parked, or blocked is ignored. The first answer stays.
+      const sameOpenItem =
         typeof attempt.itemInstanceId === "string" &&
         attempt.itemInstanceId.length > 0 &&
-        data.pending.some((item) => item.itemInstanceId === attempt.itemInstanceId);
-      if (samePendingItem) return store.load();
+        [...data.pending, ...data.parked, ...data.blocked].some(
+          (item) => item.itemInstanceId === attempt.itemInstanceId,
+        );
+      if (sameOpenItem) return store.load();
       const known =
         data.pending.some((item) => item.idempotencyKey === attempt.idempotencyKey) ||
         data.synced.some((item) => item.idempotencyKey === attempt.idempotencyKey) ||

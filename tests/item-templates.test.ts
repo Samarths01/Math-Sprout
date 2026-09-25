@@ -3716,6 +3716,69 @@ describe("item templates and issuance", () => {
     expect(attemptRows.count).toBe(1);
   });
 
+  it("ignores a second Check while that item is parked or blocked", () => {
+    const parkedAttempt: QueuedAttempt = {
+      idempotencyKey: "parked-first-check",
+      childId: "child-1",
+      sessionId: "session-1",
+      itemId: "ops-g2-add",
+      answer: "42",
+      shownAt: shown(),
+      submittedAt: WHEN,
+      itemInstanceId: "issued-instance-parked",
+    };
+    const parkedQueue = createAttemptQueue(
+      memoryQueueStore({
+        version: 1,
+        pending: [],
+        blocked: [],
+        parked: [{ ...parkedAttempt, message: interfaceCopy("offline.parked.kid") }],
+        dropped: [],
+        synced: [],
+      }),
+    );
+    const secondParked = parkedQueue.enqueue({
+      ...parkedAttempt,
+      idempotencyKey: "parked-second-check",
+      answer: "7",
+    });
+    expect(secondParked.pending).toEqual([]);
+    expect(secondParked.parked).toHaveLength(1);
+    expect(secondParked.parked[0]?.answer).toBe("42");
+    expect(JSON.stringify(secondParked)).not.toContain("parked-second-check");
+
+    const blockedAttempt: QueuedAttempt = {
+      ...parkedAttempt,
+      idempotencyKey: "blocked-first-check",
+      itemInstanceId: "issued-instance-blocked",
+    };
+    const blockedQueue = createAttemptQueue(
+      memoryQueueStore({
+        version: 1,
+        pending: [],
+        blocked: [{ ...blockedAttempt, message: "Practice is blocked." }],
+        parked: [],
+        dropped: [],
+        synced: [],
+      }),
+    );
+    const secondBlocked = blockedQueue.enqueue({
+      ...blockedAttempt,
+      idempotencyKey: "blocked-second-check",
+      answer: "9",
+    });
+    expect(secondBlocked.pending).toEqual([]);
+    expect(secondBlocked.blocked).toHaveLength(1);
+    expect(secondBlocked.blocked[0]?.answer).toBe("42");
+
+    const client = readFileSync(path.join(process.cwd(), "components/practice-session.tsx"), "utf8");
+    expect(client).toContain("snapshot.parked.some((entry) => entry.idempotencyKey === waitingKey.current)");
+    expect(client).toContain("snapshot.parked.some((entry) => entry.idempotencyKey === idempotencyKey)");
+    expect(client).not.toMatch(
+      /snapshot\.parked\.some\(\(entry\) => entry\.idempotencyKey === (?:waitingKey\.current|idempotencyKey)\)[\s\S]{0,180}markSavedOffline\(false\)/,
+    );
+  });
+
   it("moves to the next item after a queued offline answer syncs", async () => {
     const db = tempDb();
     const { guardian, child, session } = granted(db, "offline-advance@example.com");
