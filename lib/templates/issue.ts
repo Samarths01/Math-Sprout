@@ -899,6 +899,51 @@ export function issueItemBatch(
   return issued;
 }
 
+/**
+ * Problems for the session's current slots. A slot that already has a row
+ * comes back as that same instance: no second insert, and `issued_at` is
+ * left alone. A missing slot is issued under the unanswered cap.
+ * The key is the session slot, so a new client idempotency key cannot
+ * mint another copy of the item the child is stuck on.
+ */
+export function resumeSessionItems(
+  db: Database.Database,
+  input: {
+    childId: string;
+    sessionId: string;
+    slotSeq: number;
+    count: number;
+    indexes: number[];
+    now?: string;
+  },
+): ItemInstance[] {
+  if (!Number.isInteger(input.count) || input.count < 1 || input.count > ISSUE_BATCH_CAP) {
+    throw new DomainError("A practice batch can hold at most 3 problems.", 400);
+  }
+  const issued: ItemInstance[] = [];
+  for (let offset = 0; offset < input.count; offset += 1) {
+    const slotSeq = input.slotSeq + offset;
+    const key = sessionSlotKey(input.sessionId, slotSeq);
+    const existing = readByIdempotency(db, input.sessionId, key);
+    if (existing) {
+      issued.push(existing);
+      continue;
+    }
+    if (unansweredCount(db, input.sessionId) >= OUTSTANDING_UNANSWERED_CAP) break;
+    const catalog = itemAt(input.indexes[offset] ?? slotSeq);
+    issued.push(
+      issueForProgression(db, {
+        childId: input.childId,
+        sessionId: input.sessionId,
+        skillId: catalog.skill,
+        idempotencyKey: key,
+        now: input.now,
+      }),
+    );
+  }
+  return issued;
+}
+
 export function gradeStoredAnswer(
   instance: ItemInstance,
   given: string,

@@ -13,6 +13,10 @@ export function PracticeProblem({
   answerSlot?: ReactNode;
 }) {
   const word = item.stepWord ?? "Warm-up";
+  const columnLines =
+    item.layout === "column" && item.columnLines && item.columnLines.length > 0
+      ? item.columnLines
+      : null;
   return (
     <div data-testid="practice-problem" className="grid gap-3">
       <div className="flex items-center gap-2 text-sm">
@@ -32,12 +36,13 @@ export function PracticeProblem({
         <span data-testid="concept-name">{item.skill}</span>
         <span>{item.pack === "fractions" ? "Fractions" : "Operations"}</span>
       </div>
-      {item.layout === "column" && item.columnLines && item.columnLines.length > 0 ? (
+      {columnLines ? (
         <pre
           data-testid="column-problem"
+          aria-hidden="true"
           className="font-heading text-[32px] leading-[40px] tracking-tight tabular-nums"
         >
-          {item.columnLines.join("\n")}
+          {columnLines.join("\n")}
         </pre>
       ) : null}
       {item.blankInline ? (
@@ -52,7 +57,11 @@ export function PracticeProblem({
       ) : (
         <h2
           data-testid="practice-prompt"
-          className="font-heading text-[32px] leading-[40px] tracking-tight tabular-nums"
+          className={
+            columnLines
+              ? "sr-only"
+              : "font-heading text-[32px] leading-[40px] tracking-tight tabular-nums"
+          }
         >
           {item.prompt}
         </h2>

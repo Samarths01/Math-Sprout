@@ -5,7 +5,7 @@ import { asRecord, assertSameOrigin, errorResponse, readJson, requireGuardian } 
 import { readPracticeSession } from "@/lib/learner-state";
 import { itemAt } from "@/lib/item-catalog";
 import { plannedCatalogIndexes } from "@/lib/session-plan";
-import { ISSUE_BATCH_CAP, issueItemBatch, publicItemForInstance } from "@/lib/templates/issue";
+import { ISSUE_BATCH_CAP, publicItemForInstance, resumeSessionItems } from "@/lib/templates/issue";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -36,12 +36,13 @@ export async function POST(request: Request, context: Context) {
       session.slot_seq - session.lane_start,
       count,
     );
-    const instances = issueItemBatch(db, {
+    // The client key names the request. The row is the session slot's, so a
+    // reload returns the stuck instance and does not insert or restamp it.
+    const instances = resumeSessionItems(db, {
       childId: id,
       sessionId,
-      idempotencyKey,
+      slotSeq: session.slot_seq,
       count,
-      itemIndex: indexes[0] ?? session.item_index,
       indexes,
     });
     return NextResponse.json({

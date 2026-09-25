@@ -505,7 +505,7 @@ export function submitAnswer(
       )
       .get(childId, windowStart, submittedAt) as { count: number };
     const elapsedMs = Date.parse(submittedAt) - Date.parse(shownAt);
-    let flags = integrityFlags({
+    const flags = integrityFlags({
       answer: input.answer,
       elapsedMs,
       priorInWindow: prior.count,
@@ -524,7 +524,7 @@ export function submitAnswer(
     let difficultyStep: number | null = null;
     let estimatorEvidence: number | null = null;
     let attemptOutcome: "correct" | "incorrect" | "form_mismatch" = "incorrect";
-    let skipEconomy = false;
+    const skipEconomy = false;
 
     const issuedOnSession = db
       .prepare(`SELECT COUNT(*) AS count FROM item_instances WHERE session_id = ?`)
