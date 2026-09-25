@@ -1,3 +1,5 @@
+import type { WrongFormReason } from "@/lib/wrong-form-copy";
+
 export const FOUR_BEAT_KEYS = [
   "whatWentWell",
   "oneFocus",
@@ -81,6 +83,12 @@ export type AttemptResult = FourBeat & {
    * Callers must not present a celebration for a quiet resume.
    */
   resumePresentation?: "quiet";
+  /**
+   * Child-safe form note. Present only when the amount matched and the
+   * written form did not. `null` when this attempt has no form frozen on
+   * its item instance. The stored outcome tag stays off this object.
+   */
+  reason?: WrongFormReason | null;
 };
 
 export const TOO_FAST_MS = 500;

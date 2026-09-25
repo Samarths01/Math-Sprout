@@ -41,6 +41,7 @@ import * as appBuild from "@/lib/app-build";
 import { POLICY_VERSION } from "@/lib/policy";
 import { takePendingPauseHold } from "@/lib/pause-hold";
 import { practiceGate } from "@/lib/practice-gate";
+import { answersMatch, type RequireForm } from "@/lib/templates/rational";
 import {
   consumeItemInstance,
   focusForStoredAnswer,
@@ -56,6 +57,11 @@ import {
   type FormatRejected,
   type UnparseableBehavior,
 } from "@/lib/unparseable";
+import {
+  normalizedTypedAnswer,
+  wrongFormCopy,
+  wrongFormReasonFor,
+} from "@/lib/wrong-form-copy";
 
 const KEY_PATTERN = /^[A-Za-z0-9_-]{8,80}$/;
 
@@ -91,6 +97,8 @@ type AttemptRow = {
   beats_json: string;
   client_view_json: string;
   resume_presentation: "live" | "quiet";
+  item_instance_id: string | null;
+  outcome: "correct" | "incorrect" | "form_mismatch" | null;
 };
 
 assertBankMatchesCatalog();
@@ -209,7 +217,7 @@ function findAttempt(
     .prepare(
       `SELECT id, child_id, session_id, idempotency_key, item_id, answer, correct,
               lane, celebration_tier, flags_json, beats_json, client_view_json,
-              resume_presentation
+              resume_presentation, item_instance_id, outcome
        FROM attempts
        WHERE child_id = ? AND idempotency_key = ?`,
     )
@@ -247,6 +255,60 @@ function readClientView(
   return { bandLabel, showConceptChip, celebrationTier };
 }
 
+function isCompareMode(value: string): value is "rational" | "exact" {
+  return value === "rational" || value === "exact";
+}
+
+/**
+ * The child reason comes from this attempt and the instance row frozen at
+ * issue: stored answer, require_form, canonical answer, compare mode, and
+ * the stored grade. The live template is not read.
+ * `null` means the instance has no frozen form (an attempt from before that
+ * column). `undefined` means a form is frozen and this try is not a clean
+ * wrong-form miss.
+ */
+function wrongFormReasonFromAttempt(
+  db: Database.Database,
+  row: AttemptRow,
+  flags: readonly IntegrityFlag[],
+) {
+  // An attempt from before instances has nothing frozen. No lookup, no re-grade.
+  if (!row.item_instance_id) return null;
+  if (row.outcome != null) {
+    const frozen = db
+      .prepare(`SELECT require_form FROM item_instances WHERE item_instance_id = ?`)
+      .get(row.item_instance_id) as { require_form: string | null } | undefined;
+    if (!frozen || frozen.require_form == null) return null;
+    return wrongFormReasonFor({
+      flags,
+      formMismatch: row.outcome === "form_mismatch",
+      required: frozen.require_form,
+    });
+  }
+  const frozen = db
+    .prepare(
+      `SELECT canonical_answer, compare_mode, require_form
+       FROM item_instances
+       WHERE item_instance_id = ?`,
+    )
+    .get(row.item_instance_id) as
+    | { canonical_answer: string; compare_mode: string; require_form: string | null }
+    | undefined;
+  if (!frozen || frozen.require_form == null) return null;
+  if (!isCompareMode(frozen.compare_mode)) return null;
+  const verdict = answersMatch(
+    frozen.canonical_answer,
+    row.answer,
+    frozen.compare_mode,
+    frozen.require_form as RequireForm,
+  );
+  return wrongFormReasonFor({
+    flags,
+    formMismatch: verdict === "form_mismatch",
+    required: frozen.require_form,
+  });
+}
+
 function resultFromRow(
   db: Database.Database,
   row: AttemptRow,
@@ -268,6 +330,8 @@ function resultFromRow(
     .get(row.session_id) as { slot_seq: number } | undefined;
   if (!session) throw new DomainError("Practice session not found.", 404);
   const beats = readBeats(row.beats_json);
+  const flags = JSON.parse(row.flags_json) as IntegrityFlag[];
+  const reason = wrongFormReasonFromAttempt(db, row, flags);
   if (row.celebration_tier === "full" && credits.length === 0) {
     throw new DomainError("full celebration requires a mint.", 500);
   }
@@ -275,7 +339,6 @@ function resultFromRow(
     throw new DomainError("quietXp celebration requires a mint.", 500);
   }
   const clientView = readClientView(row.client_view_json, row.celebration_tier);
-  const flags = JSON.parse(row.flags_json) as IntegrityFlag[];
   return {
     attemptId: row.id,
     idempotencyKey: row.idempotency_key,
@@ -291,6 +354,7 @@ function resultFromRow(
     clientView,
     nextItem: presentIssuedItem(db, row.child_id, row.session_id, session.slot_seq),
     ...(row.resume_presentation === "quiet" ? { resumePresentation: "quiet" as const } : {}),
+    ...(reason !== undefined ? { reason } : {}),
   };
 }
 
@@ -521,10 +585,23 @@ export function submitAnswer(
         };
       }
       correct = verdict === "correct";
-        const formMiss = verdict === "form_mismatch";
-        const valueMiss = verdict === "incorrect" || formMiss;
-        attemptOutcome = formMiss ? "form_mismatch" : correct ? "correct" : "incorrect";
-        estimatorEvidence = instance.evidenceEligible ? 1 : 0;
+      const formMiss = verdict === "form_mismatch";
+      const valueMiss = verdict === "incorrect" || formMiss;
+      attemptOutcome = formMiss ? "form_mismatch" : correct ? "correct" : "incorrect";
+      estimatorEvidence = instance.evidenceEligible ? 1 : 0;
+      if (formMiss && flags.length === 0 && instance.requireForm) {
+        const copy = wrongFormCopy({
+          typed: normalizedTypedAnswer(input.answer),
+          canonical: instance.canonicalAnswer,
+          required: instance.requireForm,
+        });
+        beats = {
+          whatWentWell: copy.whatWentWell,
+          oneFocus: copy.oneFocus,
+          tryNext: copy.tryNext,
+          lockIn: copy.lockIn,
+        };
+      } else {
         const focus = valueMiss ? focusForStoredAnswer(instance, input.answer) : null;
         beats = buildFourBeat({
           correct,
@@ -537,22 +614,23 @@ export function submitAnswer(
             : {}),
           ...(flags.length === 0 && correct ? { solidify: instance.whyItWorks ?? "" } : {}),
         });
-        economy = planAttemptEconomy(db, {
-          childId,
-          sessionId,
-          idempotencyKey,
-          timeZone: child.timezone,
-          submittedAt,
-          skill: skillItem.skill,
-          correct,
-          flags,
-          practiceLane: session.practice_lane,
-          history: evidenceForSkill(db, childId, skillItem.skill),
-          previousBand: readSkillClientView(db, childId, skillItem.skill)?.bandLabel ?? null,
-        });
-        if (instance.evidenceEligible) {
-          saveSkillState(db, childId, skillItem.skill, economy.clientView);
-        }
+      }
+      economy = planAttemptEconomy(db, {
+        childId,
+        sessionId,
+        idempotencyKey,
+        timeZone: child.timezone,
+        submittedAt,
+        skill: skillItem.skill,
+        correct,
+        flags,
+        practiceLane: session.practice_lane,
+        history: evidenceForSkill(db, childId, skillItem.skill),
+        previousBand: readSkillClientView(db, childId, skillItem.skill)?.bandLabel ?? null,
+      });
+      if (instance.evidenceEligible) {
+        saveSkillState(db, childId, skillItem.skill, economy.clientView);
+      }
       consumeItemInstance(db, instance, idempotencyKey, submittedAt);
     } else {
       correct = gradeAnswer(itemId, input.answer);

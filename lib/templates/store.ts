@@ -98,6 +98,14 @@ CREATE TABLE IF NOT EXISTS answer_format_rejects (
 );
 `;
 
+function addInstanceColumn(db: Database.Database, name: string, ddl: string): void {
+  const columns = new Set(
+    (db.pragma("table_info(item_instances)") as Array<{ name: string }>).map((row) => row.name),
+  );
+  if (columns.size === 0 || columns.has(name)) return;
+  db.exec(`ALTER TABLE item_instances ADD COLUMN ${ddl}`);
+}
+
 function addAttemptColumn(db: Database.Database, name: string, ddl: string): void {
   const columns = new Set(
     (db.pragma("table_info(attempts)") as Array<{ name: string }>).map((row) => row.name),
@@ -130,6 +138,8 @@ CREATE TABLE answer_format_rejects (
 export function migrateItemTemplates(db: Database.Database): void {
   db.exec(TEMPLATE_DDL);
   rebuildFormatRejects(db);
+  // Rows issued before this column stay NULL. Read-back must not invent a form.
+  addInstanceColumn(db, "require_form", "require_form TEXT");
   addAttemptColumn(db, "item_instance_id", "item_instance_id TEXT");
   addAttemptColumn(db, "template_id", "template_id TEXT");
   addAttemptColumn(db, "difficulty_step", "difficulty_step INTEGER");

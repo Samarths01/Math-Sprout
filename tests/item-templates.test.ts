@@ -10,6 +10,7 @@ import { currentAppBuildSha } from "@/lib/app-build";
 import { parseAnswer, rationalsEqual } from "@/lib/answer-parser";
 import { parseSubmitAttempt, startPracticeSession, submitAnswer, submitAttempt } from "@/lib/attempts";
 import { AnswerBlank } from "@/components/answer-blank";
+import { PracticeFeedback } from "@/components/practice-feedback";
 import { openDatabase } from "@/lib/db";
 import { DomainError, createChild, createGuardian, setConsent } from "@/lib/domain";
 import { publicErrorBody } from "@/lib/http";
@@ -48,6 +49,7 @@ import { ITEM_CATALOG, itemAt } from "@/lib/item-catalog";
 import { answersMatch } from "@/lib/templates/rational";
 import { ISSUANCE_TEMPLATE_COLUMNS, issuanceTemplateSelect, seedTemplateVersions } from "@/lib/templates/store";
 import type { TemplateVersion } from "@/lib/templates/types";
+import { feedbackFrames } from "@/lib/feedback-frame";
 import { evidenceForSkill, readSkillClientView } from "@/lib/learner-state";
 import {
   classifyAttemptFailure,
@@ -64,6 +66,13 @@ import {
   isFormatRejected,
   UNPARSEABLE_BEHAVIOR,
 } from "@/lib/unparseable";
+import {
+  WRONG_FORM_LOCK_IN,
+  WRONG_FORM_ONE_FOCUS,
+  WRONG_FORM_WHAT_YOU_TRIED,
+  wrongFormCopy,
+  type WrongFormRequired,
+} from "@/lib/wrong-form-copy";
 
 const cleanups: Array<() => void> = [];
 const WHEN = "2026-06-15T18:00:00.000Z";
@@ -2232,6 +2241,713 @@ describe("item templates and issuance", () => {
     expect(reloadLiveSession(null, snapshot, reload)).toBe(false);
     expect(reloadLiveSession("other-key", snapshot, reload)).toBe(false);
     expect(reload).toHaveBeenCalledOnce();
+  });
+
+  it("returns a wrong_form reason for each required form", () => {
+    const cases: Array<{
+      required: WrongFormRequired;
+      canonical: string;
+      answer: string;
+      typed: string;
+    }> = [
+      { required: "lowest_terms", canonical: "1/2", answer: "2 / 4", typed: "2/4" },
+      { required: "improper", canonical: "3/2", answer: "1 1/2", typed: "1 1/2" },
+      { required: "mixed", canonical: "1 1/2", answer: "3/2", typed: "3/2" },
+    ];
+    const db = tempDb();
+    for (const sample of cases) {
+      const { guardian, child, session } = granted(db, `${sample.required}@example.com`);
+      const issued = issueForProgression(db, {
+        childId: child.id,
+        sessionId: session.sessionId,
+        skillId: SKILLS.equiv,
+        idempotencyKey: `shape-${sample.required}`,
+        now: WHEN,
+      });
+      db.prepare(
+        `UPDATE item_instances
+         SET canonical_answer = ?, answer_line = ?, require_form = ?, compare_mode = 'rational'
+         WHERE item_instance_id = ?`,
+      ).run(sample.canonical, sample.canonical, sample.required, issued.itemInstanceId);
+      const scored = submitAnswer(
+        db,
+        guardian.id,
+        child.id,
+        {
+          idempotencyKey: `shape-score-${sample.required}`,
+          sessionId: session.sessionId,
+          itemId: session.item.id,
+          itemInstanceId: issued.itemInstanceId,
+          answer: sample.answer,
+          shownAt: shown(),
+          submittedAt: WHEN,
+        },
+        { now: WHEN },
+      );
+      if (isFormatRejected(scored)) throw new Error("a readable answer was rejected");
+      const copy = wrongFormCopy({
+        typed: sample.typed,
+        canonical: sample.canonical,
+        required: sample.required,
+      });
+      expect(scored.reason).toEqual({ kind: "wrong_form", required: sample.required });
+      expect(Object.keys(scored.reason ?? {}).sort()).toEqual(["kind", "required"]);
+      expect(scored.correct).toBe(false);
+      expect(scored.whatWentWell).toBe(copy.whatWentWell);
+      expect(scored.whatWentWell).toBe(
+        WRONG_FORM_WHAT_YOU_TRIED.replaceAll("{typed}", sample.typed),
+      );
+      expect(scored.whatWentWell).not.toMatch(/lowest terms|whole number|fraction/);
+      expect(scored.oneFocus).toBe(
+        WRONG_FORM_ONE_FOCUS[sample.required].replaceAll("{canonical}", sample.canonical),
+      );
+      expect(scored.tryNext).toBe("");
+      expect(scored.lockIn).toBe(
+        WRONG_FORM_LOCK_IN.replaceAll("{typed}", sample.typed).replaceAll(
+          "{canonical}",
+          sample.canonical,
+        ),
+      );
+      expect(JSON.stringify(scored)).not.toContain("form_mismatch");
+      const stored = db
+        .prepare(`SELECT beats_json FROM attempts WHERE id = ?`)
+        .get(scored.attemptId) as { beats_json: string };
+      expect(Object.keys(JSON.parse(stored.beats_json) as object).sort()).toEqual([
+        "lockIn",
+        "oneFocus",
+        "tryNext",
+        "whatWentWell",
+      ]);
+    }
+  });
+
+  it("keeps the existing Not-yet copy when the value is wrong", () => {
+    const db = tempDb();
+    const { guardian, child, session } = granted(db, "wrong-amount@example.com");
+    const issued = issueForProgression(db, {
+      childId: child.id,
+      sessionId: session.sessionId,
+      skillId: SKILLS.equiv,
+      idempotencyKey: "wrong-amount-issue",
+      now: WHEN,
+    });
+    db.prepare(
+      `UPDATE item_instances
+       SET canonical_answer = '1/2', answer_line = '1/2', require_form = 'lowest_terms', compare_mode = 'rational'
+       WHERE item_instance_id = ?`,
+    ).run(issued.itemInstanceId);
+    const scored = submitAnswer(
+      db,
+      guardian.id,
+      child.id,
+      {
+        idempotencyKey: "wrong-amount-score",
+        sessionId: session.sessionId,
+        itemId: session.item.id,
+        itemInstanceId: issued.itemInstanceId,
+        answer: "3/4",
+        shownAt: shown(),
+        submittedAt: WHEN,
+      },
+      { now: WHEN },
+    );
+    if (isFormatRejected(scored)) throw new Error("a readable answer was rejected");
+    expect(scored.reason).toBeUndefined();
+    expect(scored.whatWentWell).toBe("You committed to an answer.");
+    expect(scored.lockIn).toBe("1/2");
+    expect(scored.lockIn).not.toBe("3/4 = 1/2");
+    expect(scored.correct).toBe(false);
+    const frames = feedbackFrames(scored);
+    expect(frames.map((frame) => frame.label)).toEqual([
+      "What you tried",
+      "One focus",
+      "Try next",
+      "Lock in",
+    ]);
+  });
+
+  it("renders wrong-form copy for each required form", () => {
+    const cases: Array<{ required: WrongFormRequired; canonical: string; answer: string }> = [
+      { required: "lowest_terms", canonical: "1/2", answer: "2/4" },
+      { required: "improper", canonical: "3/2", answer: "1 1/2" },
+      { required: "mixed", canonical: "1 1/2", answer: "3/2" },
+    ];
+    const db = tempDb();
+    for (const sample of cases) {
+      const { guardian, child, session } = granted(db, `render-${sample.required}@example.com`);
+      const issued = issueForProgression(db, {
+        childId: child.id,
+        sessionId: session.sessionId,
+        skillId: SKILLS.equiv,
+        idempotencyKey: `render-${sample.required}`,
+        now: WHEN,
+      });
+      db.prepare(
+        `UPDATE item_instances
+         SET canonical_answer = ?, answer_line = ?, require_form = ?, compare_mode = 'rational'
+         WHERE item_instance_id = ?`,
+      ).run(sample.canonical, sample.canonical, sample.required, issued.itemInstanceId);
+      const scored = submitAnswer(
+        db,
+        guardian.id,
+        child.id,
+        {
+          idempotencyKey: `render-score-${sample.required}`,
+          sessionId: session.sessionId,
+          itemId: session.item.id,
+          itemInstanceId: issued.itemInstanceId,
+          answer: sample.answer,
+          shownAt: shown(),
+          submittedAt: WHEN,
+        },
+        { now: WHEN },
+      );
+      if (isFormatRejected(scored)) throw new Error("a readable answer was rejected");
+      const frames = feedbackFrames(scored);
+      expect(frames.map((frame) => frame.label)).toEqual(["What you tried", "One focus", "Lock in"]);
+      const html = renderToStaticMarkup(
+        createElement(PracticeFeedback, { feedback: scored, item: scored.nextItem }),
+      );
+      expect(html).toContain('data-testid="verdict-strip"');
+      expect(html).toContain('data-correct="false"');
+      expect(html).toContain("Not yet");
+      expect(html).toContain("text-verdict-miss");
+      expect(html).not.toContain("text-verdict-correct");
+      expect(html).not.toContain(">Correct<");
+      const triedAt = html.indexOf('data-testid="beat-whatWentWell"');
+      const focusAt = html.indexOf('data-testid="beat-oneFocus"');
+      const tried = html.slice(triedAt, focusAt);
+      expect(tried).toContain('data-ink="body"');
+      expect(tried).toContain("text-foreground");
+      expect(tried).toContain("That&#x27;s the right amount!");
+      expect(tried).not.toContain("verdict-correct");
+      expect(html).toContain(scored.oneFocus.replaceAll("'", "&#x27;"));
+      expect(html).toContain(scored.lockIn);
+      expect(html).toContain('data-beat-label="What you tried"');
+      expect(html).toContain('data-beat-label="One focus"');
+      expect(html).toContain('data-beat-label="Lock in"');
+      expect(html).not.toContain('data-beat-label="Try next"');
+      expect(html).not.toContain("A sprout for that try.");
+      expect(html).toContain("A quiet sprout. This one stays small.");
+    }
+  });
+
+  it("keeps the wrong-form verdict blue and mints like a wrong-value miss", () => {
+    const db = tempDb();
+    const scoreMiss = (email: string, answer: string, key: string) => {
+      const { guardian, child, session } = granted(db, email);
+      const before = db
+        .prepare(`SELECT streak_state, last_qualifying_day FROM learner_progress WHERE child_id = ?`)
+        .get(child.id) as { streak_state: string | null; last_qualifying_day: string | null };
+      const issued = issueForProgression(db, {
+        childId: child.id,
+        sessionId: session.sessionId,
+        skillId: SKILLS.equiv,
+        idempotencyKey: `${key}-issue`,
+        now: WHEN,
+      });
+      db.prepare(
+        `UPDATE item_instances
+         SET canonical_answer = '1/2', answer_line = '1/2', require_form = 'lowest_terms', compare_mode = 'rational'
+         WHERE item_instance_id = ?`,
+      ).run(issued.itemInstanceId);
+      const scored = submitAnswer(
+        db,
+        guardian.id,
+        child.id,
+        {
+          idempotencyKey: `${key}-score`,
+          sessionId: session.sessionId,
+          itemId: session.item.id,
+          itemInstanceId: issued.itemInstanceId,
+          answer,
+          shownAt: shown(),
+          submittedAt: WHEN,
+        },
+        { now: WHEN },
+      );
+      if (isFormatRejected(scored)) throw new Error("a readable answer was rejected");
+      const streak = db
+        .prepare(`SELECT streak_state, last_qualifying_day FROM learner_progress WHERE child_id = ?`)
+        .get(child.id) as { streak_state: string | null; last_qualifying_day: string | null };
+      return { guardian, child, session, issued, scored, before, streak };
+    };
+    const formMiss = scoreMiss("form-mint@example.com", "2/4", "form-mint");
+    const valueMiss = scoreMiss("value-mint@example.com", "3/4", "value-mint");
+    const scored = formMiss.scored;
+    expect(scored.correct).toBe(false);
+    expect(scored.celebrationTier).toBe(valueMiss.scored.celebrationTier);
+    expect(scored.xpAmount).toBe(valueMiss.scored.xpAmount);
+    expect(scored.xpAmount).toBeGreaterThan(0);
+    expect(scored.eventIds).toHaveLength(valueMiss.scored.eventIds.length);
+    expect(scored.fuel.credit).toBe(valueMiss.scored.fuel.credit);
+    expect(Boolean(scored.fuel.heatEventId)).toBe(Boolean(valueMiss.scored.fuel.heatEventId));
+    expect(scored.fuel.pieceEventIds).toHaveLength(valueMiss.scored.fuel.pieceEventIds.length);
+    expect(xpCount(db, scored.attemptId)).toBe(xpCount(db, valueMiss.scored.attemptId));
+    expect(formMiss.streak).toEqual(valueMiss.streak);
+    expect(formMiss.streak.last_qualifying_day).not.toBe(formMiss.before.last_qualifying_day);
+    const consumed = db
+      .prepare(`SELECT consumed_at FROM item_instances WHERE item_instance_id = ?`)
+      .get(formMiss.issued.itemInstanceId) as { consumed_at: string | null };
+    expect(consumed.consumed_at).not.toBeNull();
+    const evidence = evidenceForSkill(db, formMiss.child.id, SKILLS.equiv);
+    expect(evidence).toEqual([{ correct: false, lane: "celebrate", practiceLane: "recommended" }]);
+    expect(() =>
+      submitAnswer(
+        db,
+        formMiss.guardian.id,
+        formMiss.child.id,
+        {
+          idempotencyKey: "no-mint-retry",
+          sessionId: formMiss.session.sessionId,
+          itemId: formMiss.session.item.id,
+          itemInstanceId: formMiss.issued.itemInstanceId,
+          answer: "1/2",
+          shownAt: shown(),
+          submittedAt: WHEN,
+        },
+        { now: WHEN },
+      ),
+    ).toThrow(DomainError);
+    const html = renderToStaticMarkup(
+      createElement(PracticeFeedback, { feedback: scored, item: scored.nextItem }),
+    );
+    expect(html).toContain('data-correct="false"');
+    expect(html).toContain("Not yet");
+    expect(html).toContain("text-verdict-miss");
+    expect(html).not.toContain("text-verdict-correct");
+  });
+
+  it("allows only the wrong_form reason on the child payload", () => {
+    const db = tempDb();
+    const { guardian, child, session } = granted(db, "leak-form@example.com");
+    const issued = issueForProgression(db, {
+      childId: child.id,
+      sessionId: session.sessionId,
+      skillId: SKILLS.equiv,
+      idempotencyKey: "leak-form-issue",
+      now: WHEN,
+    });
+    db.prepare(
+      `UPDATE item_instances
+       SET canonical_answer = '1/2', answer_line = '1/2', require_form = 'lowest_terms', compare_mode = 'rational'
+       WHERE item_instance_id = ?`,
+    ).run(issued.itemInstanceId);
+    const scored = submitAnswer(
+      db,
+      guardian.id,
+      child.id,
+      {
+        idempotencyKey: "leak-form-score",
+        sessionId: session.sessionId,
+        itemId: session.item.id,
+        itemInstanceId: issued.itemInstanceId,
+        answer: "2/4",
+        shownAt: shown(),
+        submittedAt: WHEN,
+      },
+      { now: WHEN },
+    );
+    if (isFormatRejected(scored)) throw new Error("a readable answer was rejected");
+    expect(scored.reason).toEqual({ kind: "wrong_form", required: "lowest_terms" });
+    expect(Object.keys(scored.reason ?? {})).toEqual(["kind", "required"]);
+    const { reason, ...rest } = scored;
+    const sealed = [JSON.stringify(scored), JSON.stringify(rest), JSON.stringify(reason)].join("\n");
+    expect(sealed).not.toMatch(
+      /form_mismatch|build_sha|policy_version|buildSha|policyVersion|provenance|evidence_eligible|evidenceEligible|computed_step|computedStep|assigned_step|assignedStep|parent_prior|parentPrior|template_version|templateVersion|canonical_answer|canonicalAnswer/,
+    );
+    const html = renderToStaticMarkup(
+      createElement(PracticeFeedback, { feedback: scored, item: scored.nextItem }),
+    );
+    expect(html).not.toContain("form_mismatch");
+    expect(html).not.toContain("canonical_answer");
+  });
+
+  it("replays the same wrong_form reason", () => {
+    const db = tempDb();
+    const { guardian, child, session } = granted(db, "replay-form@example.com");
+    const issued = issueForProgression(db, {
+      childId: child.id,
+      sessionId: session.sessionId,
+      skillId: SKILLS.equiv,
+      idempotencyKey: "replay-form-issue",
+      now: WHEN,
+    });
+    db.prepare(
+      `UPDATE item_instances
+       SET canonical_answer = '1/2', answer_line = '1/2', require_form = 'lowest_terms', compare_mode = 'rational'
+       WHERE item_instance_id = ?`,
+    ).run(issued.itemInstanceId);
+    const input = {
+      idempotencyKey: "replay-form-score",
+      sessionId: session.sessionId,
+      itemId: session.item.id,
+      itemInstanceId: issued.itemInstanceId,
+      answer: "2/4",
+      shownAt: shown(),
+      submittedAt: WHEN,
+    };
+    const first = submitAnswer(db, guardian.id, child.id, input, { now: WHEN });
+    const replay = submitAnswer(db, guardian.id, child.id, input, { now: WHEN });
+    if (isFormatRejected(first) || isFormatRejected(replay)) {
+      throw new Error("a readable answer was rejected");
+    }
+    expect(replay.replayed).toBe(true);
+    expect(replay.reason).toEqual(first.reason);
+    expect(replay.reason).toEqual({ kind: "wrong_form", required: "lowest_terms" });
+    expect(replay.whatWentWell).toBe(first.whatWentWell);
+    expect(replay.oneFocus).toBe(first.oneFocus);
+    expect(replay.lockIn).toBe(first.lockIn);
+    expect(replay.lockIn).toBe("2/4 = 1/2");
+    const attempts = db.prepare(`SELECT COUNT(*) AS count FROM attempts WHERE child_id = ?`).get(child.id) as {
+      count: number;
+    };
+    expect(attempts.count).toBe(1);
+    expect(xpCount(db, first.attemptId)).toBe(xpCount(db, replay.attemptId));
+    expect(replay.xpAmount).toBe(first.xpAmount);
+    expect(replay.xpAmount).toBeGreaterThan(0);
+  });
+
+  it("gives blank, unreadable, and too-fast answers no wrong_form reason", () => {
+    const db = tempDb();
+    const { guardian, child, session } = granted(db, "no-reason@example.com");
+    const issue = (key: string) => {
+      const issued = issueForProgression(db, {
+        childId: child.id,
+        sessionId: session.sessionId,
+        skillId: SKILLS.equiv,
+        idempotencyKey: key,
+        now: WHEN,
+      });
+      db.prepare(
+        `UPDATE item_instances
+         SET canonical_answer = '1/2', answer_line = '1/2', require_form = 'lowest_terms', compare_mode = 'rational'
+         WHERE item_instance_id = ?`,
+      ).run(issued.itemInstanceId);
+      return issued;
+    };
+    const blankItem = issue("no-reason-blank-issue");
+    const blank = submitAnswer(
+      db,
+      guardian.id,
+      child.id,
+      {
+        idempotencyKey: "no-reason-blank-score",
+        sessionId: session.sessionId,
+        itemId: session.item.id,
+        itemInstanceId: blankItem.itemInstanceId,
+        answer: "   ",
+        shownAt: shown(),
+        submittedAt: WHEN,
+      },
+      { now: WHEN },
+    );
+    if (isFormatRejected(blank)) throw new Error("a blank answer was rejected as unreadable");
+    expect(blank.flags).toContain("empty_answer");
+    expect(blank.reason).toBeUndefined();
+
+    const unreadableItem = issue("no-reason-unreadable-issue");
+    const rejected = submitAnswer(
+      db,
+      guardian.id,
+      child.id,
+      {
+        idempotencyKey: "no-reason-unreadable-score",
+        sessionId: session.sessionId,
+        itemId: session.item.id,
+        itemInstanceId: unreadableItem.itemInstanceId,
+        answer: "nope",
+        shownAt: shown(),
+        submittedAt: WHEN,
+      },
+      { now: WHEN },
+    );
+    if (!isFormatRejected(rejected)) throw new Error("expected format_rejected");
+    expect(rejected).not.toHaveProperty("reason");
+    const rejects = db
+      .prepare(`SELECT COUNT(*) AS count FROM answer_format_rejects WHERE item_instance_id = ?`)
+      .get(unreadableItem.itemInstanceId) as { count: number };
+    expect(rejects.count).toBe(1);
+    const attemptsForReject = db
+      .prepare(`SELECT COUNT(*) AS count FROM attempts WHERE item_instance_id = ?`)
+      .get(unreadableItem.itemInstanceId) as { count: number };
+    expect(attemptsForReject.count).toBe(0);
+
+    const fastItem = issue("no-reason-fast-issue");
+    const tooFast = submitAnswer(
+      db,
+      guardian.id,
+      child.id,
+      {
+        idempotencyKey: "no-reason-fast-score",
+        sessionId: session.sessionId,
+        itemId: session.item.id,
+        itemInstanceId: fastItem.itemInstanceId,
+        answer: "2/4",
+        shownAt: WHEN,
+        submittedAt: WHEN,
+      },
+      { now: WHEN },
+    );
+    if (isFormatRejected(tooFast)) throw new Error("a readable answer was rejected");
+    expect(tooFast.flags).toContain("too_fast");
+    expect(tooFast.reason).toBeUndefined();
+    const stored = db
+      .prepare(`SELECT outcome, beats_json FROM attempts WHERE id = ?`)
+      .get(tooFast.attemptId) as { outcome: string; beats_json: string };
+    expect(stored.outcome).toBe("form_mismatch");
+    expect(stored.beats_json).not.toContain("wrong_form");
+  });
+
+  it("keeps the wrong_form reason when an offline try syncs and replays", async () => {
+    const db = tempDb();
+    const { guardian, child, session } = granted(db, "offline-form@example.com");
+    const issued = issueForProgression(db, {
+      childId: child.id,
+      sessionId: session.sessionId,
+      skillId: SKILLS.equiv,
+      idempotencyKey: "offline-form-issue",
+      now: WHEN,
+    });
+    db.prepare(
+      `UPDATE item_instances
+       SET canonical_answer = '1/2', answer_line = '1/2', require_form = 'lowest_terms', compare_mode = 'rational'
+       WHERE item_instance_id = ?`,
+    ).run(issued.itemInstanceId);
+    const queued = {
+      idempotencyKey: "offline-form-score",
+      childId: child.id,
+      sessionId: session.sessionId,
+      itemId: session.item.id,
+      itemInstanceId: issued.itemInstanceId,
+      answer: "2/4",
+      shownAt: shown(),
+      submittedAt: WHEN,
+    };
+    const queue = createAttemptQueue(memoryQueueStore());
+    expect(queue.enqueue(queued).pending).toHaveLength(1);
+    const synced = await queue.reconcile(async (attempt) => {
+      const result = submitAnswer(
+        db,
+        guardian.id,
+        child.id,
+        {
+          idempotencyKey: attempt.idempotencyKey,
+          sessionId: attempt.sessionId,
+          itemId: attempt.itemId,
+          itemInstanceId: attempt.itemInstanceId,
+          answer: attempt.answer,
+          shownAt: attempt.shownAt,
+          submittedAt: attempt.submittedAt,
+        },
+        { now: WHEN },
+      );
+      if (isFormatRejected(result)) return { ok: false as const, reason: "format_rejected" as const, rejected: result };
+      return { ok: true as const, result };
+    });
+    expect(synced.pending).toEqual([]);
+    expect(synced.synced).toHaveLength(1);
+    expect(synced.synced[0]?.reason).toEqual({ kind: "wrong_form", required: "lowest_terms" });
+    const replay = submitAnswer(db, guardian.id, child.id, queued, { now: WHEN });
+    if (isFormatRejected(replay)) throw new Error("a readable answer was rejected");
+    expect(replay.replayed).toBe(true);
+    expect(replay.reason).toEqual({ kind: "wrong_form", required: "lowest_terms" });
+    const stored = db
+      .prepare(`SELECT beats_json FROM attempts WHERE child_id = ?`)
+      .get(child.id) as { beats_json: string };
+    expect(JSON.parse(stored.beats_json)).not.toHaveProperty("reason");
+  });
+
+  it("keeps a frozen wrong_form reason when a later template version changes the form rule", () => {
+    const attemptsSource = readFileSync(path.join(process.cwd(), "lib/attempts.ts"), "utf8");
+    const reader = attemptsSource.slice(
+      attemptsSource.indexOf("function wrongFormReasonFromAttempt"),
+      attemptsSource.indexOf("function resultFromRow"),
+    );
+    expect(reader).toContain("FROM item_instances");
+    expect(reader).not.toContain("item_template_versions");
+    expect(reader).not.toContain("readItemInstance");
+
+    const db = tempDb();
+    const { guardian, child, session } = granted(db, "frozen-form@example.com");
+    db.prepare(
+      `UPDATE item_template_versions SET active = 0
+       WHERE skill_id = ? AND template_id != 'frac-equiv-lowest'`,
+    ).run(SKILLS.equiv);
+    const issued = issueForProgression(db, {
+      childId: child.id,
+      sessionId: session.sessionId,
+      skillId: SKILLS.equiv,
+      idempotencyKey: "frozen-form-issue",
+      now: WHEN,
+    });
+    const frozen = db
+      .prepare(
+        `SELECT template_id, template_version, require_form, compare_mode
+         FROM item_instances WHERE item_instance_id = ?`,
+      )
+      .get(issued.itemInstanceId) as {
+      template_id: string;
+      template_version: number;
+      require_form: string | null;
+      compare_mode: string;
+    };
+    expect(frozen.template_id).toBe("frac-equiv-lowest");
+    expect(frozen.require_form).toBe("lowest_terms");
+    expect(frozen.compare_mode).toBe("rational");
+    db.prepare(
+      `UPDATE item_instances SET canonical_answer = '1/2', answer_line = '1/2'
+       WHERE item_instance_id = ?`,
+    ).run(issued.itemInstanceId);
+    const input = {
+      idempotencyKey: "frozen-form-score",
+      sessionId: session.sessionId,
+      itemId: session.item.id,
+      itemInstanceId: issued.itemInstanceId,
+      answer: "2/4",
+      shownAt: shown(),
+      submittedAt: WHEN,
+    };
+    const first = submitAnswer(db, guardian.id, child.id, input, { now: WHEN });
+    if (isFormatRejected(first)) throw new Error("a readable answer was rejected");
+    expect(first.reason).toEqual({ kind: "wrong_form", required: "lowest_terms" });
+
+    db.prepare(
+      `UPDATE item_template_versions SET active = 0, require_form = 'mixed'
+       WHERE template_id = ? AND template_version = ?`,
+    ).run(frozen.template_id, frozen.template_version);
+    db.prepare(
+      `INSERT INTO item_template_versions (
+         template_id, template_version, skill_id, prompt_shape, spec_json, bug_rules_json,
+         default_focus, why_it_works, require_form, provenance, evidence_eligible,
+         parent_prior_grade, parent_prior_difficulty, active, promoted, content_hash
+       )
+       SELECT template_id, template_version + 1, skill_id, prompt_shape, spec_json, bug_rules_json,
+              default_focus, why_it_works, 'improper', provenance, evidence_eligible,
+              parent_prior_grade, parent_prior_difficulty, 1, promoted, 'bumped-' || content_hash
+       FROM item_template_versions
+       WHERE template_id = ? AND template_version = ?`,
+    ).run(frozen.template_id, frozen.template_version);
+    const live = db
+      .prepare(
+        `SELECT template_version, require_form, active
+         FROM item_template_versions WHERE template_id = ? ORDER BY template_version`,
+      )
+      .all(frozen.template_id) as Array<{
+      template_version: number;
+      require_form: string | null;
+      active: number;
+    }>;
+    expect(live).toEqual([
+      { template_version: frozen.template_version, require_form: "mixed", active: 0 },
+      { template_version: frozen.template_version + 1, require_form: "improper", active: 1 },
+    ]);
+
+    const replay = submitAnswer(db, guardian.id, child.id, input, { now: WHEN });
+    if (isFormatRejected(replay)) throw new Error("a readable answer was rejected");
+    expect(replay.replayed).toBe(true);
+    expect(replay.reason).toEqual({ kind: "wrong_form", required: "lowest_terms" });
+    const stillFrozen = db
+      .prepare(`SELECT require_form FROM item_instances WHERE item_instance_id = ?`)
+      .get(issued.itemInstanceId) as { require_form: string | null };
+    expect(stillFrozen.require_form).toBe("lowest_terms");
+  });
+
+  it("returns reason null when the instance has no frozen form", () => {
+    const db = tempDb();
+    const { guardian, child, session } = granted(db, "unfrozen-form@example.com");
+    const issued = issueForProgression(db, {
+      childId: child.id,
+      sessionId: session.sessionId,
+      skillId: SKILLS.equiv,
+      idempotencyKey: "unfrozen-form-issue",
+      now: WHEN,
+    });
+    const frozen = db
+      .prepare(
+        `SELECT template_id, template_version FROM item_instances WHERE item_instance_id = ?`,
+      )
+      .get(issued.itemInstanceId) as { template_id: string; template_version: number };
+    db.prepare(
+      `UPDATE item_instances
+       SET canonical_answer = '1/2', answer_line = '1/2', require_form = NULL, compare_mode = 'rational'
+       WHERE item_instance_id = ?`,
+    ).run(issued.itemInstanceId);
+    const input = {
+      idempotencyKey: "unfrozen-form-score",
+      sessionId: session.sessionId,
+      itemId: session.item.id,
+      itemInstanceId: issued.itemInstanceId,
+      answer: "2/4",
+      shownAt: shown(),
+      submittedAt: WHEN,
+    };
+    const first = submitAnswer(db, guardian.id, child.id, input, { now: WHEN });
+    if (isFormatRejected(first)) throw new Error("a readable answer was rejected");
+    expect(first.reason).toBeNull();
+    expect(first.correct).toBe(true);
+
+    db.prepare(
+      `UPDATE item_template_versions SET active = 0, require_form = 'mixed'
+       WHERE template_id = ? AND template_version = ?`,
+    ).run(frozen.template_id, frozen.template_version);
+    db.prepare(
+      `INSERT INTO item_template_versions (
+         template_id, template_version, skill_id, prompt_shape, spec_json, bug_rules_json,
+         default_focus, why_it_works, require_form, provenance, evidence_eligible,
+         parent_prior_grade, parent_prior_difficulty, active, promoted, content_hash
+       )
+       SELECT template_id, template_version + 1, skill_id, prompt_shape, spec_json, bug_rules_json,
+              default_focus, why_it_works, 'improper', provenance, evidence_eligible,
+              parent_prior_grade, parent_prior_difficulty, 1, promoted, 'unfrozen-' || content_hash
+       FROM item_template_versions
+       WHERE template_id = ? AND template_version = ?`,
+    ).run(frozen.template_id, frozen.template_version);
+
+    const replay = submitAnswer(db, guardian.id, child.id, input, { now: WHEN });
+    if (isFormatRejected(replay)) throw new Error("a readable answer was rejected");
+    expect(replay.replayed).toBe(true);
+    expect(replay.reason).toBeNull();
+    expect(replay.correct).toBe(true);
+    const stored = db
+      .prepare(`SELECT outcome FROM attempts WHERE id = ?`)
+      .get(first.attemptId) as { outcome: string };
+    expect(stored.outcome).toBe("correct");
+  });
+
+  it("returns reason null for an old attempt with no instance", () => {
+    const attemptsSource = readFileSync(path.join(process.cwd(), "lib/attempts.ts"), "utf8");
+    const reader = attemptsSource.slice(
+      attemptsSource.indexOf("function wrongFormReasonFromAttempt"),
+      attemptsSource.indexOf("function resultFromRow"),
+    );
+    expect(reader.indexOf("if (!row.item_instance_id) return null")).toBeGreaterThan(-1);
+    expect(reader.indexOf("if (!row.item_instance_id) return null")).toBeLessThan(reader.indexOf("answersMatch"));
+    expect(reader).toContain("row.outcome != null");
+
+    const db = tempDb();
+    const { guardian, child, session } = granted(db, "no-instance-reason@example.com");
+    db.prepare(`DELETE FROM item_instances WHERE session_id = ?`).run(session.sessionId);
+    const input = {
+      idempotencyKey: "old-attempt-no-instance",
+      sessionId: session.sessionId,
+      itemId: session.item.id,
+      answer: "42",
+      shownAt: shown(),
+      submittedAt: WHEN,
+    };
+    const first = submitAnswer(db, guardian.id, child.id, input, { now: WHEN });
+    if (isFormatRejected(first)) throw new Error("a readable answer was rejected");
+    expect(first.reason).toBeNull();
+    const stored = db
+      .prepare(`SELECT item_instance_id AS instanceId, outcome FROM attempts WHERE id = ?`)
+      .get(first.attemptId) as { instanceId: string | null; outcome: string };
+    expect(stored.instanceId).toBeNull();
+    const replay = submitAnswer(db, guardian.id, child.id, input, { now: WHEN });
+    if (isFormatRejected(replay)) throw new Error("a readable answer was rejected");
+    expect(replay.replayed).toBe(true);
+    expect(replay.reason).toBeNull();
+    expect(replay.correct).toBe(first.correct);
   });
 });
 
