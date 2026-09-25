@@ -15,6 +15,8 @@ export type QueuedAttempt = {
   itemInstanceId?: string;
   /** Retryable sync failures so far. A parked try is no longer pending. */
   syncFailures?: number;
+  /** When the first retryable sync failure happened. Offline time before this does not count. */
+  firstFailedAt?: string;
 };
 
 export type BlockedAttempt = QueuedAttempt & { message: string };
@@ -26,13 +28,8 @@ export type DroppedAttempt = {
   sessionId: string;
 };
 
-/** A try set aside so it no longer blocks the queue. The answer is not kept. */
-export type ParkedAttempt = {
-  idempotencyKey: string;
-  childId: string;
-  sessionId: string;
-  message: string;
-};
+/** A try set aside so it no longer blocks the queue. The full attempt stays local. */
+export type ParkedAttempt = QueuedAttempt & { message: string };
 
 export type QueueData = {
   version: 1;
@@ -80,10 +77,12 @@ const SYNCED_CAP = 40;
 export const OFFLINE_QUEUE_CAP = 3;
 
 /**
- * A retryable failure stays at the head for a few tries. After this many
- * failures, or once the try is this old, it is parked and later answers flush.
- * One server error still retries. Three failures is a few reconnects, not a
- * single blip. Fifteen minutes is an earlier sitting, not this one problem.
+ * A retryable failure stays at the head for a few tries. The clock starts at
+ * `firstFailedAt`, the first failed sync, not when the child answered. After
+ * this many failures, or this long after that first failure, the try is parked
+ * with the answer still stored. The next session start posts it once. One
+ * server error still retries. Time spent offline before the first failure
+ * does not park the try.
  */
 export const QUEUE_PARK_AFTER_FAILURES = 3;
 export const QUEUE_PARK_AFTER_MS = 15 * 60 * 1000;
@@ -162,10 +161,25 @@ function readParked(value: unknown): ParkedAttempt[] {
     if (!item || typeof item !== "object") continue;
     const row = item as Partial<ParkedAttempt>;
     if (typeof row.idempotencyKey !== "string" || row.idempotencyKey.length === 0) continue;
+    if (
+      typeof row.answer !== "string" ||
+      typeof row.itemId !== "string" ||
+      typeof row.shownAt !== "string" ||
+      typeof row.submittedAt !== "string"
+    ) {
+      continue;
+    }
     parked.push({
       idempotencyKey: row.idempotencyKey,
       childId: typeof row.childId === "string" ? row.childId : "",
       sessionId: typeof row.sessionId === "string" ? row.sessionId : "",
+      itemId: row.itemId,
+      answer: row.answer,
+      shownAt: row.shownAt,
+      submittedAt: row.submittedAt,
+      ...(typeof row.itemInstanceId === "string" ? { itemInstanceId: row.itemInstanceId } : {}),
+      ...(typeof row.syncFailures === "number" ? { syncFailures: row.syncFailures } : {}),
+      ...(typeof row.firstFailedAt === "string" ? { firstFailedAt: row.firstFailedAt } : {}),
       message: interfaceCopy("offline.parked.kid"),
     });
   }
@@ -273,6 +287,63 @@ export function createAttemptQueue(store: QueueStore) {
       store.save(remember(data));
       return store.load();
     },
+    async retryParkedOnce(
+      post: (attempt: QueuedAttempt) => Promise<SyncPost>,
+    ): Promise<QueueSnapshot> {
+      const data = store.load();
+      const stillParked: ParkedAttempt[] = [];
+      let quietCredits = 0;
+      const invalidAttemptKeys: string[] = [];
+      for (const parked of data.parked) {
+        let posted: SyncPost;
+        try {
+          posted = await post(parked);
+        } catch {
+          stillParked.push(parked);
+          continue;
+        }
+        if (!posted.ok && (posted.reason === "offline" || posted.reason === "hold")) {
+          stillParked.push(parked);
+          continue;
+        }
+        if (!posted.ok && posted.reason === "error") {
+          data.dropped.push(anonymize(parked));
+          continue;
+        }
+        if (!posted.ok && posted.reason === "drop") {
+          data.dropped.push(anonymize(parked));
+          continue;
+        }
+        if (!posted.ok && posted.reason === "invalid_attempt") {
+          data.dropped.push(anonymize(parked));
+          invalidAttemptKeys.push(parked.idempotencyKey);
+          warnDroppedAttempt(parked.idempotencyKey);
+          continue;
+        }
+        if (!posted.ok && posted.reason === "format_rejected") {
+          data.dropped.push(anonymize(parked));
+          continue;
+        }
+        if (!posted.ok) {
+          data.dropped.push(anonymize(parked));
+          continue;
+        }
+        const already = data.synced.some(
+          (item) =>
+            item.attemptId === posted.result.attemptId ||
+            item.idempotencyKey === posted.result.idempotencyKey,
+        );
+        if (!already) data.synced.push(posted.result);
+        if (posted.result.resumePresentation === "quiet") quietCredits += 1;
+      }
+      data.parked = stillParked;
+      store.save(remember(data));
+      return {
+        ...store.load(),
+        ...(quietCredits > 0 ? { quietCredits } : {}),
+        ...(invalidAttemptKeys.length > 0 ? { invalidAttemptKeys } : {}),
+      };
+    },
     async reconcile(
       post: (attempt: QueuedAttempt) => Promise<SyncPost>,
       options?: { now?: string },
@@ -326,18 +397,15 @@ export function createAttemptQueue(store: QueueStore) {
         }
         if (!posted.ok) {
           const failures = (attempt.syncFailures ?? 0) + 1;
-          const ageMs = Date.parse(now) - Date.parse(attempt.submittedAt);
+          const firstFailedAt = attempt.firstFailedAt ?? now;
+          const ageMs = Date.parse(now) - Date.parse(firstFailedAt);
           const agedOut = Number.isFinite(ageMs) && ageMs >= QUEUE_PARK_AFTER_MS;
+          const kept = { ...attempt, syncFailures: failures, firstFailedAt };
           if (failures >= QUEUE_PARK_AFTER_FAILURES || agedOut) {
-            data.parked.push({
-              idempotencyKey: attempt.idempotencyKey,
-              childId: attempt.childId,
-              sessionId: attempt.sessionId,
-              message: interfaceCopy("offline.parked.kid"),
-            });
+            data.parked.push({ ...kept, message: interfaceCopy("offline.parked.kid") });
             continue;
           }
-          stillPending.push({ ...attempt, syncFailures: failures });
+          stillPending.push(kept);
           stopped = true;
           lastError = posted.message;
           continue;
@@ -368,16 +436,20 @@ export type ShownSessionAction = "start" | "reconnect" | "new-session";
 /**
  * Session start, reconnect, and a new session flush queued answers and show
  * the one item the session route issued. They do not request a hidden batch.
- * Reconnect only flushes. Start and a new session open the session after the
- * queue has drained, so a parked or dropped try does not block that one item.
+ * Reconnect only flushes. Start and a new session retry each parked try once
+ * before that flush, then open the session after the queue has drained.
  */
 export async function runShownSession<T>(
   action: ShownSessionAction,
   input: {
     flush: () => Promise<QueueSnapshot>;
+    retryParked?: () => Promise<QueueSnapshot>;
     openSession?: () => Promise<T>;
   },
 ): Promise<{ snapshot: QueueSnapshot; shown: T | null }> {
+  if (action !== "reconnect" && input.retryParked) {
+    await input.retryParked();
+  }
   if (action === "reconnect") {
     return { snapshot: await input.flush(), shown: null };
   }

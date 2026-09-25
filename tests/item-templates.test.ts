@@ -101,6 +101,7 @@ import {
   memoryQueueStore,
   reloadLiveSession,
   runShownSession,
+  storageQueueStore,
   type QueuedAttempt,
 } from "@/lib/offline-queue";
 import { provisionalVerdict } from "@/lib/provisional-verdict";
@@ -3617,13 +3618,13 @@ describe("item templates and issuance", () => {
     expect(parked.snapshot.pending).toEqual([]);
     expect(parked.snapshot.parked).toEqual([
       {
-        idempotencyKey: head.idempotencyKey,
-        childId: head.childId,
-        sessionId: head.sessionId,
+        ...head,
+        syncFailures: QUEUE_PARK_AFTER_FAILURES,
+        firstFailedAt: WHEN,
         message: interfaceCopy("offline.parked.kid"),
       },
     ]);
-    expect(JSON.stringify(parked.snapshot.parked)).not.toContain(head.answer);
+    expect(parked.snapshot.parked[0]?.answer).toBe(head.answer);
     expect(parked.snapshot.synced.map((result) => result.idempotencyKey)).toEqual([later.idempotencyKey]);
     expect(issuedAfterPark).toBe(true);
     expect(parked.issued).toBe("shown");
@@ -3642,17 +3643,162 @@ describe("item templates and issuance", () => {
     const aged = createAttemptQueue(memoryQueueStore());
     aged.enqueue(agedHead);
     aged.enqueue(agedLater);
+    const stillWaiting = await aged.reconcile(
+      async (entry) => {
+        expect(entry.idempotencyKey).toBe(agedHead.idempotencyKey);
+        return serverError();
+      },
+      { now: WHEN },
+    );
+    expect(stillWaiting.parked).toEqual([]);
+    expect(stillWaiting.pending.map((entry) => entry.idempotencyKey)).toEqual([
+      agedHead.idempotencyKey,
+      agedLater.idempotencyKey,
+    ]);
+    expect(stillWaiting.pending[0]).toMatchObject({
+      answer: agedHead.answer,
+      syncFailures: 1,
+      firstFailedAt: WHEN,
+    });
+    expect(stillWaiting.synced).toEqual([]);
     const agedOut = await aged.reconcile(
       async (entry) => {
         if (entry.idempotencyKey === agedHead.idempotencyKey) return serverError();
         return { ok: true as const, result: syncedAttempt(entry.idempotencyKey) };
       },
-      { now: WHEN },
+      { now: new Date(Date.parse(WHEN) + QUEUE_PARK_AFTER_MS).toISOString() },
     );
     expect(agedOut.pending).toEqual([]);
-    expect(agedOut.parked.map((entry) => entry.idempotencyKey)).toEqual([agedHead.idempotencyKey]);
-    expect(JSON.stringify(agedOut.parked)).not.toContain(agedHead.answer);
+    expect(agedOut.parked).toEqual([
+      {
+        ...agedHead,
+        syncFailures: 2,
+        firstFailedAt: WHEN,
+        message: interfaceCopy("offline.parked.kid"),
+      },
+    ]);
+    expect(agedOut.parked[0]?.answer).toBe(agedHead.answer);
     expect(agedOut.synced.map((result) => result.idempotencyKey)).toEqual([agedLater.idempotencyKey]);
+  });
+
+  it("retries a parked answer once on the next session start, then drops it", async () => {
+    const parkedAttempt: QueuedAttempt = {
+      idempotencyKey: "parked-answer",
+      childId: "child-1",
+      sessionId: "session-1",
+      itemId: "ops-g2-add",
+      answer: "42",
+      shownAt: shown(),
+      submittedAt: WHEN,
+      itemInstanceId: "issued-instance-01",
+      syncFailures: QUEUE_PARK_AFTER_FAILURES,
+      firstFailedAt: WHEN,
+    };
+    const storage = new Map<string, string>();
+    const memory = {
+      getItem: (key: string) => storage.get(key) ?? null,
+      setItem: (key: string, value: string) => {
+        storage.set(key, value);
+      },
+    };
+    const queue = createAttemptQueue(storageQueueStore(memory, "math-sprout-queue"));
+    queue.enqueue({
+      idempotencyKey: parkedAttempt.idempotencyKey,
+      childId: parkedAttempt.childId,
+      sessionId: parkedAttempt.sessionId,
+      itemId: parkedAttempt.itemId,
+      answer: parkedAttempt.answer,
+      shownAt: parkedAttempt.shownAt,
+      submittedAt: parkedAttempt.submittedAt,
+      itemInstanceId: parkedAttempt.itemInstanceId,
+    });
+    await queue.reconcile(async () => {
+      const classified = classifyAttemptFailure(500, { error: "Something went wrong." });
+      if (!classified) throw new Error("expected a retryable server error");
+      return classified;
+    }, { now: WHEN });
+    await queue.reconcile(async () => {
+      const classified = classifyAttemptFailure(500, { error: "Something went wrong." });
+      if (!classified) throw new Error("expected a retryable server error");
+      return classified;
+    }, { now: WHEN });
+    const parked = await queue.reconcile(async () => {
+      const classified = classifyAttemptFailure(500, { error: "Something went wrong." });
+      if (!classified) throw new Error("expected a retryable server error");
+      return classified;
+    }, { now: WHEN });
+    expect(parked.parked[0]?.answer).toBe("42");
+    const restored = createAttemptQueue(storageQueueStore(memory, "math-sprout-queue"));
+    expect(restored.snapshot().parked[0]?.answer).toBe("42");
+    let posts = 0;
+    const failOnce = () =>
+      restored.retryParkedOnce(async (entry) => {
+        posts += 1;
+        expect(entry.answer).toBe("42");
+        const classified = classifyAttemptFailure(500, { error: "Something went wrong." });
+        if (!classified) throw new Error("expected a retryable server error");
+        return classified;
+      });
+    const started = await runShownSession("start", {
+      retryParked: failOnce,
+      flush: async () => restored.snapshot(),
+      openSession: async () => "shown",
+    });
+    expect(posts).toBe(1);
+    expect(started.shown).toBe("shown");
+    expect(started.snapshot.parked).toEqual([]);
+    expect(started.snapshot.dropped).toEqual([
+      {
+        idempotencyKey: parkedAttempt.idempotencyKey,
+        childId: parkedAttempt.childId,
+        sessionId: parkedAttempt.sessionId,
+      },
+    ]);
+    expect(JSON.stringify(started.snapshot.dropped)).not.toContain(`"answer"`);
+    const again = await runShownSession("start", {
+      retryParked: failOnce,
+      flush: async () => restored.snapshot(),
+      openSession: async () => "shown-again",
+    });
+    expect(posts).toBe(1);
+    expect(again.shown).toBe("shown-again");
+
+    const saved = createAttemptQueue(
+      memoryQueueStore({
+        version: 1,
+        pending: [],
+        blocked: [],
+        parked: [{ ...parkedAttempt, idempotencyKey: "parked-saved", message: interfaceCopy("offline.parked.kid") }],
+        dropped: [],
+        synced: [],
+      }),
+    );
+    let savedPosts = 0;
+    const reconnected = await runShownSession("reconnect", {
+      retryParked: () =>
+        saved.retryParkedOnce(async () => {
+          savedPosts += 1;
+          return { ok: true as const, result: syncedAttempt("parked-saved") };
+        }),
+      flush: async () => saved.snapshot(),
+    });
+    expect(savedPosts).toBe(0);
+    expect(reconnected.snapshot.parked).toHaveLength(1);
+    const accepted = await runShownSession("new-session", {
+      retryParked: () =>
+        saved.retryParkedOnce(async (entry) => {
+          savedPosts += 1;
+          expect(entry.answer).toBe("42");
+          return { ok: true as const, result: syncedAttempt(entry.idempotencyKey) };
+        }),
+      flush: async () => saved.snapshot(),
+      openSession: async () => "next",
+    });
+    expect(savedPosts).toBe(1);
+    expect(accepted.shown).toBe("next");
+    expect(accepted.snapshot.parked).toEqual([]);
+    expect(accepted.snapshot.synced.map((result) => result.idempotencyKey)).toEqual(["parked-saved"]);
+    expect(accepted.snapshot.dropped).toEqual([]);
   });
 
   it("issues no hidden items on session start, reconnect, or a new session", async () => {
@@ -3726,6 +3872,7 @@ describe("item templates and issuance", () => {
     expect(client).toContain('runShownSession("start"');
     expect(client).toContain('runShownSession("reconnect"');
     expect(client).toContain('runShownSession("new-session"');
+    expect(client).toContain("retryParkedOnce");
     expect(client).not.toMatch(/\/items/);
     expect(client).not.toContain("prefetchBatch");
   });
