@@ -49,7 +49,9 @@ CREATE TABLE IF NOT EXISTS practice_sessions (
   phase TEXT NOT NULL DEFAULT 'practicing' CHECK (phase IN ('practicing', 'boundary', 'closed')),
   progression TEXT CHECK (progression IN ('stay', 'remediate', 'levelUpSlight')),
   policy_version TEXT NOT NULL DEFAULT '${POLICY_VERSION}',
-  build_sha TEXT
+  build_sha TEXT,
+  lane_start INTEGER NOT NULL DEFAULT 0,
+  overflow_offset INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS learner_skill_state (

@@ -14,8 +14,12 @@ export type SessionPhase = "practicing" | "boundary" | "closed";
 export type PracticeSessionRow = {
   id: string;
   item_index: number;
-  /** Monotonic issuance slot. Skill rotation uses this value modulo the catalog length. */
+  /** Monotonic issuance slot. The idempotency key uses this value, not the catalog index. */
   slot_seq: number;
+  /** Catalog index of the first item. The first full pass of the catalog starts here. */
+  lane_start: number;
+  /** First overflow skill. Later overflow slots walk forward from here. */
+  overflow_offset: number;
   practice_lane: PracticeLane;
   phase: SessionPhase;
   progression: ProgressionDecision | null;
@@ -56,9 +60,16 @@ export function readPracticeSession(
   childId: string,
   sessionId: string,
 ): PracticeSessionRow | undefined {
+  const columns = new Set(
+    (db.pragma("table_info(practice_sessions)") as Array<{ name: string }>).map((row) => row.name),
+  );
+  const slotSql = columns.has("slot_seq") ? "slot_seq" : "item_index";
+  const laneStartSql = columns.has("lane_start") ? "lane_start" : "0";
+  const overflowSql = columns.has("overflow_offset") ? "overflow_offset" : "0";
   const row = db
     .prepare(
-      `SELECT id, item_index, slot_seq, practice_lane, phase, progression
+      `SELECT id, item_index, ${slotSql} AS slot_seq, ${laneStartSql} AS lane_start,
+              ${overflowSql} AS overflow_offset, practice_lane, phase, progression
        FROM practice_sessions
        WHERE id = ? AND child_id = ? AND status = 'active'`,
     )
@@ -67,6 +78,8 @@ export function readPracticeSession(
         id: string;
         item_index: number;
         slot_seq: number;
+        lane_start: number;
+        overflow_offset: number;
         practice_lane: string;
         phase: string;
         progression: string | null;
@@ -78,6 +91,8 @@ export function readPracticeSession(
     id: row.id,
     item_index: row.item_index,
     slot_seq: row.slot_seq,
+    lane_start: row.lane_start,
+    overflow_offset: row.overflow_offset,
     practice_lane: practiceLane,
     phase: asPhase(row.phase),
     progression: asProgression(row.progression),

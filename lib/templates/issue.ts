@@ -3,6 +3,7 @@ import type Database from "better-sqlite3";
 import type { PublicItem } from "@/lib/attempt-contract";
 import { DomainError } from "@/lib/domain";
 import { ITEM_CATALOG, itemAt } from "@/lib/item-catalog";
+import { skillIndexForPosition } from "@/lib/session-plan";
 import { answersMatch, canonicalValueKey, type RequireForm } from "@/lib/templates/rational";
 import { eligibleDraws, seeded, type Rng } from "@/lib/templates/engine";
 import {
@@ -304,16 +305,28 @@ export function presentIssuedItem(
   db: Database.Database,
   childId: string,
   sessionId: string,
-  itemIndex: number,
+  slotSeq: number,
   now?: string,
+  options?: { allowSoleTemplateBackToBack?: boolean },
 ): PublicItem {
-  const catalog = itemAt(itemIndex);
+  const plan = db
+    .prepare(
+      `SELECT lane_start AS laneStart, overflow_offset AS overflowOffset
+       FROM practice_sessions WHERE id = ?`,
+    )
+    .get(sessionId) as { laneStart: number; overflowOffset: number } | undefined;
+  const catalog = itemAt(
+    plan
+      ? skillIndexForPosition(plan.laneStart, plan.overflowOffset, slotSeq - plan.laneStart)
+      : slotSeq,
+  );
   const instance = issueForProgression(db, {
     childId,
     sessionId,
     skillId: catalog.skill,
-    idempotencyKey: sessionSlotKey(sessionId, itemIndex),
+    idempotencyKey: sessionSlotKey(sessionId, slotSeq),
     now,
+    allowSoleTemplateBackToBack: options?.allowSoleTemplateBackToBack,
   });
   return publicItemForInstance(db, instance, catalog);
 }
@@ -367,19 +380,26 @@ function issuedOperandKeys(
 }
 
 /**
- * Template on the child's latest issued instance. Seen time is `issued_at`
- * on `item_instances`. There is no per-child template counter.
+ * Latest template issued to this child for this skill. Seen time is
+ * `issued_at` on `item_instances`. Another skill's latest template does not
+ * count. There is no per-child template counter.
  */
-function lastSeenTemplateId(db: Database.Database, childId: string): string | null {
+function lastSeenTemplateId(
+  db: Database.Database,
+  childId: string,
+  skillId: string,
+): string | null {
   const row = db
     .prepare(
-      `SELECT template_id AS templateId
-       FROM item_instances
-       WHERE child_id = ?
-       ORDER BY issued_at DESC, rowid DESC
+      `SELECT i.template_id AS templateId
+       FROM item_instances i
+       JOIN item_template_versions t
+         ON t.template_id = i.template_id AND t.template_version = i.template_version
+       WHERE i.child_id = ? AND t.skill_id = ?
+       ORDER BY i.issued_at DESC, i.rowid DESC
        LIMIT 1`,
     )
-    .get(childId) as { templateId: string } | undefined;
+    .get(childId, skillId) as { templateId: string } | undefined;
   return row?.templateId ?? null;
 }
 
@@ -465,16 +485,17 @@ function assertEqualTemplateWeight(templateId: string): void {
 
 /**
  * Equal weight picks the least-recently seen template. Never-issued templates
- * come first. Templates with the same seen time are shuffled with the child's
- * seed. The issue key does not break that tie.
+ * come first. Templates with the same seen time are shuffled with a seed of
+ * the child and the skill. The issue key does not break that tie.
  */
 function pickFreshTemplate<T extends { choice: ActiveTemplate }>(
   fresh: readonly T[],
   lastAt: ReadonlyMap<string, string>,
   childId: string,
+  skillId: string,
 ): T | undefined {
   for (const item of fresh) assertEqualTemplateWeight(item.choice.template.templateId);
-  const rng = seeded(hashSeed(childId));
+  const rng = seeded(hashSeed(`${childId}:${skillId}`));
   const neverIssued = fresh.filter((item) => !lastAt.has(item.choice.template.templateId));
   const oldestAt =
     neverIssued.length > 0
@@ -501,7 +522,7 @@ type SkillDraw =
 
 /**
  * (b) Least-recently-seen template that still has an unseen item, excluding
- * the template the child just had. (c) First item of that template's shuffled
+ * the template last issued for this skill. (c) First item of that template's shuffled
  * unseen list. A template with no unseen item is omitted. That omission is
  * not a switch. `template_switch` means the only template that still has an
  * unseen item is the one just used. `exhausted` means none do.
@@ -510,13 +531,19 @@ function drawAtSkill(
   db: Database.Database,
   input: {
     childId: string;
+    skillId: string;
     templates: ActiveTemplate[];
     step: 1 | 2 | 3;
     rng: Rng;
     since: string;
+    /**
+     * Test-only. Production omits this. When set, a skill whose only template
+     * with unseen items is the one just used draws that template again.
+     */
+    allowSoleTemplateBackToBack?: boolean;
   },
 ): SkillDraw {
-  const justHad = lastSeenTemplateId(db, input.childId);
+  const justHad = lastSeenTemplateId(db, input.childId, input.skillId);
   const issued = issuedOperandKeys(
     db,
     input.childId,
@@ -532,7 +559,10 @@ function drawAtSkill(
     if (unseen.length === 0) continue;
     fresh.push({ choice, unseen });
   }
-  const candidates = fresh.filter((item) => item.choice.template.templateId !== justHad);
+  let candidates = fresh.filter((item) => item.choice.template.templateId !== justHad);
+  if (candidates.length === 0 && input.allowSoleTemplateBackToBack && fresh.length > 0) {
+    candidates = fresh;
+  }
   if (candidates.length === 0) {
     return { status: fresh.length > 0 ? "template_switch" : "exhausted" };
   }
@@ -541,7 +571,7 @@ function drawAtSkill(
     input.childId,
     candidates.map((item) => item.choice.template.templateId),
   );
-  const picked = pickFreshTemplate(candidates, lastAt, input.childId);
+  const picked = pickFreshTemplate(candidates, lastAt, input.childId, input.skillId);
   if (!picked) return { status: "exhausted" };
   const draw = shuffleWith(picked.unseen, input.rng)[0];
   if (!draw) return { status: "exhausted" };
@@ -599,6 +629,7 @@ function trySkill(
     step: 1 | 2 | 3;
     rng: Rng;
     since: string;
+    allowSoleTemplateBackToBack?: boolean;
   },
 ): SkillDraw {
   const templates = loadActiveTemplates(db, input.skillId, input.step);
@@ -735,6 +766,11 @@ export function issueForProgression(
     skillId: string;
     idempotencyKey: string;
     now?: string;
+    /**
+     * Test-only. Production callers omit this, so a sole remaining template
+     * still cannot be issued back to back.
+     */
+    allowSoleTemplateBackToBack?: boolean;
   },
 ): ItemInstance {
   const existing = readByIdempotency(db, input.sessionId, input.idempotencyKey);
@@ -744,7 +780,7 @@ export function issueForProgression(
   const rng = seeded(hashSeed(`${input.idempotencyKey}:${input.childId}`));
   const requestedStep = assignedStepForSkill(input.skillId);
   // (a) Stay on the requested skill at its assigned step.
-  // (b) Least-recently-seen template with an unseen item, excluding the one just had.
+  // (b) Least-recently-seen template with an unseen item, excluding the one last issued for this skill.
   // (c) Shuffled unseen item from that template.
   // A switch happens only when (b) finds no template. The reason is template_switch
   // when the only fresh template is the one just used, otherwise exhausted_switch.
@@ -756,6 +792,7 @@ export function issueForProgression(
     step: requestedStep,
     rng,
     since,
+    allowSoleTemplateBackToBack: input.allowSoleTemplateBackToBack,
   });
   if (stayed.status === "drawn") {
     picked = { step: requestedStep, reason: "normal", draw: stayed.draw };
@@ -769,6 +806,7 @@ export function issueForProgression(
         step,
         rng,
         since,
+        allowSoleTemplateBackToBack: input.allowSoleTemplateBackToBack,
       });
       if (next.status !== "drawn") continue;
       picked = { step, reason, draw: next.draw };
@@ -780,10 +818,8 @@ export function issueForProgression(
     if (draw) picked = { step: requestedStep, reason: "exhausted_repeat", draw };
   }
   if (!picked) throw new DomainError("No problem is available.", 500);
-  // A switch is ordinary evidence. Only a repeat is issued ineligible.
-  if (picked.reason === "template_switch" || picked.reason === "exhausted_switch") {
-    picked = { ...picked, draw: { ...picked.draw, evidenceEligible: true } };
-  }
+  // A switch keeps the destination template's evidence flag. A template marked
+  // non-evidence stays non-evidence. Only a repeat forces evidence off.
   try {
     return insertInstance(db, {
       childId: input.childId,
@@ -835,6 +871,8 @@ export function issueItemBatch(
     idempotencyKey: string;
     count: number;
     itemIndex: number;
+    /** Catalog indexes for each batch slot. Omit to walk forward from `itemIndex`. */
+    indexes?: number[];
     now?: string;
   },
 ): ItemInstance[] {
@@ -847,7 +885,7 @@ export function issueItemBatch(
   const toIssue = Math.min(input.count, Math.max(0, room));
   const issued: ItemInstance[] = [];
   for (let slot = 0; slot < toIssue; slot += 1) {
-    const catalog = itemAt(input.itemIndex + slot);
+    const catalog = itemAt(input.indexes?.[slot] ?? input.itemIndex + slot);
     issued.push(
       issueForProgression(db, {
         childId: input.childId,

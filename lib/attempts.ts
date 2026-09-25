@@ -14,6 +14,13 @@ import { buildFourBeat } from "@/lib/beats";
 import { consentDenied, DomainError, getChild, invalidAttemptError } from "@/lib/domain";
 import { catalogItem, ITEM_CATALOG } from "@/lib/item-catalog";
 import {
+  assertOverflowCoprime,
+  catalogSkillCount,
+  OVERFLOW_OFFSET_SQL,
+  overflowSlotCount,
+  skillIndexForPosition,
+} from "@/lib/session-plan";
+import {
   assertBankMatchesCatalog,
   canonicalAnswer,
   gradeAnswer,
@@ -177,12 +184,20 @@ function requireSession(db: Database.Database, childId: string, sessionId: strin
   return row;
 }
 
-/** Slot numbers only increase. The catalog length rotates skills, not issuance keys. */
-function advanceSessionSlot(db: Database.Database, sessionId: string, slotSeq: number): void {
+/** Slot numbers only increase. The stored lane start and overflow offset choose the skill. */
+export function advancePracticeSlot(db: Database.Database, sessionId: string, slotSeq: number): void {
+  const plan = db
+    .prepare(
+      `SELECT lane_start AS laneStart, overflow_offset AS overflowOffset
+       FROM practice_sessions WHERE id = ?`,
+    )
+    .get(sessionId) as { laneStart: number; overflowOffset: number } | undefined;
+  if (!plan) throw new DomainError("Practice session not found.", 404);
   const next = slotSeq + 1;
+  const itemIndex = skillIndexForPosition(plan.laneStart, plan.overflowOffset, next - plan.laneStart);
   db.prepare(`UPDATE practice_sessions SET slot_seq = ?, item_index = ? WHERE id = ?`).run(
     next,
-    next % ITEM_CATALOG.length,
+    itemIndex,
     sessionId,
   );
 }
@@ -403,21 +418,30 @@ export function startPracticeSession(
       progress.difficultyStep,
       reviewSkill,
     );
+    const skillCount = catalogSkillCount();
+    const overflowSlots = overflowSlotCount();
+    assertOverflowCoprime(overflowSlots, skillCount);
     const sessionId = randomUUID();
     db.prepare(
       `INSERT INTO practice_sessions (
          id, child_id, status, item_index, slot_seq, started_at, practice_lane, phase,
-         policy_version, build_sha
-       ) VALUES (?, ?, 'active', ?, ?, ?, ?, 'practicing', ?, ?)`,
+         policy_version, build_sha, lane_start, overflow_offset
+       )
+       SELECT ?, ?, 'active', ?, ?, ?, ?, 'practicing', ?, ?, ?, ${OVERFLOW_OFFSET_SQL}`,
     ).run(
       sessionId,
       childId,
-      itemIndex % ITEM_CATALOG.length,
+      itemIndex % skillCount,
       itemIndex,
       nowIso(),
       progress.nextLane,
       POLICY_VERSION,
       buildSha,
+      itemIndex,
+      overflowSlots,
+      overflowSlots,
+      childId,
+      skillCount,
     );
     const created = readPracticeSession(db, childId, sessionId);
     if (!created) throw new DomainError("Practice session was not saved.", 500);
@@ -569,7 +593,7 @@ export function submitAnswer(
         });
         if (unparseableBehavior === "lock") {
           consumeItemInstance(db, instance, idempotencyKey, submittedAt);
-          advanceSessionSlot(db, session.id, session.slot_seq);
+          advancePracticeSlot(db, session.id, session.slot_seq);
         }
         return {
           result: {
@@ -712,7 +736,7 @@ export function submitAnswer(
       celebrationTier: economy.celebrationTier,
       mints: economy.mints,
     });
-    advanceSessionSlot(db, session.id, session.slot_seq);
+    advancePracticeSlot(db, session.id, session.slot_seq);
     const stored = findAttempt(db, childId, idempotencyKey);
     if (!stored) throw new DomainError("Attempt was not saved.", 500);
     const log = readAttemptLog(db, stored.id);
