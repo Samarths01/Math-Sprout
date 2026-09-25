@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import Database from "better-sqlite3";
 import { POLICY_VERSION } from "./policy";
+import { migrateItemTemplates } from "./templates/store";
 
 const MIGRATION = `
 CREATE TABLE IF NOT EXISTS guardians (
@@ -155,6 +156,7 @@ export function openDatabase(filename: string): Database.Database {
   migratePauseHold(db);
   migrateOfflineCap(db);
   migrateAppBuild(db);
+  migrateItemTemplates(db);
   return db;
 }
 

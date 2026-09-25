@@ -86,16 +86,27 @@ export async function requireGuardian(): Promise<Guardian> {
   return guardian;
 }
 
-export function errorResponse(error: unknown): NextResponse {
+export function publicErrorBody(error: unknown): {
+  status: number;
+  body: { error: string; retryable?: false; queueDisposition?: "hold" | "drop" };
+} {
+  if (error instanceof DomainError && error.permanentCode === "invalid_attempt") {
+    return { status: 400, body: { error: "invalid_attempt", retryable: false } };
+  }
   if (error instanceof DomainError) {
-    return NextResponse.json(
-      {
+    return {
+      status: error.status,
+      body: {
         error: error.message,
         ...(error.queueDisposition ? { queueDisposition: error.queueDisposition } : {}),
       },
-      { status: error.status },
-    );
+    };
   }
   console.error(error);
-  return NextResponse.json({ error: "Something went wrong." }, { status: 500 });
+  return { status: 500, body: { error: "Something went wrong." } };
+}
+
+export function errorResponse(error: unknown): NextResponse {
+  const mapped = publicErrorBody(error);
+  return NextResponse.json(mapped.body, { status: mapped.status });
 }

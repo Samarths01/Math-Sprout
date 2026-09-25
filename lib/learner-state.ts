@@ -14,6 +14,8 @@ export type SessionPhase = "practicing" | "boundary" | "closed";
 export type PracticeSessionRow = {
   id: string;
   item_index: number;
+  /** Monotonic issuance slot. Skill rotation uses this value modulo the catalog length. */
+  slot_seq: number;
   practice_lane: PracticeLane;
   phase: SessionPhase;
   progression: ProgressionDecision | null;
@@ -56,7 +58,7 @@ export function readPracticeSession(
 ): PracticeSessionRow | undefined {
   const row = db
     .prepare(
-      `SELECT id, item_index, practice_lane, phase, progression
+      `SELECT id, item_index, slot_seq, practice_lane, phase, progression
        FROM practice_sessions
        WHERE id = ? AND child_id = ? AND status = 'active'`,
     )
@@ -64,6 +66,7 @@ export function readPracticeSession(
     | {
         id: string;
         item_index: number;
+        slot_seq: number;
         practice_lane: string;
         phase: string;
         progression: string | null;
@@ -74,6 +77,7 @@ export function readPracticeSession(
   return {
     id: row.id,
     item_index: row.item_index,
+    slot_seq: row.slot_seq,
     practice_lane: practiceLane,
     phase: asPhase(row.phase),
     progression: asProgression(row.progression),
@@ -85,6 +89,12 @@ export function evidenceForSkill(
   childId: string,
   skill: string,
 ): SkillEvidence[] {
+  const columns = new Set(
+    (db.pragma("table_info(attempts)") as Array<{ name: string }>).map((row) => row.name),
+  );
+  const evidenceFilter = columns.has("estimator_evidence")
+    ? "AND (a.estimator_evidence IS NULL OR a.estimator_evidence != 0)"
+    : "";
   const rows = db
     .prepare(
       `SELECT a.correct AS correct, a.lane AS lane, ps.practice_lane AS practice_lane,
@@ -92,6 +102,7 @@ export function evidenceForSkill(
        FROM attempts a
        JOIN practice_sessions ps ON ps.id = a.session_id
        WHERE a.child_id = ?
+       ${evidenceFilter}
        ORDER BY a.submitted_at ASC, a.created_at ASC, a.id ASC`,
     )
     .all(childId) as EvidenceRow[];

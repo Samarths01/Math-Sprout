@@ -6,11 +6,8 @@ import { afterEach, describe, expect, it } from "vitest";
 import Database from "better-sqlite3";
 import type DatabaseT from "better-sqlite3";
 import { XP_AMOUNT } from "@/lib/attempt-contract";
-import {
-  startPracticeSession,
-  submitAttempt,
-  type SubmitAttemptInput,
-} from "@/lib/attempts";
+import { startPracticeSession, type SubmitAttemptInput } from "@/lib/attempts";
+import { submitCatalogAttempt as submitAttempt } from "./catalog-submit";
 import {
   choosePracticeLane,
   endPracticeSession,
@@ -236,6 +233,7 @@ describe("mastery rules", () => {
         child_id TEXT NOT NULL,
         status TEXT NOT NULL,
         item_index INTEGER NOT NULL,
+        slot_seq INTEGER NOT NULL DEFAULT 0,
         started_at TEXT NOT NULL,
         practice_lane TEXT NOT NULL,
         phase TEXT NOT NULL,

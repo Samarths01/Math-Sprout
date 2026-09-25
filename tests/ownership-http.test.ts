@@ -71,6 +71,7 @@ async function call(
 describe("child route ownership", () => {
   let childId = "";
   let sessionId = "";
+  let itemInstanceId = "";
   let ownerToken = "";
   let otherToken = "";
 
@@ -102,8 +103,11 @@ describe("child route ownership", () => {
       { method: "POST" },
     );
     expect(started.status).toBe(200);
-    sessionId = (started.body as { sessionId?: string } | null)?.sessionId ?? "";
+    const startedBody = started.body as { sessionId?: string; item?: { itemInstanceId?: string } } | null;
+    sessionId = startedBody?.sessionId ?? "";
+    itemInstanceId = startedBody?.item?.itemInstanceId ?? "";
     expect(sessionId).toBeTruthy();
+    expect(itemInstanceId).toBeTruthy();
     expect(count("practice_sessions")).toBe(1);
 
     const summary = await call(
@@ -289,6 +293,9 @@ describe("child route ownership", () => {
 
   it("still lets the owner submit and end that same session", async () => {
     cookieState.token = ownerToken;
+    const issued = getDb()
+      .prepare(`SELECT canonical_answer AS answer FROM item_instances WHERE item_instance_id = ?`)
+      .get(itemInstanceId) as { answer: string };
     const attempt = await call(
       submitAttemptRoute,
       `http://127.0.0.1/api/children/${childId}/attempts`,
@@ -300,7 +307,8 @@ describe("child route ownership", () => {
           idempotencyKey: "owner-key-0001",
           sessionId,
           itemId: "ops-g2-add",
-          answer: "42",
+          itemInstanceId,
+          answer: issued.answer,
           shownAt: "2026-04-01T00:00:00.000Z",
           submittedAt: "2026-04-01T00:00:02.000Z",
         }),

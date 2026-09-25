@@ -14,11 +14,8 @@ import {
   XP_AMOUNT,
   type AttemptResult,
 } from "@/lib/attempt-contract";
-import {
-  startPracticeSession,
-  submitAttempt,
-  type SubmitAttemptInput,
-} from "@/lib/attempts";
+import { startPracticeSession, type SubmitAttemptInput } from "@/lib/attempts";
+import { submitCatalogAttempt as submitAttempt } from "./catalog-submit";
 import { openDatabase } from "@/lib/db";
 import { DomainError, createChild, createGuardian, setConsent } from "@/lib/domain";
 import { ITEM_CATALOG } from "@/lib/item-catalog";

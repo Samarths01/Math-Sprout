@@ -17,10 +17,17 @@ export class DomainError extends Error {
     message: string,
     readonly status: number,
     readonly queueDisposition?: "hold" | "drop",
+    /** Permanent client code. The HTTP body uses this instead of the message. */
+    readonly permanentCode?: "invalid_attempt",
   ) {
     super(message);
     this.name = "DomainError";
   }
+}
+
+/** Missing or invalid issued-problem id. The queue must not retry it. */
+export function invalidAttemptError(message: string): DomainError {
+  return new DomainError(message, 400, undefined, "invalid_attempt");
 }
 
 export type Guardian = {

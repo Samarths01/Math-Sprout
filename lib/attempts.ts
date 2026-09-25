@@ -11,8 +11,8 @@ import {
   SPAM_WINDOW_MS,
 } from "@/lib/attempt-contract";
 import { buildFourBeat } from "@/lib/beats";
-import { consentDenied, DomainError, getChild } from "@/lib/domain";
-import { catalogItem, itemAt, ITEM_CATALOG } from "@/lib/item-catalog";
+import { consentDenied, DomainError, getChild, invalidAttemptError } from "@/lib/domain";
+import { catalogItem, ITEM_CATALOG } from "@/lib/item-catalog";
 import {
   assertBankMatchesCatalog,
   canonicalAnswer,
@@ -41,6 +41,21 @@ import * as appBuild from "@/lib/app-build";
 import { POLICY_VERSION } from "@/lib/policy";
 import { takePendingPauseHold } from "@/lib/pause-hold";
 import { practiceGate } from "@/lib/practice-gate";
+import {
+  consumeItemInstance,
+  focusForStoredAnswer,
+  gradeStoredAnswer,
+  presentIssuedItem,
+  readItemInstance,
+} from "@/lib/templates/issue";
+import { formatExampleFor } from "@/lib/templates/format-example";
+import {
+  isFormatRejected,
+  UNPARSEABLE_BEHAVIOR,
+  unparseableChildLine,
+  type FormatRejected,
+  type UnparseableBehavior,
+} from "@/lib/unparseable";
 
 const KEY_PATTERN = /^[A-Za-z0-9_-]{8,80}$/;
 
@@ -51,6 +66,7 @@ export type SubmitAttemptInput = {
   answer: string;
   shownAt: string;
   submittedAt: string;
+  itemInstanceId?: string;
 };
 
 export type PracticeSessionStart = {
@@ -116,6 +132,11 @@ export function parseSubmitAttempt(
       400,
     );
   }
+  for (const key of ["operands", "canonicalAnswer", "answerKey", "canonical_answer", "operandKey"]) {
+    if (key in body) {
+      throw new DomainError("The answer is scored from the stored problem.", 400);
+    }
+  }
   if (typeof body.answer !== "string") {
     throw new DomainError("Answer must be a string.", 400);
   }
@@ -124,6 +145,13 @@ export function parseSubmitAttempt(
   }
   const shownAt = requireText(body.shownAt, "Shown time");
   const submittedAt = requireText(body.submittedAt, "Submitted time");
+  const itemInstanceId =
+    typeof body.itemInstanceId === "string" && body.itemInstanceId.trim().length > 0
+      ? body.itemInstanceId.trim()
+      : undefined;
+  if (itemInstanceId && !KEY_PATTERN.test(itemInstanceId)) {
+    throw invalidAttemptError("That problem is not in this practice pack.");
+  }
   return {
     idempotencyKey,
     sessionId: requireText(body.sessionId, "Session"),
@@ -131,6 +159,7 @@ export function parseSubmitAttempt(
     answer: body.answer,
     shownAt,
     submittedAt,
+    ...(itemInstanceId ? { itemInstanceId } : {}),
   };
 }
 
@@ -140,17 +169,28 @@ function requireSession(db: Database.Database, childId: string, sessionId: strin
   return row;
 }
 
+/** Slot numbers only increase. The catalog length rotates skills, not issuance keys. */
+function advanceSessionSlot(db: Database.Database, sessionId: string, slotSeq: number): void {
+  const next = slotSeq + 1;
+  db.prepare(`UPDATE practice_sessions SET slot_seq = ?, item_index = ? WHERE id = ?`).run(
+    next,
+    next % ITEM_CATALOG.length,
+    sessionId,
+  );
+}
+
 function presentSession(
   db: Database.Database,
   childId: string,
   session: {
     id: string;
     item_index: number;
+    slot_seq: number;
     practice_lane: PracticeLane;
     phase: "practicing" | "boundary" | "closed";
   },
 ): PracticeSessionStart {
-  const item = itemAt(session.item_index);
+  const item = presentIssuedItem(db, childId, session.id, session.slot_seq);
   return {
     sessionId: session.id,
     item,
@@ -224,8 +264,8 @@ function resultFromRow(
     .all(row.id) as Array<{ id: string; kind: string }>;
   const credit = credits.reduce((sum, event) => sum + event.amount, 0);
   const session = db
-    .prepare(`SELECT item_index FROM practice_sessions WHERE id = ?`)
-    .get(row.session_id) as { item_index: number } | undefined;
+    .prepare(`SELECT slot_seq FROM practice_sessions WHERE id = ?`)
+    .get(row.session_id) as { slot_seq: number } | undefined;
   if (!session) throw new DomainError("Practice session not found.", 404);
   const beats = readBeats(row.beats_json);
   if (row.celebration_tier === "full" && credits.length === 0) {
@@ -249,7 +289,7 @@ function resultFromRow(
     xpAmount: credit,
     fuel: fuelFromEvents(qualifying, credit),
     clientView,
-    nextItem: itemAt(session.item_index),
+    nextItem: presentIssuedItem(db, row.child_id, row.session_id, session.slot_seq),
     ...(row.resume_presentation === "quiet" ? { resumePresentation: "quiet" as const } : {}),
   };
 }
@@ -302,12 +342,13 @@ export function startPracticeSession(
     const sessionId = randomUUID();
     db.prepare(
       `INSERT INTO practice_sessions (
-         id, child_id, status, item_index, started_at, practice_lane, phase,
+         id, child_id, status, item_index, slot_seq, started_at, practice_lane, phase,
          policy_version, build_sha
-       ) VALUES (?, ?, 'active', ?, ?, ?, 'practicing', ?, ?)`,
+       ) VALUES (?, ?, 'active', ?, ?, ?, ?, 'practicing', ?, ?)`,
     ).run(
       sessionId,
       childId,
+      itemIndex % ITEM_CATALOG.length,
       itemIndex,
       nowIso(),
       progress.nextLane,
@@ -321,13 +362,13 @@ export function startPracticeSession(
   return presentSession(db, childId, open.immediate());
 }
 
-export function submitAttempt(
+export function submitAnswer(
   db: Database.Database,
   guardianId: string,
   childId: string,
   input: SubmitAttemptInput,
-  options?: { now?: string },
-): AttemptResult {
+  options?: { now?: string; unparseableBehavior?: UnparseableBehavior },
+): AttemptResult | FormatRejected {
   const idempotencyKey = input.idempotencyKey.trim();
   if (!KEY_PATTERN.test(idempotencyKey)) {
     throw new DomainError(
@@ -349,7 +390,7 @@ export function submitAttempt(
   }
 
   const buildSha = appBuild.currentAppBuildSha();
-  const commit = db.transaction((): { result: AttemptResult; log: AttemptLog | null } => {
+  const commit = db.transaction((): { result: AttemptResult | FormatRejected; log: AttemptLog | null } => {
     const existing = findAttempt(db, childId, idempotencyKey);
     if (existing) return { result: resultFromRow(db, existing, true), log: null };
 
@@ -376,32 +417,167 @@ export function submitAttempt(
       )
       .get(childId, windowStart, submittedAt) as { count: number };
     const elapsedMs = Date.parse(submittedAt) - Date.parse(shownAt);
-    const flags = integrityFlags({
+    let flags = integrityFlags({
       answer: input.answer,
       elapsedMs,
       priorInWindow: prior.count,
     });
-    const correct = gradeAnswer(itemId, input.answer);
-    const economy = planAttemptEconomy(db, {
-      childId,
-      sessionId,
-      idempotencyKey,
-      timeZone: child.timezone,
-      submittedAt,
-      skill: item.skill,
-      correct,
-      flags,
-      practiceLane: session.practice_lane,
-      history: evidenceForSkill(db, childId, item.skill),
-      previousBand: readSkillClientView(db, childId, item.skill)?.bandLabel ?? null,
-    });
-    const beats = buildFourBeat({
-      correct,
-      flags,
-      item,
-      canonicalAnswer: canonicalAnswer(itemId),
-    });
-    saveSkillState(db, childId, item.skill, economy.clientView);
+    let correct = false;
+    let beats: FourBeat;
+    let economy: {
+      lane: AttemptResult["lane"];
+      celebrationTier: AttemptResult["celebrationTier"];
+      clientView: ClientView;
+      mints: Parameters<typeof commitAttemptEconomy>[1]["mints"];
+    };
+    let scoredItemId = itemId;
+    let instanceId: string | null = null;
+    let templateId: string | null = null;
+    let difficultyStep: number | null = null;
+    let estimatorEvidence: number | null = null;
+    let attemptOutcome: "correct" | "incorrect" | "form_mismatch" = "incorrect";
+    let skipEconomy = false;
+
+    const issuedOnSession = db
+      .prepare(`SELECT COUNT(*) AS count FROM item_instances WHERE session_id = ?`)
+      .get(sessionId) as { count: number };
+    if (issuedOnSession.count > 0 && !input.itemInstanceId) {
+      throw invalidAttemptError("An issued problem id is required.");
+    }
+
+    if (input.itemInstanceId) {
+      const instance = readItemInstance(db, input.itemInstanceId);
+      if (!instance) throw new DomainError("That problem is not in this practice pack.", 404);
+      if (instance.childId !== childId || instance.sessionId !== sessionId) {
+        throw new DomainError("That problem is already locked.", 409);
+      }
+      if (instance.consumedAt) {
+        throw new DomainError("That problem is already locked.", 409);
+      }
+      const skillRow = db
+        .prepare(
+          `SELECT skill_id FROM item_template_versions
+           WHERE template_id = ? AND template_version = ?`,
+        )
+        .get(instance.templateId, instance.templateVersion) as { skill_id: string } | undefined;
+      const skillItem =
+        ITEM_CATALOG.find((entry) => entry.skill === skillRow?.skill_id) ?? item;
+      scoredItemId = skillItem.id;
+      instanceId = instance.itemInstanceId;
+      templateId = instance.templateId;
+      difficultyStep = instance.difficultyStep;
+      const verdict = gradeStoredAnswer(instance, input.answer);
+      if (verdict === "unparseable") {
+        const unparseableBehavior = options?.unparseableBehavior ?? UNPARSEABLE_BEHAVIOR;
+        const meta = db
+          .prepare(
+            `SELECT provenance FROM item_template_versions
+             WHERE template_id = ? AND template_version = ?`,
+          )
+          .get(instance.templateId, instance.templateVersion) as
+          | { provenance: string }
+          | undefined;
+        if (!meta) throw new DomainError("That problem is not in this practice pack.", 404);
+        const example = formatExampleFor(instance.answerKind, instance.canonicalAnswer);
+        const seq = db
+          .prepare(
+            `SELECT COALESCE(MAX(reject_seq), 0) + 1 AS reject_seq
+             FROM answer_format_rejects WHERE item_instance_id = ?`,
+          )
+          .get(instance.itemInstanceId) as { reject_seq: number };
+        db.prepare(
+          `INSERT INTO answer_format_rejects (
+             item_instance_id, template_version, provenance, answer_kind,
+             build_sha, policy_version, reject_seq, rejected_at
+           ) VALUES (
+             @item_instance_id, @template_version, @provenance, @answer_kind,
+             @build_sha, @policy_version, @reject_seq, @rejected_at
+           )`,
+        ).run({
+          item_instance_id: instance.itemInstanceId,
+          template_version: instance.templateVersion,
+          provenance: meta.provenance,
+          answer_kind: example.answerKind,
+          build_sha: buildSha,
+          policy_version: POLICY_VERSION,
+          reject_seq: seq.reject_seq,
+          rejected_at: submittedAt,
+        });
+        if (unparseableBehavior === "lock") {
+          consumeItemInstance(db, instance, idempotencyKey, submittedAt);
+          advanceSessionSlot(db, session.id, session.slot_seq);
+        }
+        return {
+          result: {
+            type: "format_rejected",
+            behavior: unparseableBehavior,
+            hint: unparseableChildLine(
+              unparseableBehavior,
+              example.answerKind,
+              example.formatExample,
+            ),
+          },
+          log: null,
+        };
+      }
+      correct = verdict === "correct";
+        const formMiss = verdict === "form_mismatch";
+        const valueMiss = verdict === "incorrect" || formMiss;
+        attemptOutcome = formMiss ? "form_mismatch" : correct ? "correct" : "incorrect";
+        estimatorEvidence = instance.evidenceEligible ? 1 : 0;
+        const focus = valueMiss ? focusForStoredAnswer(instance, input.answer) : null;
+        beats = buildFourBeat({
+          correct,
+          flags,
+          item: skillItem,
+          canonicalAnswer: instance.canonicalAnswer,
+          answerLine: instance.answerLine,
+          ...(flags.length === 0 && valueMiss && focus
+            ? { focus: focus.oneFocus, tryNext: focus.tryNext }
+            : {}),
+          ...(flags.length === 0 && correct ? { solidify: instance.whyItWorks ?? "" } : {}),
+        });
+        economy = planAttemptEconomy(db, {
+          childId,
+          sessionId,
+          idempotencyKey,
+          timeZone: child.timezone,
+          submittedAt,
+          skill: skillItem.skill,
+          correct,
+          flags,
+          practiceLane: session.practice_lane,
+          history: evidenceForSkill(db, childId, skillItem.skill),
+          previousBand: readSkillClientView(db, childId, skillItem.skill)?.bandLabel ?? null,
+        });
+        if (instance.evidenceEligible) {
+          saveSkillState(db, childId, skillItem.skill, economy.clientView);
+        }
+      consumeItemInstance(db, instance, idempotencyKey, submittedAt);
+    } else {
+      correct = gradeAnswer(itemId, input.answer);
+      economy = planAttemptEconomy(db, {
+        childId,
+        sessionId,
+        idempotencyKey,
+        timeZone: child.timezone,
+        submittedAt,
+        skill: item.skill,
+        correct,
+        flags,
+        practiceLane: session.practice_lane,
+        history: evidenceForSkill(db, childId, item.skill),
+        previousBand: readSkillClientView(db, childId, item.skill)?.bandLabel ?? null,
+      });
+      beats = buildFourBeat({
+        correct,
+        flags,
+        item,
+        canonicalAnswer: canonicalAnswer(itemId),
+      });
+      saveSkillState(db, childId, item.skill, economy.clientView);
+      attemptOutcome = correct ? "correct" : "incorrect";
+    }
     const quietResume = takePendingPauseHold(db, childId, idempotencyKey);
     const attemptId = randomUUID();
     const createdAt = nowIso();
@@ -409,18 +585,20 @@ export function submitAttempt(
       `INSERT INTO attempts (
          id, child_id, session_id, idempotency_key, item_id, answer, shown_at,
          submitted_at, correct, lane, celebration_tier, flags_json, beats_json,
-         client_view_json, created_at, policy_version, build_sha, resume_presentation
+         client_view_json, created_at, policy_version, build_sha, resume_presentation,
+         item_instance_id, template_id, difficulty_step, estimator_evidence, outcome
        ) VALUES (
          @id, @child_id, @session_id, @idempotency_key, @item_id, @answer, @shown_at,
          @submitted_at, @correct, @lane, @celebration_tier, @flags_json, @beats_json,
-         @client_view_json, @created_at, @policy_version, @build_sha, @resume_presentation
+         @client_view_json, @created_at, @policy_version, @build_sha, @resume_presentation,
+         @item_instance_id, @template_id, @difficulty_step, @estimator_evidence, @outcome
        )`,
     ).run({
       id: attemptId,
       child_id: childId,
       session_id: sessionId,
       idempotency_key: idempotencyKey,
-      item_id: itemId,
+      item_id: scoredItemId,
       answer: input.answer,
       shown_at: shownAt,
       submitted_at: submittedAt,
@@ -434,8 +612,13 @@ export function submitAttempt(
       policy_version: POLICY_VERSION,
       build_sha: buildSha,
       resume_presentation: quietResume ? "quiet" : "live",
+      item_instance_id: instanceId,
+      template_id: templateId,
+      difficulty_step: difficultyStep,
+      estimator_evidence: estimatorEvidence,
+      outcome: attemptOutcome,
     });
-    commitAttemptEconomy(db, {
+    if (!skipEconomy) commitAttemptEconomy(db, {
       childId,
       attemptId,
       sessionId,
@@ -448,9 +631,7 @@ export function submitAttempt(
       celebrationTier: economy.celebrationTier,
       mints: economy.mints,
     });
-    db.prepare(
-      `UPDATE practice_sessions SET item_index = ? WHERE id = ?`,
-    ).run((session.item_index + 1) % ITEM_CATALOG.length, session.id);
+    advanceSessionSlot(db, session.id, session.slot_seq);
     const stored = findAttempt(db, childId, idempotencyKey);
     if (!stored) throw new DomainError("Attempt was not saved.", 500);
     const log = readAttemptLog(db, stored.id);
@@ -474,5 +655,20 @@ export function submitAttempt(
     }
     throw error;
   }
+}
+
+/** Scored tries only. An unreadable answer is not an attempt; use `submitAnswer`. */
+export function submitAttempt(
+  db: Database.Database,
+  guardianId: string,
+  childId: string,
+  input: SubmitAttemptInput,
+  options?: { now?: string },
+): AttemptResult {
+  const outcome = submitAnswer(db, guardianId, childId, input, options);
+  if (isFormatRejected(outcome)) {
+    throw new DomainError("An unreadable answer is not an attempt.", 422);
+  }
+  return outcome;
 }
 

@@ -4,7 +4,8 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import type DatabaseT from "better-sqlite3";
-import { startPracticeSession, submitAttempt, type SubmitAttemptInput } from "@/lib/attempts";
+import { startPracticeSession, type SubmitAttemptInput } from "@/lib/attempts";
+import { submitCatalogAttempt as submitAttempt } from "./catalog-submit";
 import { projectBadges } from "@/lib/badges";
 import { choosePracticeLane, endPracticeSession } from "@/lib/boundary";
 import {
@@ -267,11 +268,14 @@ describe("build goal projection", () => {
       )
       .all() as Array<{ name: string }>;
     expect(tables.map((table) => table.name).sort()).toEqual([
+      "answer_format_rejects",
       "attempts",
       "boundary_events",
       "children",
       "consents",
       "guardians",
+      "item_instances",
+      "item_template_versions",
       "learner_progress",
       "learner_skill_state",
       "practice_sessions",

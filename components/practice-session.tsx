@@ -4,13 +4,14 @@ import { useEffect, useRef, useState, type FormEvent } from "react";
 import Link from "next/link";
 import type { AttemptResult, ClientView, PublicItem } from "@/lib/attempt-contract";
 import type { BoundaryOptions, PracticeLane } from "@/lib/mastery";
-import { itemAt, ITEM_CATALOG } from "@/lib/item-catalog";
 import { interfaceCopy } from "@/lib/interface-copy";
 import { PracticeFeedback } from "@/components/practice-feedback";
 import {
+  classifyAttemptFailure,
   consentQueueReason,
   createAttemptQueue,
   OFFLINE_QUEUE_CAP,
+  reloadLiveSession,
   storageQueueStore,
   type QueuedAttempt,
   type SyncPost,
@@ -18,7 +19,16 @@ import {
 import { markFuelPulse } from "@/lib/fuel-motion";
 import { showResumeCelebration } from "@/lib/pause-hold";
 import { postPauseHoldUntilVisible } from "@/lib/pause-hold-receipt";
-import { stepClass } from "@/lib/palette";
+import { AnswerBlank } from "@/components/answer-blank";
+import { PracticeProblem } from "@/components/practice-problem";
+import { parseAnswer } from "@/lib/answer-parser";
+import { provisionalVerdict } from "@/lib/provisional-verdict";
+import {
+  FORMAT_EXAMPLE_DEFAULTS,
+  formatHint as formatHintCopy,
+  isFormatRejected,
+  type AnswerKind,
+} from "@/lib/unparseable";
 import { Button } from "@/components/ui/button";
 import {
   Card,
@@ -27,8 +37,16 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
-import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+
+function answerKindOf(item: PublicItem): AnswerKind {
+  return item.answerKind === "fraction" ? "fraction" : "whole";
+}
+
+function offlineFormatHint(item: PublicItem): string {
+  const kind = answerKindOf(item);
+  return formatHintCopy(kind, item.formatExample ?? FORMAT_EXAMPLE_DEFAULTS[kind]);
+}
 
 const PROGRESS_COPY: Record<BoundaryOptions["progression"], string> = {
   stay: "Recommended stays the usual next step.",
@@ -58,6 +76,11 @@ async function postAttempt(childId: string, attempt: QueuedAttempt): Promise<Syn
     const body = (await response.json().catch(() => null)) as
       | (AttemptResult & { error?: string; queueDisposition?: unknown })
       | null;
+    if (isFormatRejected(body)) {
+      return { ok: false, reason: "format_rejected", rejected: body };
+    }
+    const classified = classifyAttemptFailure(response.status, body);
+    if (classified) return classified;
     if (response.status === 403) {
       if (body?.queueDisposition === "hold") {
         // Receipt retries stay on hold. A failed POST never becomes a drop.
@@ -113,6 +136,8 @@ export function PracticeSession({
   const [quietResume, setQuietResume] = useState(false);
   const [pending, setPending] = useState(0);
   const [error, setError] = useState<string | null>(null);
+  const [formatHint, setFormatHint] = useState<string | null>(null);
+  const [formatLocked, setFormatLocked] = useState(false);
   const [busy, setBusy] = useState(false);
   const [ready, setReady] = useState(false);
   const [boundary, setBoundary] = useState<BoundaryOptions | null>(null);
@@ -130,6 +155,9 @@ export function PracticeSession({
   async function flush() {
     const snapshot = await queue().reconcile((attempt) => postAttempt(childId, attempt));
     setPending(snapshot.pending.length);
+    if (reloadLiveSession(waitingKey.current, snapshot, () => window.location.reload())) {
+      return snapshot;
+    }
     if (snapshot.quietCredits) setQuietResume(true);
     if (snapshot.held) setHeldNotice(true);
     if (waitingKey.current) {
@@ -226,12 +254,19 @@ export function PracticeSession({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [childId]);
 
+  function editAnswer(next: string) {
+    setAnswer(next);
+    if (next !== answer) setFormatHint(null);
+  }
+
   function showNext(next: PublicItem) {
     waitingKey.current = null;
     setItem(next);
     setShownAt(new Date().toISOString());
     setAnswer("");
     setFeedback(null);
+    setFormatHint(null);
+    setFormatLocked(false);
     setSavedOffline(false);
     setError(null);
   }
@@ -290,6 +325,8 @@ export function PracticeSession({
       setBoundary(null);
       setFeedback(null);
       setAnswer("");
+      setFormatHint(null);
+      setFormatLocked(false);
       setShownAt(new Date().toISOString());
       setSavedOffline(false);
     } catch {
@@ -300,9 +337,38 @@ export function PracticeSession({
 
   async function onSubmit(event: FormEvent) {
     event.preventDefault();
-    if (!sessionId || !item || !shownAt || busy) return;
+    if (!sessionId || !item || !shownAt || busy || formatLocked) return;
     setBusy(true);
     setError(null);
+    if (parseAnswer(answer).kind === "unparseable") {
+      const offline = typeof navigator !== "undefined" && navigator.onLine === false;
+      if (!offline && item.itemInstanceId) {
+        const posted = await postAttempt(childId, {
+          idempotencyKey: crypto.randomUUID(),
+          childId,
+          sessionId,
+          itemId: item.id,
+          answer,
+          shownAt,
+          submittedAt: new Date().toISOString(),
+          itemInstanceId: item.itemInstanceId,
+        });
+        if (!posted.ok && posted.reason === "format_rejected") {
+          setFormatHint(posted.rejected.hint);
+          setFormatLocked(posted.rejected.behavior === "lock");
+          setFeedback(null);
+          setSavedOffline(false);
+          setBusy(false);
+          return;
+        }
+      }
+      setFormatHint(offlineFormatHint(item));
+      setFeedback(null);
+      setSavedOffline(false);
+      setBusy(false);
+      return;
+    }
+    setFormatHint(null);
     if (queue().snapshot().pending.length >= OFFLINE_QUEUE_CAP) {
       setPending(OFFLINE_QUEUE_CAP);
       await publishOfflineCap(OFFLINE_QUEUE_CAP);
@@ -318,6 +384,7 @@ export function PracticeSession({
       answer,
       shownAt,
       submittedAt: new Date().toISOString(),
+      ...(item.itemInstanceId ? { itemInstanceId: item.itemInstanceId } : {}),
     };
     waitingKey.current = idempotencyKey;
     queue().enqueue(queued);
@@ -394,8 +461,8 @@ export function PracticeSession({
   }
 
   const nextFromFeedback = feedback?.nextItem;
-  const localNext = itemAt(ITEM_CATALOG.findIndex((entry) => entry.id === item.id) + 1);
   const offlineCapped = pending >= OFFLINE_QUEUE_CAP;
+  const pendingVerdict = provisionalVerdict();
 
   return (
     <div className="grid gap-4">
@@ -483,22 +550,23 @@ export function PracticeSession({
       ) : (
       <Card>
         <CardHeader>
-          <CardDescription className="flex items-center gap-2">
-            <span
-              data-testid="difficulty-badge"
-              data-grade={item.grade}
-              className={`inline-flex w-fit items-center rounded-full px-2.5 py-0.5 text-xs font-medium ${stepClass(item.grade)}`}
-            >
-              Grade {item.grade}
-            </span>
-            <span>{item.pack === "fractions" ? "Fractions" : "Operations"}</span>
-          </CardDescription>
-          <CardTitle
-            data-testid="practice-prompt"
-            className="font-heading text-[32px] leading-[40px] tracking-tight tabular-nums"
-          >
-            {item.prompt}
-          </CardTitle>
+          <PracticeProblem
+            item={item}
+            answerSlot={
+              item.blankInline && !feedback ? (
+                <AnswerBlank
+                  value={answer}
+                  hint={formatHint}
+                  answerKind={answerKindOf(item)}
+                  locked={formatLocked}
+                  disabled={formatLocked}
+                  onValueChange={editAnswer}
+                  form="practice-form"
+                  className="h-12 w-24 text-center font-heading text-2xl tabular-nums"
+                />
+              ) : undefined
+            }
+          />
         </CardHeader>
         <CardContent>
           {feedback ? (
@@ -508,49 +576,51 @@ export function PracticeSession({
                 <Button
                   type="button"
                   size="primary"
-                  onClick={() => showNext(nextFromFeedback ?? localNext)}
+                  onClick={() => {
+                    if (nextFromFeedback) showNext(nextFromFeedback);
+                  }}
                 >
                   Next problem
                 </Button>
               )}
             </div>
           ) : (
-            <form className="grid gap-3" onSubmit={onSubmit}>
+            <form id="practice-form" className="grid gap-3" noValidate onSubmit={onSubmit}>
               {savedOffline && !offlineCapped ? (
-                <p role="status" className="text-sm leading-6">
+                <p
+                  role="status"
+                  data-testid="provisional-verdict"
+                  data-pending={pendingVerdict.pending ? "true" : "false"}
+                  data-reveals-answer={pendingVerdict.revealsAnswer ? "true" : "false"}
+                  data-mints={pendingVerdict.mints ? "true" : "false"}
+                  className="text-sm leading-6"
+                >
                   Saved on this device. It will check in when you reconnect.
                 </p>
               ) : null}
-              <div className="grid gap-2">
-                <Label htmlFor="practice-answer">Your answer</Label>
-                <Input
-                  id="practice-answer"
-                  data-testid="practice-answer"
-                  value={answer}
-                  onChange={(event) => setAnswer(event.target.value)}
-                  autoComplete="off"
-                  className="h-12 text-lg"
-                />
-              </div>
+              {item.blankInline ? null : (
+                <div className="grid gap-2">
+                  <Label htmlFor="practice-answer">Your answer</Label>
+                  <AnswerBlank
+                    value={answer}
+                    hint={formatHint}
+                    answerKind={answerKindOf(item)}
+                    locked={formatLocked}
+                    disabled={formatLocked}
+                    onValueChange={editAnswer}
+                    className="h-12 text-lg"
+                  />
+                </div>
+              )}
               {error ? <p className="text-sm text-destructive">{error}</p> : null}
               <Button
                 type="submit"
                 size="primary"
                 data-testid="practice-submit"
-                disabled={busy || offlineCapped}
+                disabled={busy || offlineCapped || formatLocked}
               >
                 {busy ? "Checking…" : "Check answer"}
               </Button>
-              {savedOffline && !offlineCapped ? (
-                <Button
-                  type="button"
-                  variant="outline"
-                  className="h-12 text-base"
-                  onClick={() => showNext(localNext)}
-                >
-                  Next problem
-                </Button>
-              ) : null}
             </form>
           )}
           <Button
