@@ -3885,11 +3885,14 @@ describe("item templates and issuance", () => {
     expect(afterRetry).toEqual(firstSave);
   });
 
-  it("spends a parked retry that times out and keeps one the network drops", async () => {
+  it("keeps a parked retry that times out, the same as a network failure", async () => {
     expect(QUEUE_RETRY_TIMEOUT_MS).toBe(8_000);
     const timedOut = parkedRetryFailure(new DOMException("The operation was aborted due to timeout", "TimeoutError"));
-    expect(timedOut).toEqual({ ok: false, reason: "error", message: "Could not save that try." });
-    expect(parkedRetryFailure(new DOMException("The operation was aborted.", "AbortError")).reason).toBe("error");
+    expect(timedOut).toEqual({ ok: false, reason: "offline" });
+    expect(parkedRetryFailure(new DOMException("The operation was aborted.", "AbortError"))).toEqual({
+      ok: false,
+      reason: "offline",
+    });
     expect(parkedRetryFailure(new TypeError("Failed to fetch"))).toEqual({ ok: false, reason: "offline" });
     const parked = {
       idempotencyKey: "parked-timeout",
@@ -3912,12 +3915,10 @@ describe("item templates and issuance", () => {
         synced: [],
       }),
     );
-    const spent = await timingOut.retryParkedOnce(async () => timedOut);
-    expect(spent.parked).toEqual([]);
-    expect(spent.dropped).toEqual([
-      { idempotencyKey: parked.idempotencyKey, childId: parked.childId, sessionId: parked.sessionId },
-    ]);
-    expect(JSON.stringify(spent.dropped)).not.toContain(parked.answer);
+    const keptTimeout = await timingOut.retryParkedOnce(async () => timedOut);
+    expect(keptTimeout.dropped).toEqual([]);
+    expect(keptTimeout.parked.map((entry) => entry.idempotencyKey)).toEqual([parked.idempotencyKey]);
+    expect(keptTimeout.parked[0]?.answer).toBe(parked.answer);
     const offline = createAttemptQueue(
       memoryQueueStore({
         version: 1,
@@ -3937,6 +3938,61 @@ describe("item templates and issuance", () => {
     const client = readFileSync(path.join(process.cwd(), "components/practice-session.tsx"), "utf8");
     expect(client).toContain("postAttempt(childId, attempt, QUEUE_RETRY_TIMEOUT_MS)");
     expect(client).toContain("if (snapshot.quietCredits) setQuietResume(true)");
+  });
+
+  it("credits one attempt when a timed-out parked retry is replayed", async () => {
+    const db = tempDb();
+    const { guardian, child, session } = granted(db, "timeout-replay@example.com");
+    const token = createSession(db, guardian.id);
+    const screen = readItemInstance(db, session.item.itemInstanceId ?? "");
+    if (!screen) throw new Error("session did not issue");
+    const saved: QueuedAttempt = {
+      idempotencyKey: "timeout-then-replay",
+      childId: child.id,
+      sessionId: session.sessionId,
+      itemId: session.item.id,
+      itemInstanceId: screen.itemInstanceId,
+      answer: screen.canonicalAnswer,
+      shownAt: new Date(Date.parse(screen.issuedAt) + 1_000).toISOString(),
+      submittedAt: new Date(Date.parse(screen.issuedAt) + 3_000).toISOString(),
+    };
+    const queue = createAttemptQueue(
+      memoryQueueStore({
+        version: 1,
+        pending: [],
+        blocked: [],
+        parked: [{ ...saved, message: interfaceCopy("offline.parked.kid") }],
+        dropped: [],
+        synced: [],
+      }),
+    );
+    const timedOut = await queue.retryParkedOnce(async (attempt) => {
+      const posted = await postAttemptRoute(db, token, child.id, attempt);
+      expect(posted.status).toBe(200);
+      expect(posted.body.replayed).toBe(false);
+      return parkedRetryFailure(new DOMException("The operation was aborted due to timeout", "TimeoutError"));
+    });
+    expect(timedOut.dropped).toEqual([]);
+    expect(timedOut.parked.map((entry) => entry.idempotencyKey)).toEqual([saved.idempotencyKey]);
+    expect(timedOut.parked[0]?.answer).toBe(saved.answer);
+    const firstSave = savedItemEvidence(db, screen.itemInstanceId);
+    expect(firstSave.attempts).toHaveLength(1);
+    expect(firstSave.xp).toHaveLength(1);
+    const replayed = await queue.retryParkedOnce(async (attempt) => {
+      const posted = await postAttemptRoute(db, token, child.id, attempt);
+      expect(posted.status).toBe(200);
+      expect(posted.body.replayed).toBe(true);
+      if (!posted.body.attemptId) throw new Error("replayed retry was not the saved attempt");
+      return { ok: true as const, result: posted.body as AttemptResult };
+    });
+    expect(replayed.parked).toEqual([]);
+    expect(replayed.dropped).toEqual([]);
+    expect(replayed.quietCredits).toBe(1);
+    expect(replayed.synced.map((result) => result.idempotencyKey)).toEqual([saved.idempotencyKey]);
+    const afterReplay = savedItemEvidence(db, screen.itemInstanceId);
+    expect(afterReplay.attempts).toHaveLength(1);
+    expect(afterReplay.xp).toHaveLength(1);
+    expect(afterReplay).toEqual(firstSave);
   });
 
   it("parks a try after repeated server errors or after it ages out", async () => {

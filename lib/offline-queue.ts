@@ -91,24 +91,17 @@ export const QUEUE_PARK_AFTER_MS = 15 * 60 * 1000;
 
 /**
  * A parked retry posts once and must not hold session start open.
- * A timeout is that one retry. The answer is dropped afterward, the same as
- * any other failed retry. A network failure is not a timeout.
+ * The post uses a timeout so a hung request cannot block session start.
+ * A timeout does not say whether the server saved the answer, so the try
+ * stays parked, the same as a network failure. A later replay uses the same
+ * idempotency key and credits the row quietly if the server already stored it.
  */
 export const QUEUE_RETRY_TIMEOUT_MS = 8_000;
 
-export function retryTimedOut(error: unknown): boolean {
-  if (!error || typeof error !== "object" || !("name" in error)) return false;
-  const name = String(error.name);
-  return name === "TimeoutError" || name === "AbortError";
-}
-
-/** Map a thrown parked-retry post. Timeout spends the retry. Anything else stays parked. */
+/** A thrown parked-retry post stays parked. A timeout is not a drop. */
 export function parkedRetryFailure(
-  error: unknown,
-): Extract<SyncPost, { ok: false; reason: "error" | "offline" }> {
-  if (retryTimedOut(error)) {
-    return { ok: false, reason: "error", message: "Could not save that try." };
-  }
+  _error: unknown,
+): Extract<SyncPost, { ok: false; reason: "offline" }> {
   return { ok: false, reason: "offline" };
 }
 
