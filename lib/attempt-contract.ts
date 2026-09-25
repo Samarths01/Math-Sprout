@@ -85,9 +85,10 @@ export type AttemptResult = FourBeat & {
   resumePresentation?: "quiet";
   /**
    * Child-safe form note. Present only when the amount matched and the
-   * written form did not. The stored outcome tag stays off this object.
+   * written form did not. `null` when this attempt has no form frozen on
+   * its item instance. The stored outcome tag stays off this object.
    */
-  reason?: WrongFormReason;
+  reason?: WrongFormReason | null;
 };
 
 export const TOO_FAST_MS = 500;

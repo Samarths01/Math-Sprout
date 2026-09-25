@@ -499,6 +499,7 @@ function insertInstance(
     repeat_forced: input.draw.repeatForced ? 1 : 0,
     issue_idempotency_key: input.idempotencyKey,
     issued_at: input.issuedAt,
+    // Frozen at issue. Reading a reason later uses this column, not the live template.
     require_form: input.draw.requireForm,
     compare_mode: input.draw.compareMode,
     bug_hits_json: JSON.stringify(input.draw.bugHits),

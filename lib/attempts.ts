@@ -41,6 +41,7 @@ import * as appBuild from "@/lib/app-build";
 import { POLICY_VERSION } from "@/lib/policy";
 import { takePendingPauseHold } from "@/lib/pause-hold";
 import { practiceGate } from "@/lib/practice-gate";
+import { answersMatch, type RequireForm } from "@/lib/templates/rational";
 import {
   consumeItemInstance,
   focusForStoredAnswer,
@@ -97,6 +98,7 @@ type AttemptRow = {
   client_view_json: string;
   resume_presentation: "live" | "quiet";
   item_instance_id: string | null;
+  outcome: "correct" | "incorrect" | "form_mismatch" | null;
 };
 
 assertBankMatchesCatalog();
@@ -215,7 +217,7 @@ function findAttempt(
     .prepare(
       `SELECT id, child_id, session_id, idempotency_key, item_id, answer, correct,
               lane, celebration_tier, flags_json, beats_json, client_view_json,
-              resume_presentation, item_instance_id
+              resume_presentation, item_instance_id, outcome
        FROM attempts
        WHERE child_id = ? AND idempotency_key = ?`,
     )
@@ -253,18 +255,46 @@ function readClientView(
   return { bandLabel, showConceptChip, celebrationTier };
 }
 
+function isCompareMode(value: string): value is "rational" | "exact" {
+  return value === "rational" || value === "exact";
+}
+
+/**
+ * The child reason comes from this attempt and the instance row frozen at
+ * issue: stored answer, require_form, canonical answer, compare mode, and
+ * the stored grade. The live template is not read.
+ * `null` means the instance has no frozen form (an attempt from before that
+ * column). `undefined` means a form is frozen and this try is not a clean
+ * wrong-form miss.
+ */
 function wrongFormReasonFromAttempt(
   db: Database.Database,
   row: AttemptRow,
   flags: readonly IntegrityFlag[],
 ) {
-  if (!row.item_instance_id) return undefined;
-  const instance = readItemInstance(db, row.item_instance_id);
-  if (!instance) return undefined;
+  if (!row.item_instance_id) return null;
+  const frozen = db
+    .prepare(
+      `SELECT canonical_answer, compare_mode, require_form
+       FROM item_instances
+       WHERE item_instance_id = ?`,
+    )
+    .get(row.item_instance_id) as
+    | { canonical_answer: string; compare_mode: string; require_form: string | null }
+    | undefined;
+  if (!frozen || frozen.require_form == null) return null;
+  if (!isCompareMode(frozen.compare_mode)) return null;
+  const verdict = answersMatch(
+    frozen.canonical_answer,
+    row.answer,
+    frozen.compare_mode,
+    frozen.require_form as RequireForm,
+  );
+  const gradeAgrees = row.outcome == null || row.outcome === verdict;
   return wrongFormReasonFor({
     flags,
-    formMismatch: gradeStoredAnswer(instance, row.answer) === "form_mismatch",
-    required: instance.requireForm,
+    formMismatch: verdict === "form_mismatch" && gradeAgrees,
+    required: frozen.require_form,
   });
 }
 
@@ -313,7 +343,7 @@ function resultFromRow(
     clientView,
     nextItem: presentIssuedItem(db, row.child_id, row.session_id, session.slot_seq),
     ...(row.resume_presentation === "quiet" ? { resumePresentation: "quiet" as const } : {}),
-    ...(reason ? { reason } : {}),
+    ...(reason !== undefined ? { reason } : {}),
   };
 }
 

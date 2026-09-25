@@ -62,8 +62,10 @@ function isWrongFormRequired(value: string | null): value is WrongFormRequired {
 }
 
 /**
- * Built when a stored answer is read back. `beats_json` keeps the four beat
- * strings only. A blank, unreadable, or flagged try has no reason.
+ * Built when a stored answer is read back from the attempt and its frozen
+ * instance. `beats_json` keeps the four beat strings only. A blank,
+ * unreadable, or flagged try has no reason. A missing frozen form is `null`
+ * at the call site, not a reason.
  */
 export function wrongFormReasonFor(input: {
   flags: readonly string[];

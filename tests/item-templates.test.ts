@@ -2757,6 +2757,163 @@ describe("item templates and issuance", () => {
       .get(child.id) as { beats_json: string };
     expect(JSON.parse(stored.beats_json)).not.toHaveProperty("reason");
   });
+
+  it("keeps a frozen wrong_form reason when a later template version changes the form rule", () => {
+    const attemptsSource = readFileSync(path.join(process.cwd(), "lib/attempts.ts"), "utf8");
+    const reader = attemptsSource.slice(
+      attemptsSource.indexOf("function wrongFormReasonFromAttempt"),
+      attemptsSource.indexOf("function resultFromRow"),
+    );
+    expect(reader).toContain("FROM item_instances");
+    expect(reader).not.toContain("item_template_versions");
+    expect(reader).not.toContain("readItemInstance");
+
+    const db = tempDb();
+    const { guardian, child, session } = granted(db, "frozen-form@example.com");
+    db.prepare(
+      `UPDATE item_template_versions SET active = 0
+       WHERE skill_id = ? AND template_id != 'frac-equiv-lowest'`,
+    ).run(SKILLS.equiv);
+    const issued = issueForProgression(db, {
+      childId: child.id,
+      sessionId: session.sessionId,
+      skillId: SKILLS.equiv,
+      idempotencyKey: "frozen-form-issue",
+      now: WHEN,
+    });
+    const frozen = db
+      .prepare(
+        `SELECT template_id, template_version, require_form, compare_mode
+         FROM item_instances WHERE item_instance_id = ?`,
+      )
+      .get(issued.itemInstanceId) as {
+      template_id: string;
+      template_version: number;
+      require_form: string | null;
+      compare_mode: string;
+    };
+    expect(frozen.template_id).toBe("frac-equiv-lowest");
+    expect(frozen.require_form).toBe("lowest_terms");
+    expect(frozen.compare_mode).toBe("rational");
+    db.prepare(
+      `UPDATE item_instances SET canonical_answer = '1/2', answer_line = '1/2'
+       WHERE item_instance_id = ?`,
+    ).run(issued.itemInstanceId);
+    const input = {
+      idempotencyKey: "frozen-form-score",
+      sessionId: session.sessionId,
+      itemId: session.item.id,
+      itemInstanceId: issued.itemInstanceId,
+      answer: "2/4",
+      shownAt: shown(),
+      submittedAt: WHEN,
+    };
+    const first = submitAnswer(db, guardian.id, child.id, input, { now: WHEN });
+    if (isFormatRejected(first)) throw new Error("a readable answer was rejected");
+    expect(first.reason).toEqual({ kind: "wrong_form", required: "lowest_terms" });
+
+    db.prepare(
+      `UPDATE item_template_versions SET active = 0, require_form = 'mixed'
+       WHERE template_id = ? AND template_version = ?`,
+    ).run(frozen.template_id, frozen.template_version);
+    db.prepare(
+      `INSERT INTO item_template_versions (
+         template_id, template_version, skill_id, prompt_shape, spec_json, bug_rules_json,
+         default_focus, why_it_works, require_form, provenance, evidence_eligible,
+         parent_prior_grade, parent_prior_difficulty, active, promoted, content_hash
+       )
+       SELECT template_id, template_version + 1, skill_id, prompt_shape, spec_json, bug_rules_json,
+              default_focus, why_it_works, 'improper', provenance, evidence_eligible,
+              parent_prior_grade, parent_prior_difficulty, 1, promoted, 'bumped-' || content_hash
+       FROM item_template_versions
+       WHERE template_id = ? AND template_version = ?`,
+    ).run(frozen.template_id, frozen.template_version);
+    const live = db
+      .prepare(
+        `SELECT template_version, require_form, active
+         FROM item_template_versions WHERE template_id = ? ORDER BY template_version`,
+      )
+      .all(frozen.template_id) as Array<{
+      template_version: number;
+      require_form: string | null;
+      active: number;
+    }>;
+    expect(live).toEqual([
+      { template_version: frozen.template_version, require_form: "mixed", active: 0 },
+      { template_version: frozen.template_version + 1, require_form: "improper", active: 1 },
+    ]);
+
+    const replay = submitAnswer(db, guardian.id, child.id, input, { now: WHEN });
+    if (isFormatRejected(replay)) throw new Error("a readable answer was rejected");
+    expect(replay.replayed).toBe(true);
+    expect(replay.reason).toEqual({ kind: "wrong_form", required: "lowest_terms" });
+    const stillFrozen = db
+      .prepare(`SELECT require_form FROM item_instances WHERE item_instance_id = ?`)
+      .get(issued.itemInstanceId) as { require_form: string | null };
+    expect(stillFrozen.require_form).toBe("lowest_terms");
+  });
+
+  it("returns reason null when the instance has no frozen form", () => {
+    const db = tempDb();
+    const { guardian, child, session } = granted(db, "unfrozen-form@example.com");
+    const issued = issueForProgression(db, {
+      childId: child.id,
+      sessionId: session.sessionId,
+      skillId: SKILLS.equiv,
+      idempotencyKey: "unfrozen-form-issue",
+      now: WHEN,
+    });
+    const frozen = db
+      .prepare(
+        `SELECT template_id, template_version FROM item_instances WHERE item_instance_id = ?`,
+      )
+      .get(issued.itemInstanceId) as { template_id: string; template_version: number };
+    db.prepare(
+      `UPDATE item_instances
+       SET canonical_answer = '1/2', answer_line = '1/2', require_form = NULL, compare_mode = 'rational'
+       WHERE item_instance_id = ?`,
+    ).run(issued.itemInstanceId);
+    const input = {
+      idempotencyKey: "unfrozen-form-score",
+      sessionId: session.sessionId,
+      itemId: session.item.id,
+      itemInstanceId: issued.itemInstanceId,
+      answer: "2/4",
+      shownAt: shown(),
+      submittedAt: WHEN,
+    };
+    const first = submitAnswer(db, guardian.id, child.id, input, { now: WHEN });
+    if (isFormatRejected(first)) throw new Error("a readable answer was rejected");
+    expect(first.reason).toBeNull();
+    expect(first.correct).toBe(true);
+
+    db.prepare(
+      `UPDATE item_template_versions SET active = 0, require_form = 'mixed'
+       WHERE template_id = ? AND template_version = ?`,
+    ).run(frozen.template_id, frozen.template_version);
+    db.prepare(
+      `INSERT INTO item_template_versions (
+         template_id, template_version, skill_id, prompt_shape, spec_json, bug_rules_json,
+         default_focus, why_it_works, require_form, provenance, evidence_eligible,
+         parent_prior_grade, parent_prior_difficulty, active, promoted, content_hash
+       )
+       SELECT template_id, template_version + 1, skill_id, prompt_shape, spec_json, bug_rules_json,
+              default_focus, why_it_works, 'improper', provenance, evidence_eligible,
+              parent_prior_grade, parent_prior_difficulty, 1, promoted, 'unfrozen-' || content_hash
+       FROM item_template_versions
+       WHERE template_id = ? AND template_version = ?`,
+    ).run(frozen.template_id, frozen.template_version);
+
+    const replay = submitAnswer(db, guardian.id, child.id, input, { now: WHEN });
+    if (isFormatRejected(replay)) throw new Error("a readable answer was rejected");
+    expect(replay.replayed).toBe(true);
+    expect(replay.reason).toBeNull();
+    expect(replay.correct).toBe(true);
+    const stored = db
+      .prepare(`SELECT outcome FROM attempts WHERE id = ?`)
+      .get(first.attemptId) as { outcome: string };
+    expect(stored.outcome).toBe("correct");
+  });
 });
 
 function syncedAttempt(idempotencyKey: string): AttemptResult {

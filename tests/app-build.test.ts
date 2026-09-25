@@ -89,14 +89,17 @@ function assertChildPayloadSealed(value: unknown) {
   );
   if (value && typeof value === "object" && "reason" in value) {
     const reason = (value as { reason?: unknown }).reason;
-    expect(reason && typeof reason === "object" ? Object.keys(reason).sort() : []).toEqual([
-      "kind",
-      "required",
-    ]);
-    expect(reason).toEqual({
-      kind: "wrong_form",
-      required: expect.stringMatching(/^(lowest_terms|improper|mixed)$/),
-    });
+    // No form was frozen on the instance. A real note is still only wrong_form.
+    if (reason !== null) {
+      expect(reason && typeof reason === "object" ? Object.keys(reason).sort() : []).toEqual([
+        "kind",
+        "required",
+      ]);
+      expect(reason).toEqual({
+        kind: "wrong_form",
+        required: expect.stringMatching(/^(lowest_terms|improper|mixed)$/),
+      });
+    }
   }
 }
 
