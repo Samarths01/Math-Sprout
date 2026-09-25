@@ -51,6 +51,7 @@ import {
   issueItemBatch,
   publicItemForInstance,
   pickOldestExposure,
+  operandKey,
   presentIssuedItem,
   readItemInstance,
   sessionSlotKey,
@@ -373,6 +374,8 @@ type LaneCohortReport = {
   exhaustedRepeats: number;
   minDistinctTemplates: number;
   backToBackShared: number;
+  equivMaxSessionSwitches: number;
+  soleTemplateWeekItem: string;
   skills: Array<{
     skill: string;
     overall: number;
@@ -473,6 +476,47 @@ function readSessionPlan(db: Database.Database, sessionId: string): {
   return row;
 }
 
+function templatesWithUnseenItems(db: Database.Database, childId: string, skillId: string): number {
+  const newest = new Map<string, (typeof TEMPLATE_VERSIONS)[number]>();
+  for (const template of TEMPLATE_VERSIONS) {
+    if (!template.active || template.skillId !== skillId) continue;
+    const current = newest.get(template.templateId);
+    if (!current || template.version > current.version) newest.set(template.templateId, template);
+  }
+  const templates = [...newest.values()].filter((template) => eligibleDraws(template, 1).length > 0);
+  if (templates.length === 0) return 0;
+  const placeholders = templates.map(() => "?").join(", ");
+  const rows = db
+    .prepare(
+      `SELECT template_id AS templateId, operand_key AS operandKey
+       FROM item_instances
+       WHERE child_id = ? AND template_id IN (${placeholders})`,
+    )
+    .all(childId, ...templates.map((template) => template.templateId)) as Array<{
+    templateId: string;
+    operandKey: string;
+  }>;
+  const seen = new Set(rows.map((row) => `${row.templateId}\0${row.operandKey}`));
+  let count = 0;
+  for (const template of templates) {
+    const unseen = eligibleDraws(template, 1).some(
+      (draw) => !seen.has(`${template.templateId}\0${operandKey(draw.operands, draw.canonicalAnswer)}`),
+    );
+    if (unseen) count += 1;
+  }
+  return count;
+}
+
+function formatSoleTemplateWeekItem(indexes: Array<number | null>, childCount: number): string {
+  const hits = indexes.filter((index): index is number => index !== null);
+  if (hits.length === 0) return "none";
+  const earliest = Math.min(...hits);
+  const latest = Math.max(...hits);
+  if (hits.length === childCount && earliest === latest) return String(earliest);
+  if (earliest === latest) return `${earliest} (${hits.length} children)`;
+  return `earliest ${earliest}, latest ${latest} (${hits.length} children)`;
+}
+
 function recordIssuedSkill(
   db: Database.Database,
   itemInstanceId: string,
@@ -504,24 +548,47 @@ function issueStoredOffsetSession(
   guardianId: string,
   childId: string,
   items: number,
-): { switches: string[]; doubled: string[]; laneStart: number; overflowOffset: number } {
+  options?: { allowSoleTemplateBackToBack?: boolean; weekItemStart?: number },
+): {
+  switches: string[];
+  doubled: string[];
+  laneStart: number;
+  overflowOffset: number;
+  equivSwitches: number;
+  soleTemplateWeekItem: number | null;
+} {
   const started = startPracticeSession(db, guardianId, childId);
   const opened = readSessionPlan(db, started.sessionId);
   const switches: string[] = [];
   const doubled: string[] = [];
   const skillCount = catalogSkillCount();
   const overflow = overflowSlotCount();
+  let equivSwitches = 0;
+  let soleTemplateWeekItem: number | null = null;
+  const weekItemStart = options?.weekItemStart ?? 0;
   for (let position = 0; position < items; position += 1) {
     const current = readSessionPlan(db, started.sessionId);
     const plannedSkill = itemAt(
       skillIndexForPosition(current.laneStart, current.overflowOffset, position),
     ).skill;
+    const before = switches.length;
     const item =
       position === 0
         ? started.item
-        : presentIssuedItem(db, childId, started.sessionId, current.slotSeq);
+        : presentIssuedItem(db, childId, started.sessionId, current.slotSeq, undefined, {
+            allowSoleTemplateBackToBack: options?.allowSoleTemplateBackToBack,
+          });
     if (!item.itemInstanceId) throw new Error("slot was not issued");
     recordIssuedSkill(db, item.itemInstanceId, plannedSkill, switches);
+    if (plannedSkill === SKILLS.equiv && switches.length > before) equivSwitches += 1;
+    const weekItem = weekItemStart + position + 1;
+    if (
+      soleTemplateWeekItem === null &&
+      (plannedSkill === SKILLS.equiv || item.skill === SKILLS.equiv) &&
+      templatesWithUnseenItems(db, childId, SKILLS.equiv) === 1
+    ) {
+      soleTemplateWeekItem = weekItem;
+    }
     if (overflow > 0 && position >= skillCount && position < skillCount + overflow) {
       doubled.push(plannedSkill);
     }
@@ -533,6 +600,8 @@ function issueStoredOffsetSession(
     doubled,
     laneStart: opened.laneStart,
     overflowOffset: opened.overflowOffset,
+    equivSwitches,
+    soleTemplateWeekItem,
   };
 }
 
@@ -543,7 +612,12 @@ function issueStoredOffsetSession(
 function measureProductionCohort(
   db: Database.Database,
   email: string,
-  input: { kind: LaneKind; label: string; sessionsPerDay: number },
+  input: {
+    kind: LaneKind;
+    label: string;
+    sessionsPerDay: number;
+    allowSoleTemplateBackToBack?: boolean;
+  },
 ): LaneCohortReport {
   const childCount = 20;
   const guardian = createGuardian(db, {
@@ -556,6 +630,8 @@ function measureProductionCohort(
   let maxSessionSwitches = 0;
   let exactRepeats = 0;
   let backToBackShared = 0;
+  let equivMaxSessionSwitches = 0;
+  const soleTemplateWeekItems: Array<number | null> = [];
   let startIndex = -1;
   for (let index = 0; index < childCount; index += 1) {
     const child = createChild(db, guardian.id, { displayName: "Ava" });
@@ -567,20 +643,26 @@ function measureProductionCohort(
     if (index === 0) startIndex = childStart;
     expect(childStart).toBe(startIndex);
     let previousDoubled: string[] | null = null;
+    let weekItem = 0;
+    let childSole: number | null = null;
     for (let day = 0; day < 7; day += 1) {
       for (let practice = 0; practice < input.sessionsPerDay; practice += 1) {
-        const played = issueStoredOffsetSession(
-          db,
-          guardian.id,
-          child.id,
-          PRACTICE_SESSION_LENGTH,
-        );
+        const played = issueStoredOffsetSession(db, guardian.id, child.id, PRACTICE_SESSION_LENGTH, {
+          allowSoleTemplateBackToBack: input.allowSoleTemplateBackToBack,
+          weekItemStart: weekItem,
+        });
+        weekItem += PRACTICE_SESSION_LENGTH;
         expect(played.laneStart, `${input.label} day ${day + 1}`).toBe(childStart);
         if (previousDoubled?.some((skill) => played.doubled.includes(skill))) backToBackShared += 1;
         previousDoubled = played.doubled;
         maxSessionSwitches = Math.max(maxSessionSwitches, played.switches.length);
+        equivMaxSessionSwitches = Math.max(equivMaxSessionSwitches, played.equivSwitches);
+        if (childSole === null && played.soleTemplateWeekItem !== null) {
+          childSole = played.soleTemplateWeekItem;
+        }
       }
     }
+    soleTemplateWeekItems.push(childSole);
     exactRepeats += exactRepeatCount(db, child.id);
     distinctByChild.push(distinctTemplatesBySkill(db, child.id));
     perChild.push(catalogSkillRates(db, child.id));
@@ -641,6 +723,8 @@ function measureProductionCohort(
     exhaustedRepeats,
     minDistinctTemplates: Math.min(...skills.map((row) => row.minDistinct)),
     backToBackShared,
+    equivMaxSessionSwitches,
+    soleTemplateWeekItem: formatSoleTemplateWeekItem(soleTemplateWeekItems, childCount),
     skills,
   };
 }
@@ -658,7 +742,7 @@ function formatLaneCohort(report: LaneCohortReport): string {
   ];
   if (equiv) {
     lines.push(
-      `equivalent fractions: ${(equiv.overall * 100).toFixed(1)}% (${equiv.overallText}; template ${equiv.templateSwitch}, exhausted ${equiv.exhaustedSwitch}); worst child-week ${(equiv.worst * 100).toFixed(1)}%; worst child requests ${equiv.worstRequests}/${equiv.poolSize}`,
+      `equivalent fractions: template_switch ${equiv.templateSwitch}, exhausted_switch ${equiv.exhaustedSwitch} (${equiv.overallText}); worst child-week ${(equiv.worst * 100).toFixed(1)}%; max switches in one session ${report.equivMaxSessionSwitches}; sole-template week item ${report.soleTemplateWeekItem}; worst child requests ${equiv.worstRequests}/${equiv.poolSize}`,
     );
   }
   return lines.join("\n");
@@ -4857,6 +4941,86 @@ describe("item templates and issuance", () => {
       }, sessionsPerDay === 2 ? 180_000 : 120_000);
     }
   }
+
+  const soleTemplateDiagnostic: Array<{ kind: LaneKind; label: string; index: number }> = [
+    { kind: "challenge", label: "challenge start", index: 4 },
+    { kind: "index6", label: "index 6", index: 6 },
+  ];
+  for (const sessionsPerDay of [1, 2] as const) {
+    for (const cohort of soleTemplateDiagnostic) {
+      it(`records a test-only sole-template back-to-back diagnostic on ${cohort.label} at ${sessionsPerDay} session(s) a day`, () => {
+        const db = tempDb();
+        const report = measureProductionCohort(
+          db,
+          `diag-${cohort.kind}-${sessionsPerDay}@example.com`,
+          {
+            kind: cohort.kind,
+            label: `${cohort.label} diagnostic`,
+            sessionsPerDay,
+            allowSoleTemplateBackToBack: true,
+          },
+        );
+        expect(report.startIndex, cohort.label).toBe(cohort.index);
+        const text = formatLaneCohort(report);
+        console.log(text);
+        appendFileSync("/tmp/rotation-lane-cohorts.txt", `diagnostic\n${text}\n\n`);
+      }, sessionsPerDay === 2 ? 180_000 : 120_000);
+    }
+  }
+
+  it("draws the same template again only when the test-only option allows it", () => {
+    const db = tempDb();
+    db.prepare(
+      `UPDATE item_template_versions SET active = 0
+       WHERE skill_id = ? AND template_id != 'frac-equiv-mixed'`,
+    ).run(SKILLS.equiv);
+    const blocked = granted(db, "sole-block@example.com");
+    const opened = readItemInstance(db, blocked.session.item.itemInstanceId ?? "");
+    if (!opened) throw new Error("session did not issue");
+    const clock = Date.parse(opened.issuedAt);
+    const first = issueForProgression(db, {
+      childId: blocked.child.id,
+      sessionId: blocked.session.sessionId,
+      skillId: SKILLS.equiv,
+      idempotencyKey: "sole-block-first",
+      now: new Date(clock + 1000).toISOString(),
+    });
+    expect(first.issueReason).toBe("normal");
+    expect(first.templateId).toBe("frac-equiv-mixed");
+    const switched = issueForProgression(db, {
+      childId: blocked.child.id,
+      sessionId: blocked.session.sessionId,
+      skillId: SKILLS.equiv,
+      idempotencyKey: "sole-block-second",
+      now: new Date(clock + 2000).toISOString(),
+    });
+    expect(switched.issueReason).toBe("template_switch");
+    expect(switched.templateId).not.toBe("frac-equiv-mixed");
+    const allowed = granted(db, "sole-allow@example.com");
+    const allowedOpen = readItemInstance(db, allowed.session.item.itemInstanceId ?? "");
+    if (!allowedOpen) throw new Error("session did not issue");
+    const allowedClock = Date.parse(allowedOpen.issuedAt);
+    const stayed = issueForProgression(db, {
+      childId: allowed.child.id,
+      sessionId: allowed.session.sessionId,
+      skillId: SKILLS.equiv,
+      idempotencyKey: "sole-allow-first",
+      now: new Date(allowedClock + 1000).toISOString(),
+    });
+    expect(stayed.templateId).toBe("frac-equiv-mixed");
+    const again = issueForProgression(db, {
+      childId: allowed.child.id,
+      sessionId: allowed.session.sessionId,
+      skillId: SKILLS.equiv,
+      idempotencyKey: "sole-allow-second",
+      now: new Date(allowedClock + 2000).toISOString(),
+      allowSoleTemplateBackToBack: true,
+    });
+    expect(again.issueReason).toBe("normal");
+    expect(again.templateId).toBe("frac-equiv-mixed");
+    expect(again.itemInstanceId).not.toBe(stayed.itemInstanceId);
+    expect(again.requestedSkillId).toBe(SKILLS.equiv);
+  });
 
   it("gives every pool a heavy week with zero exhausted repeats", () => {
     // Simulation (b): 2 sessions of 15 items a day, for 7 days.

@@ -307,6 +307,7 @@ export function presentIssuedItem(
   sessionId: string,
   slotSeq: number,
   now?: string,
+  options?: { allowSoleTemplateBackToBack?: boolean },
 ): PublicItem {
   const plan = db
     .prepare(
@@ -325,6 +326,7 @@ export function presentIssuedItem(
     skillId: catalog.skill,
     idempotencyKey: sessionSlotKey(sessionId, slotSeq),
     now,
+    allowSoleTemplateBackToBack: options?.allowSoleTemplateBackToBack,
   });
   return publicItemForInstance(db, instance, catalog);
 }
@@ -534,6 +536,11 @@ function drawAtSkill(
     step: 1 | 2 | 3;
     rng: Rng;
     since: string;
+    /**
+     * Test-only. Production omits this. When set, a skill whose only template
+     * with unseen items is the one just used draws that template again.
+     */
+    allowSoleTemplateBackToBack?: boolean;
   },
 ): SkillDraw {
   const justHad = lastSeenTemplateId(db, input.childId, input.skillId);
@@ -552,7 +559,10 @@ function drawAtSkill(
     if (unseen.length === 0) continue;
     fresh.push({ choice, unseen });
   }
-  const candidates = fresh.filter((item) => item.choice.template.templateId !== justHad);
+  let candidates = fresh.filter((item) => item.choice.template.templateId !== justHad);
+  if (candidates.length === 0 && input.allowSoleTemplateBackToBack && fresh.length > 0) {
+    candidates = fresh;
+  }
   if (candidates.length === 0) {
     return { status: fresh.length > 0 ? "template_switch" : "exhausted" };
   }
@@ -619,6 +629,7 @@ function trySkill(
     step: 1 | 2 | 3;
     rng: Rng;
     since: string;
+    allowSoleTemplateBackToBack?: boolean;
   },
 ): SkillDraw {
   const templates = loadActiveTemplates(db, input.skillId, input.step);
@@ -755,6 +766,11 @@ export function issueForProgression(
     skillId: string;
     idempotencyKey: string;
     now?: string;
+    /**
+     * Test-only. Production callers omit this, so a sole remaining template
+     * still cannot be issued back to back.
+     */
+    allowSoleTemplateBackToBack?: boolean;
   },
 ): ItemInstance {
   const existing = readByIdempotency(db, input.sessionId, input.idempotencyKey);
@@ -776,6 +792,7 @@ export function issueForProgression(
     step: requestedStep,
     rng,
     since,
+    allowSoleTemplateBackToBack: input.allowSoleTemplateBackToBack,
   });
   if (stayed.status === "drawn") {
     picked = { step: requestedStep, reason: "normal", draw: stayed.draw };
@@ -789,6 +806,7 @@ export function issueForProgression(
         step,
         rng,
         since,
+        allowSoleTemplateBackToBack: input.allowSoleTemplateBackToBack,
       });
       if (next.status !== "drawn") continue;
       picked = { step, reason, draw: next.draw };
