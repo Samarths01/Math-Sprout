@@ -4316,6 +4316,60 @@ describe("item templates and issuance", () => {
     expect(snapshot.pending).toEqual([]);
   });
 
+  it("keeps a parked entry when a parked retry and a flush interleave", async () => {
+    const parkedAttempt: QueuedAttempt = {
+      idempotencyKey: "interleave-parked",
+      childId: "child-1",
+      sessionId: "session-1",
+      itemId: "ops-g2-add",
+      answer: "42",
+      shownAt: shown(),
+      submittedAt: WHEN,
+      itemInstanceId: "issued-instance-parked",
+    };
+    const pendingAttempt: QueuedAttempt = {
+      ...parkedAttempt,
+      idempotencyKey: "interleave-pending",
+      answer: "7",
+      itemInstanceId: "issued-instance-pending",
+    };
+    const queue = createAttemptQueue(
+      memoryQueueStore({
+        version: 1,
+        pending: [pendingAttempt],
+        blocked: [],
+        parked: [{ ...parkedAttempt, message: interfaceCopy("offline.parked.kid") }],
+        dropped: [],
+        synced: [],
+      }),
+    );
+    let releaseParked!: () => void;
+    const parkedGate = new Promise<void>((resolve) => {
+      releaseParked = resolve;
+    });
+    const posts: string[] = [];
+    const retry = queue.retryParkedOnce(async (attempt) => {
+      posts.push(attempt.idempotencyKey);
+      await parkedGate;
+      return { ok: true as const, result: syncedAttempt(attempt.idempotencyKey) };
+    });
+    const flush = queue.reconcile(async (attempt) => {
+      posts.push(attempt.idempotencyKey);
+      return { ok: true as const, result: syncedAttempt(attempt.idempotencyKey) };
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    releaseParked();
+    await Promise.all([retry, flush]);
+    expect(posts).toEqual([parkedAttempt.idempotencyKey, pendingAttempt.idempotencyKey]);
+    const snapshot = queue.snapshot();
+    expect(snapshot.parked).toEqual([]);
+    expect(snapshot.pending).toEqual([]);
+    expect(snapshot.synced.map((result) => result.idempotencyKey)).toEqual([
+      parkedAttempt.idempotencyKey,
+      pendingAttempt.idempotencyKey,
+    ]);
+  });
+
   it("parks a try after repeated server errors or after it ages out", async () => {
     const head: QueuedAttempt = {
       idempotencyKey: "stuck-head",

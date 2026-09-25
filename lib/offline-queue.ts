@@ -295,6 +295,17 @@ function remember(data: QueueData): QueueData {
 }
 
 export function createAttemptQueue(store: QueueStore) {
+  // reconcile and retryParkedOnce each load the queue, await the network, then
+  // save the whole queue. One lock so the last save cannot drop the other's entry.
+  let queueLock: Promise<void> = Promise.resolve();
+  function exclusive<T>(run: () => Promise<T>): Promise<T> {
+    const result = queueLock.then(run, run);
+    queueLock = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
+  }
   return {
     snapshot(): QueueSnapshot {
       return store.load();
@@ -330,9 +341,10 @@ export function createAttemptQueue(store: QueueStore) {
       store.save(remember(data));
       return store.load();
     },
-    async retryParkedOnce(
+    retryParkedOnce(
       post: (attempt: QueuedAttempt) => Promise<SyncPost>,
     ): Promise<QueueSnapshot> {
+      return exclusive(async () => {
       const data = store.load();
       const stillParked: ParkedAttempt[] = [];
       let quietCredits = 0;
@@ -386,11 +398,13 @@ export function createAttemptQueue(store: QueueStore) {
         ...(quietCredits > 0 ? { quietCredits } : {}),
         ...(invalidAttemptKeys.length > 0 ? { invalidAttemptKeys } : {}),
       };
+      });
     },
-    async reconcile(
+    reconcile(
       post: (attempt: QueuedAttempt) => Promise<SyncPost>,
       options?: { now?: string },
     ): Promise<QueueSnapshot> {
+      return exclusive(async () => {
       const data = store.load();
       let lastError: string | undefined;
       const stillPending: QueuedAttempt[] = [];
@@ -479,6 +493,7 @@ export function createAttemptQueue(store: QueueStore) {
         ...(held > 0 ? { held } : {}),
         ...(invalidAttemptKeys.length > 0 ? { invalidAttemptKeys } : {}),
       };
+      });
     },
   };
 }
