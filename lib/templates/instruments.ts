@@ -69,6 +69,9 @@ export function exhaustionEventCounts(
     .all(childId) as ExhaustionEventCount[];
 }
 
+/** A template above this share of its skill's draws is flagged on the dev readout. */
+export const TEMPLATE_SHARE_CAP = 0.6;
+
 export type PoolIssuanceCount = {
   skill: string;
   templateId: string;
@@ -80,13 +83,18 @@ export type PoolIssuanceCount = {
   exhaustedRepeat: number;
   /** `(templateSwitch + exhaustedSwitch) / issued`. Zero when nothing was issued. */
   switchRate: number;
+  /** This template's draws divided by the skill's draws in this readout. */
+  share: number;
+  /** True when `share` is above `TEMPLATE_SHARE_CAP`. */
+  aboveShareCap: boolean;
 };
 
 /**
  * Dev readout for a dogfood run. Runtime counts of every issued item in each
  * (requested skill, step, template version) pool, plus switch and repeat counts.
- * A switch is credited to the skill that was requested. Older rows with no
- * stored request fall back to the template skill.
+ * `share` is that template's draws divided by the skill's draws. A template
+ * above 60% is flagged. A switch is credited to the skill that was requested.
+ * Older rows with no stored request fall back to the template skill.
  * Not an estimator input, and not a child or parent field.
  */
 export function poolIssuanceCounts(db: Database.Database, childId: string): PoolIssuanceCount[] {
@@ -118,10 +126,24 @@ export function poolIssuanceCounts(db: Database.Database, childId: string): Pool
     exhaustedSwitch: number;
     exhaustedRepeat: number;
   }>;
-  return rows.map((row) => ({
-    ...row,
-    switchRate: row.issued === 0 ? 0 : (row.templateSwitch + row.exhaustedSwitch) / row.issued,
-  }));
+  const skillIssued = new Map<string, number>();
+  const templateIssued = new Map<string, number>();
+  for (const row of rows) {
+    skillIssued.set(row.skill, (skillIssued.get(row.skill) ?? 0) + row.issued);
+    const key = `${row.skill}\0${row.templateId}`;
+    templateIssued.set(key, (templateIssued.get(key) ?? 0) + row.issued);
+  }
+  return rows.map((row) => {
+    const skillTotal = skillIssued.get(row.skill) ?? 0;
+    const templateTotal = templateIssued.get(`${row.skill}\0${row.templateId}`) ?? 0;
+    const share = skillTotal === 0 ? 0 : templateTotal / skillTotal;
+    return {
+      ...row,
+      switchRate: row.issued === 0 ? 0 : (row.templateSwitch + row.exhaustedSwitch) / row.issued,
+      share,
+      aboveShareCap: share > TEMPLATE_SHARE_CAP,
+    };
+  });
 }
 
 export type StepPractice = {

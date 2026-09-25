@@ -39,8 +39,9 @@ export const OUTSTANDING_UNANSWERED_CAP = 3;
 
 /**
  * Relative draw weight of one template. Ids omitted here use
- * `DEFAULT_TEMPLATE_DRAW_WEIGHT`. Equal weights are pure least-recently-used.
- * This map is the only weighting knob.
+ * `DEFAULT_TEMPLATE_DRAW_WEIGHT`. The default is equal weight, which is pure
+ * least-recently-seen. There is no weighted draw and no share floor. A map
+ * entry that is not the default is rejected.
  */
 export const DEFAULT_TEMPLATE_DRAW_WEIGHT = 1;
 export const TEMPLATE_DRAW_WEIGHTS: Readonly<Record<string, number>> = {};
@@ -455,32 +456,25 @@ function shuffleWith<T>(items: readonly T[], rng: Rng): T[] {
   return copy;
 }
 
-function templateDrawWeight(templateId: string): number {
+function assertEqualTemplateWeight(templateId: string): void {
   const weight = TEMPLATE_DRAW_WEIGHTS[templateId] ?? DEFAULT_TEMPLATE_DRAW_WEIGHT;
-  if (!Number.isFinite(weight) || weight <= 0) {
-    throw new DomainError(`Template draw weight must be positive: ${templateId}`, 500);
+  if (weight !== DEFAULT_TEMPLATE_DRAW_WEIGHT) {
+    throw new DomainError(`Template draw weight is equal only: ${templateId}`, 500);
   }
-  return weight;
 }
 
 /**
- * Equal weights pick the least-recently issued template. Never-issued templates
- * come first. The seeded shuffle breaks a tie. Unequal weights are not a
- * second policy; a later ruling replaces this function.
+ * Equal weight picks the least-recently seen template. Never-issued templates
+ * come first. Templates with the same seen time are shuffled with the child's
+ * seed. The issue key does not break that tie.
  */
 function pickFreshTemplate<T extends { choice: ActiveTemplate }>(
   fresh: readonly T[],
   lastAt: ReadonlyMap<string, string>,
-  rng: Rng,
+  childId: string,
 ): T | undefined {
-  const weights = fresh.map((item) => templateDrawWeight(item.choice.template.templateId));
-  const baseline = weights[0];
-  if (baseline === undefined || weights.some((weight) => weight !== baseline)) {
-    throw new DomainError(
-      "Unequal template draw weights need a ruled policy. Equal weight is least-recently-used.",
-      500,
-    );
-  }
+  for (const item of fresh) assertEqualTemplateWeight(item.choice.template.templateId);
+  const rng = seeded(hashSeed(childId));
   const neverIssued = fresh.filter((item) => !lastAt.has(item.choice.template.templateId));
   const oldestAt =
     neverIssued.length > 0
@@ -547,7 +541,7 @@ function drawAtSkill(
     input.childId,
     candidates.map((item) => item.choice.template.templateId),
   );
-  const picked = pickFreshTemplate(candidates, lastAt, input.rng);
+  const picked = pickFreshTemplate(candidates, lastAt, input.childId);
   if (!picked) return { status: "exhausted" };
   const draw = shuffleWith(picked.unseen, input.rng)[0];
   if (!draw) return { status: "exhausted" };

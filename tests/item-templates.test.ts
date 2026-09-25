@@ -36,6 +36,8 @@ import {
   formatRejectRates,
   poolIssuanceCounts,
   stepsPracticed,
+  TEMPLATE_SHARE_CAP,
+  type PoolIssuanceCount,
 } from "@/lib/templates/instruments";
 import {
   DEFAULT_TEMPLATE_DRAW_WEIGHT,
@@ -311,7 +313,48 @@ type CohortResult = {
   }>;
   spread: Array<{ skill: string; min: number; median: number; max: number }>;
   perChild: SkillSwitchRate[][];
+  shares: TemplateShareRow[];
 };
+
+type TemplateShareRow = {
+  skill: string;
+  templateId: string;
+  templateVersion: number;
+  issued: number;
+  skillIssued: number;
+  share: number;
+};
+
+function cohortTemplateShares(children: PoolIssuanceCount[][]): TemplateShareRow[] {
+  const issued = new Map<string, { skill: string; templateId: string; templateVersion: number; issued: number }>();
+  const skillIssued = new Map<string, number>();
+  for (const pools of children) {
+    for (const pool of pools) {
+      skillIssued.set(pool.skill, (skillIssued.get(pool.skill) ?? 0) + pool.issued);
+      const key = `${pool.skill}\0${pool.templateId}`;
+      const row = issued.get(key) ?? {
+        skill: pool.skill,
+        templateId: pool.templateId,
+        templateVersion: pool.templateVersion,
+        issued: 0,
+      };
+      row.issued += pool.issued;
+      issued.set(key, row);
+    }
+  }
+  return [...issued.values()]
+    .map((row) => {
+      const total = skillIssued.get(row.skill) ?? 0;
+      return { ...row, skillIssued: total, share: total === 0 ? 0 : row.issued / total };
+    })
+    .sort((left, right) =>
+      left.skill < right.skill ? -1
+      : left.skill > right.skill ? 1
+      : left.templateId < right.templateId ? -1
+      : left.templateId > right.templateId ? 1
+      : 0,
+    );
+}
 
 function runChildCohort(
   db: Database.Database,
@@ -330,6 +373,7 @@ function runChildCohort(
   );
   const perChild: SkillSwitchRate[][] = [];
   const distinctByChild: Array<Array<{ skill: string; templates: number }>> = [];
+  const poolsByChild: PoolIssuanceCount[][] = [];
   let worstSessionSwitches = 0;
   for (let index = 0; index < childCount; index += 1) {
     const childId = `${input.childPrefix}-${String(index).padStart(2, "0")}`;
@@ -343,6 +387,13 @@ function runChildCohort(
     worstSessionSwitches = Math.max(worstSessionSwitches, assertAtMostOneSwitch(rotation.sessions));
     distinctByChild.push(assertDistinctTemplates(db, childId));
     perChild.push(assertRotationLimits(db, childId));
+    const pools = poolIssuanceCounts(db, childId);
+    const hot = pools.filter((pool) => pool.aboveShareCap);
+    expect(
+      hot.map((pool) => `${childId} ${pool.skill} ${pool.templateId} ${(pool.share * 100).toFixed(1)}%`),
+      "template share above 60%",
+    ).toEqual([]);
+    poolsByChild.push(pools);
   }
   const skills = perChild[0]?.map((row) => row.skill) ?? [];
   const summary = skills.map((skill) => {
@@ -384,7 +435,7 @@ function runChildCohort(
       max: Math.max(...counts),
     };
   });
-  return { worstSessionSwitches, summary, spread, perChild };
+  return { worstSessionSwitches, summary, spread, perChild, shares: cohortTemplateShares(poolsByChild) };
 }
 
 function assertCohortLimits(result: CohortResult): void {
@@ -404,6 +455,11 @@ function assertCohortLimits(result: CohortResult): void {
   expect(
     thin.map((row) => `${row.skill}: min ${row.min}`),
     "fewer than 3 distinct templates in a child-week",
+  ).toEqual([]);
+  const hot = result.shares.filter((row) => row.share > TEMPLATE_SHARE_CAP);
+  expect(
+    hot.map((row) => `${row.skill} ${row.templateId} ${(row.share * 100).toFixed(1)}%`),
+    "cohort template share above 60%",
   ).toEqual([]);
 }
 
@@ -3965,6 +4021,85 @@ describe("item templates and issuance", () => {
     expect(TEMPLATE_DRAW_WEIGHTS).toEqual({});
   });
 
+  it("breaks a never-issued template tie with the child id", () => {
+    const firstTemplate = (childId: string, key: string) => {
+      const db = tempDb();
+      const guardian = createGuardian(db, {
+        email: `${childId}@example.com`,
+        password: "correct-horse",
+        timezone: "America/Los_Angeles",
+      });
+      db.prepare(
+        `INSERT INTO children (id, guardian_id, display_name, timezone, created_at)
+         VALUES (?, ?, ?, 'America/Los_Angeles', ?)`,
+      ).run(childId, guardian.id, childId, WHEN);
+      openRotationSession(db, childId, `${childId}-session`, WHEN);
+      const issued = issueForProgression(db, {
+        childId,
+        sessionId: `${childId}-session`,
+        skillId: SKILLS.sub,
+        idempotencyKey: key,
+        now: new Date(Date.parse(WHEN) + 1000).toISOString(),
+      });
+      return issued.templateId;
+    };
+    const left = firstTemplate("tie-child", "tie-key-a");
+    expect(firstTemplate("tie-child", "tie-key-b")).toBe(left);
+    const others = ["tie-b", "tie-c", "tie-d", "tie-e", "tie-f", "tie-g", "tie-h"].map((id) =>
+      firstTemplate(id, "tie-key-a"),
+    );
+    expect(others.some((templateId) => templateId !== left)).toBe(true);
+  });
+
+  it("flags a template above 60% of a skill's draws", () => {
+    const db = tempDb();
+    const inline = newestTemplate("sub-2d-inline");
+    const blank = newestTemplate("sub-2d-blank");
+    if (!inline || !blank) throw new Error("missing subtract templates");
+    const insert = db.prepare(
+      `INSERT INTO item_instances (
+         item_instance_id, child_id, session_id, template_id, template_version, difficulty_step,
+         operands_json, operand_key, canonical_answer, answer_line, prompt, presentation_json,
+         evidence_eligible, repeat_forced, issue_reason, requested_skill_id, issue_idempotency_key,
+         issued_at, compare_mode, bug_hits_json
+       ) VALUES (
+         ?, 'share-child', 'share-session', ?, ?, 1,
+         '{}', ?, '1', '1', '1 + 1', '{}',
+         1, 0, 'normal', ?, ?, ?, 'exact', '[]'
+       )`,
+    );
+    for (let index = 0; index < 7; index += 1) {
+      insert.run(
+        `share-inline-${index}`,
+        inline.templateId,
+        inline.version,
+        `inline-${index}`,
+        SKILLS.sub,
+        `share-inline-key-${index}`,
+        new Date(Date.parse(WHEN) + index * 1000).toISOString(),
+      );
+    }
+    for (let index = 0; index < 3; index += 1) {
+      insert.run(
+        `share-blank-${index}`,
+        blank.templateId,
+        blank.version,
+        `blank-${index}`,
+        SKILLS.sub,
+        `share-blank-key-${index}`,
+        new Date(Date.parse(WHEN) + (index + 7) * 1000).toISOString(),
+      );
+    }
+    const pools = poolIssuanceCounts(db, "share-child");
+    const heavy = pools.find((pool) => pool.templateId === inline.templateId);
+    const light = pools.find((pool) => pool.templateId === blank.templateId);
+    expect(heavy?.share).toBe(0.7);
+    expect(heavy?.aboveShareCap).toBe(true);
+    expect(light?.share).toBe(0.3);
+    expect(light?.aboveShareCap).toBe(false);
+    expect(TEMPLATE_SHARE_CAP).toBe(0.6);
+  });
+
   it("skips a spent 1-item subtract template without a switch or a repeat", () => {
     const db = tempDb();
     const { child, session } = granted(db, "sub-seed-skip@example.com");
@@ -4129,11 +4264,22 @@ describe("item templates and issuance", () => {
     expect(exactRepeatRate(db, child.id, end).forced).toBe(0);
     const pools = poolIssuanceCounts(db, child.id);
     expect(pools.reduce((sum, row) => sum + row.issued, 0)).toBe(rows.length);
+    const skillIssued = new Map<string, number>();
+    const templateIssued = new Map<string, number>();
+    for (const pool of pools) {
+      skillIssued.set(pool.skill, (skillIssued.get(pool.skill) ?? 0) + pool.issued);
+      const key = `${pool.skill}\0${pool.templateId}`;
+      templateIssued.set(key, (templateIssued.get(key) ?? 0) + pool.issued);
+    }
     for (const pool of pools) {
       expect(pool.exhaustedRepeat).toBe(0);
       expect(pool.switchRate).toBe(
         pool.issued === 0 ? 0 : (pool.templateSwitch + pool.exhaustedSwitch) / pool.issued,
       );
+      const total = skillIssued.get(pool.skill) ?? 0;
+      const templateTotal = templateIssued.get(`${pool.skill}\0${pool.templateId}`) ?? 0;
+      expect(pool.share).toBe(total === 0 ? 0 : templateTotal / total);
+      expect(pool.aboveShareCap).toBe(pool.share > TEMPLATE_SHARE_CAP);
     }
     const home = getChildHome(db, guardian.id, child.id);
     const summary = readParentSummary(db, guardian.id, child.id, end);
