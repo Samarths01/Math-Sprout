@@ -68,6 +68,10 @@ CREATE TABLE IF NOT EXISTS item_instances (
   presentation_json TEXT NOT NULL,
   evidence_eligible INTEGER NOT NULL CHECK (evidence_eligible IN (0, 1)),
   repeat_forced INTEGER NOT NULL CHECK (repeat_forced IN (0, 1)),
+  issue_reason TEXT NOT NULL DEFAULT 'normal' CHECK (
+    issue_reason IN ('normal', 'template_switch', 'exhausted_switch', 'exhausted_repeat')
+  ),
+  requested_skill_id TEXT,
   issue_idempotency_key TEXT NOT NULL,
   issued_at TEXT NOT NULL,
   consumed_at TEXT,
@@ -152,7 +156,95 @@ export function migrateItemTemplates(db: Database.Database): void {
   if (addSessionColumn(db, "slot_seq", "slot_seq INTEGER NOT NULL DEFAULT 0")) {
     db.exec(`UPDATE practice_sessions SET slot_seq = item_index`);
   }
+  addIssueReason(db);
+  addRequestedSkill(db);
+  widenIssueReason(db);
   seedTemplateVersions(db);
+}
+
+/** Existing rows predate the column. They were ordinary draws, so they default to normal. */
+function addIssueReason(db: Database.Database): void {
+  const columns = new Set(
+    (db.pragma("table_info(item_instances)") as Array<{ name: string }>).map((row) => row.name),
+  );
+  if (columns.size === 0 || columns.has("issue_reason")) return;
+  db.exec(
+    `ALTER TABLE item_instances ADD COLUMN issue_reason TEXT NOT NULL DEFAULT 'normal' CHECK (
+       issue_reason IN ('normal', 'template_switch', 'exhausted_switch', 'exhausted_repeat')
+     )`,
+  );
+}
+
+/**
+ * SQLite cannot alter a CHECK. A database created before `template_switch`
+ * is rebuilt so that reason can be stored. Rows are copied as they are.
+ */
+function widenIssueReason(db: Database.Database): void {
+  const table = db
+    .prepare(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'item_instances'`)
+    .get() as { sql: string } | undefined;
+  if (!table?.sql || table.sql.includes("template_switch")) return;
+  db.exec(`
+CREATE TABLE item_instances_reason (
+  item_instance_id TEXT PRIMARY KEY,
+  child_id TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  template_id TEXT NOT NULL,
+  template_version INTEGER NOT NULL,
+  difficulty_step INTEGER NOT NULL,
+  operands_json TEXT NOT NULL,
+  operand_key TEXT NOT NULL,
+  canonical_answer TEXT NOT NULL,
+  answer_line TEXT NOT NULL,
+  prompt TEXT NOT NULL,
+  presentation_json TEXT NOT NULL,
+  evidence_eligible INTEGER NOT NULL CHECK (evidence_eligible IN (0, 1)),
+  repeat_forced INTEGER NOT NULL CHECK (repeat_forced IN (0, 1)),
+  issue_reason TEXT NOT NULL DEFAULT 'normal' CHECK (
+    issue_reason IN ('normal', 'template_switch', 'exhausted_switch', 'exhausted_repeat')
+  ),
+  requested_skill_id TEXT,
+  issue_idempotency_key TEXT NOT NULL,
+  issued_at TEXT NOT NULL,
+  consumed_at TEXT,
+  consumed_by_attempt_key TEXT,
+  require_form TEXT,
+  compare_mode TEXT NOT NULL,
+  bug_hits_json TEXT NOT NULL,
+  default_focus TEXT,
+  why_it_works TEXT,
+  UNIQUE (session_id, issue_idempotency_key)
+);
+INSERT INTO item_instances_reason (
+  item_instance_id, child_id, session_id, template_id, template_version,
+  difficulty_step, operands_json, operand_key, canonical_answer, answer_line,
+  prompt, presentation_json, evidence_eligible, repeat_forced, issue_reason, requested_skill_id,
+  issue_idempotency_key, issued_at, consumed_at, consumed_by_attempt_key,
+  require_form, compare_mode, bug_hits_json, default_focus, why_it_works
+)
+SELECT
+  item_instance_id, child_id, session_id, template_id, template_version,
+  difficulty_step, operands_json, operand_key, canonical_answer, answer_line,
+  prompt, presentation_json, evidence_eligible, repeat_forced, issue_reason, requested_skill_id,
+  issue_idempotency_key, issued_at, consumed_at, consumed_by_attempt_key,
+  require_form, compare_mode, bug_hits_json, default_focus, why_it_works
+FROM item_instances;
+DROP TABLE item_instances;
+ALTER TABLE item_instances_reason RENAME TO item_instances;
+CREATE INDEX IF NOT EXISTS item_instances_child_issued
+  ON item_instances(child_id, issued_at);
+CREATE INDEX IF NOT EXISTS item_instances_child_template
+  ON item_instances(child_id, template_id, operand_key);
+`);
+}
+
+/** Older rows have no stored request. Callers fall back to the template skill. */
+function addRequestedSkill(db: Database.Database): void {
+  const columns = new Set(
+    (db.pragma("table_info(item_instances)") as Array<{ name: string }>).map((row) => row.name),
+  );
+  if (columns.size === 0 || columns.has("requested_skill_id")) return;
+  db.exec(`ALTER TABLE item_instances ADD COLUMN requested_skill_id TEXT`);
 }
 
 function addSessionColumn(db: Database.Database, name: string, ddl: string): boolean {

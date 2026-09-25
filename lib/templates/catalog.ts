@@ -179,7 +179,7 @@ function legacyWide(blank: string): FeatureRange {
   return feat(blank);
 }
 
-export const TEMPLATE_VERSIONS: TemplateVersion[] = [
+const SEEDED_TEMPLATES: TemplateVersion[] = [
   template({
     templateId: "add-2d-v0",
     version: 0,
@@ -1148,14 +1148,136 @@ export const TEMPLATE_VERSIONS: TemplateVersion[] = [
   }),
 ];
 
+/**
+ * Step-1 operand ranges widened inside the existing feature band.
+ * Version 1 stays immutable. Issuance uses the newest active version.
+ */
+const STEP_ONE_WIDENED: Array<{ templateId: string; slots: Record<string, [number, number]> }> = [
+  // span stays 2–3, one digit. n=2,k=2 is ambiguous (scale_add equals the answer) and drops out.
+  { templateId: "frac-equiv-scale", slots: { n: [1, 3], d: [2, 3], k: [2, 3] } },
+  // span stays 5–6, one digit, proper fraction part. n = whole is ambiguous with form_swap.
+  { templateId: "frac-equiv-improper", slots: { whole: [1, 6], n: [1, 5], d: [5, 6] } },
+  // span stays 3–5. Whole answers stay ineligible. Most remaining pairs match form_swap.
+  { templateId: "frac-equiv-mixed", slots: { n: [3, 5], d: [2, 5] } },
+];
+
+function widenedStepOne(templateId: string, step1: Record<string, [number, number]>): TemplateVersion {
+  const base = SEEDED_TEMPLATES.find((template) => template.templateId === templateId);
+  if (!base) throw new Error(`Missing template ${templateId}`);
+  return {
+    ...base,
+    version: base.version + 1,
+    spec: {
+      ...base.spec,
+      steps: base.spec.steps.map((variant) =>
+        variant.assignedStep === 1 ? { ...variant, slots: slots(step1) } : variant,
+      ),
+    },
+  };
+}
+
+const WITH_STEP_ONE: TemplateVersion[] = [
+  ...SEEDED_TEMPLATES,
+  ...STEP_ONE_WIDENED.map((widened) => widenedStepOne(widened.templateId, widened.slots)),
+];
+
+/**
+ * Later versions widen a single step's operand box inside that step's
+ * feature band. Earlier versions stay in the catalog unchanged.
+ */
+const LATER_WIDENED: Array<{
+  templateId: string;
+  fromVersion: number;
+  slots: Partial<Record<1 | 2 | 3, Record<string, [number, number]>>>;
+}> = [
+  // scale step 2 span stays 4. k stays 4, so n and d can run up to 4.
+  { templateId: "frac-equiv-scale", fromVersion: 2, slots: { 2: { n: [1, 4], d: [2, 4], k: [4, 4] } } },
+  // improper step 2 span stays 3–4; step 3 span stays 7–9. n stays a proper part.
+  {
+    templateId: "frac-equiv-improper",
+    fromVersion: 2,
+    slots: {
+      2: { whole: [2, 4], n: [1, 2], d: [3, 4] },
+      3: { whole: [3, 4], n: [1, 2], d: [7, 9] },
+    },
+  },
+  // mixed step 2 span stays 7–11. d=5 is still inside that span.
+  { templateId: "frac-equiv-mixed", fromVersion: 2, slots: { 2: { n: [7, 11], d: [3, 5] } } },
+  // dividend stays inside span 4–20. q=6 is accepted only when the product still fits.
+  { templateId: "div-100-inline", fromVersion: 1, slots: { 1: { b: [2, 5], q: [2, 6] } } },
+  { templateId: "div-100-blank", fromVersion: 1, slots: { 1: { b: [2, 5], q: [2, 6] } } },
+  // dividend stays inside span 70–99.
+  { templateId: "div-100-blank-left", fromVersion: 1, slots: { 3: { b: [7, 9], q: [9, 12] } } },
+  // dividend stays inside span 36–60.
+  { templateId: "div-2d-blank", fromVersion: 1, slots: { 2: { b: [4, 7], q: [6, 10] } } },
+];
+
+/**
+ * Step-1 improper answers keep denominators 5 and 6 and cap the whole part at 3.
+ * A whole part of 4, 5, or 6 makes the operand span 5–6, which is this step's
+ * band, not step 2's span of 3–4, so those answers are dropped from step 1.
+ */
+function improperWholeCap(versions: readonly TemplateVersion[]): TemplateVersion {
+  return withWiderSlots(versions, "frac-equiv-improper", 3, {
+    1: { whole: [1, 3], n: [1, 5], d: [5, 6] },
+  });
+}
+
+function withWiderSlots(
+  versions: readonly TemplateVersion[],
+  templateId: string,
+  fromVersion: number,
+  slotsByStep: Partial<Record<1 | 2 | 3, Record<string, [number, number]>>>,
+): TemplateVersion {
+  const base = versions.find((template) => template.templateId === templateId && template.version === fromVersion);
+  if (!base) throw new Error(`Missing template ${templateId}@${fromVersion}`);
+  return {
+    ...base,
+    version: fromVersion + 1,
+    spec: {
+      ...base.spec,
+      steps: base.spec.steps.map((variant) => {
+        const next = slotsByStep[variant.assignedStep];
+        return next ? { ...variant, slots: slots(next) } : variant;
+      }),
+    },
+  };
+}
+
+const WITH_LATER_SLOTS: TemplateVersion[] = [
+  ...WITH_STEP_ONE,
+  ...LATER_WIDENED.map((widened) =>
+    withWiderSlots(WITH_STEP_ONE, widened.templateId, widened.fromVersion, widened.slots),
+  ),
+];
+
+export const TEMPLATE_VERSIONS: TemplateVersion[] = [
+  ...WITH_LATER_SLOTS,
+  improperWholeCap(WITH_LATER_SLOTS),
+];
+
+export function newestTemplate(templateId: string): TemplateVersion | undefined {
+  let newest: TemplateVersion | undefined;
+  for (const template of TEMPLATE_VERSIONS) {
+    if (template.templateId !== templateId) continue;
+    if (!newest || template.version > newest.version) newest = template;
+  }
+  return newest;
+}
+
 export function templatesForSkill(skillId: string, versionAtLeast = 0): TemplateVersion[] {
   return TEMPLATE_VERSIONS.filter(
     (template) => template.skillId === skillId && template.version >= versionAtLeast,
   );
 }
 
+/** Newest generated version of each template. Legacy v0 rows are not included. */
 export function generatedTemplates(skillId: string): TemplateVersion[] {
-  return TEMPLATE_VERSIONS.filter(
-    (template) => template.skillId === skillId && template.version >= 1 && !template.spec.legacy,
-  );
+  const newest = new Map<string, TemplateVersion>();
+  for (const template of TEMPLATE_VERSIONS) {
+    if (template.skillId !== skillId || template.version < 1 || template.spec.legacy) continue;
+    const current = newest.get(template.templateId);
+    if (!current || template.version > current.version) newest.set(template.templateId, template);
+  }
+  return [...newest.values()];
 }

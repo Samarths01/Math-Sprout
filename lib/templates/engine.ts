@@ -680,6 +680,33 @@ export function drawOnce(template: TemplateVersion, step: 1 | 2 | 3, rng: Rng): 
   return realizeDraw(template, step, drawn);
 }
 
+/**
+ * How slot combos land relative to this step.
+ * `eligible` is the pool issuance can draw. `matchesOtherStep` and
+ * `matchesNoStep` are combos that would pull the template out of its step.
+ */
+export function classifySlotDraws(
+  template: TemplateVersion,
+  step: 1 | 2 | 3,
+): { eligible: number; matchesOtherStep: number; matchesNoStep: number } {
+  const variant = template.spec.steps.find((item) => item.assignedStep === step);
+  if (!variant) return { eligible: 0, matchesOtherStep: 0, matchesNoStep: 0 };
+  let eligible = 0;
+  let matchesOtherStep = 0;
+  let matchesNoStep = 0;
+  for (const drawn of slotProduct(variant.slots)) {
+    const draw = realizeDraw(template, step, drawn);
+    if (!draw) continue;
+    const matched = template.spec.steps.filter((item) => featuresMatch(draw.features, item.features));
+    const onStep = matched.some((item) => item.assignedStep === step);
+    const onOther = matched.some((item) => item.assignedStep !== step);
+    if (onOther) matchesOtherStep += 1;
+    else if (!onStep) matchesNoStep += 1;
+    else if (!draw.ambiguous && featuresMatch(draw.features, variant.features)) eligible += 1;
+  }
+  return { eligible, matchesOtherStep, matchesNoStep };
+}
+
 /** Every operand set drawAccepted can return, after the mixed-form filter. */
 export function eligibleDraws(template: TemplateVersion, step: 1 | 2 | 3): Draw[] {
   const variant = template.spec.steps.find((item) => item.assignedStep === step);

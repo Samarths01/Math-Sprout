@@ -41,7 +41,7 @@ export type PublicItem = {
   grade: 2 | 3 | 4;
   skill: string;
   prompt: string;
-  /** Kid-facing difficulty word. Practice serves Warm-up in this release. */
+  /** Kid-facing difficulty word for this item's own step. */
   stepWord?: "Warm-up" | "Steady" | "Stretch";
   itemInstanceId?: string;
   layout?: "inline" | "column";

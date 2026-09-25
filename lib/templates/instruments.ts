@@ -33,6 +33,119 @@ export function exactRepeatRate(
   };
 }
 
+export type ExhaustionEventCount = {
+  skill: string;
+  templateId: string;
+  templateVersion: number;
+  step: number;
+  reason: "template_switch" | "exhausted_switch" | "exhausted_repeat";
+  count: number;
+};
+
+/**
+ * Dev count of exhaustion fallbacks. Grouped by skill, template version, and
+ * the step that was issued. Not an estimator, band, or child-payload input.
+ */
+export function exhaustionEventCounts(
+  db: Database.Database,
+  childId: string,
+): ExhaustionEventCount[] {
+  return db
+    .prepare(
+      `SELECT
+         t.skill_id AS skill,
+         i.template_id AS templateId,
+         i.template_version AS templateVersion,
+         i.difficulty_step AS step,
+         i.issue_reason AS reason,
+         COUNT(*) AS count
+       FROM item_instances i
+       JOIN item_template_versions t
+         ON t.template_id = i.template_id AND t.template_version = i.template_version
+       WHERE i.child_id = ? AND i.issue_reason IN ('template_switch', 'exhausted_switch', 'exhausted_repeat')
+       GROUP BY t.skill_id, i.template_id, i.template_version, i.difficulty_step, i.issue_reason
+       ORDER BY t.skill_id ASC, i.template_id ASC, i.template_version ASC, i.difficulty_step ASC, i.issue_reason ASC`,
+    )
+    .all(childId) as ExhaustionEventCount[];
+}
+
+/** A template above this share of its skill's draws is flagged on the dev readout. */
+export const TEMPLATE_SHARE_CAP = 0.6;
+
+export type PoolIssuanceCount = {
+  skill: string;
+  templateId: string;
+  templateVersion: number;
+  step: number;
+  issued: number;
+  templateSwitch: number;
+  exhaustedSwitch: number;
+  exhaustedRepeat: number;
+  /** `(templateSwitch + exhaustedSwitch) / issued`. Zero when nothing was issued. */
+  switchRate: number;
+  /** This template's draws divided by the skill's draws in this readout. */
+  share: number;
+  /** True when `share` is above `TEMPLATE_SHARE_CAP`. */
+  aboveShareCap: boolean;
+};
+
+/**
+ * Dev readout for a dogfood run. Runtime counts of every issued item in each
+ * (requested skill, step, template version) pool, plus switch and repeat counts.
+ * `share` is that template's draws divided by the skill's draws. A template
+ * above 60% is flagged. A switch is credited to the skill that was requested.
+ * Older rows with no stored request fall back to the template skill.
+ * Not an estimator input, and not a child or parent field.
+ */
+export function poolIssuanceCounts(db: Database.Database, childId: string): PoolIssuanceCount[] {
+  const rows = db
+    .prepare(
+      `SELECT
+         COALESCE(i.requested_skill_id, t.skill_id) AS skill,
+         i.template_id AS templateId,
+         i.template_version AS templateVersion,
+         i.difficulty_step AS step,
+         COUNT(*) AS issued,
+         SUM(CASE WHEN i.issue_reason = 'template_switch' THEN 1 ELSE 0 END) AS templateSwitch,
+         SUM(CASE WHEN i.issue_reason = 'exhausted_switch' THEN 1 ELSE 0 END) AS exhaustedSwitch,
+         SUM(CASE WHEN i.issue_reason = 'exhausted_repeat' THEN 1 ELSE 0 END) AS exhaustedRepeat
+       FROM item_instances i
+       JOIN item_template_versions t
+         ON t.template_id = i.template_id AND t.template_version = i.template_version
+       WHERE i.child_id = ?
+       GROUP BY COALESCE(i.requested_skill_id, t.skill_id), i.template_id, i.template_version, i.difficulty_step
+       ORDER BY skill ASC, i.template_id ASC, i.template_version ASC, i.difficulty_step ASC`,
+    )
+    .all(childId) as Array<{
+    skill: string;
+    templateId: string;
+    templateVersion: number;
+    step: number;
+    issued: number;
+    templateSwitch: number;
+    exhaustedSwitch: number;
+    exhaustedRepeat: number;
+  }>;
+  const skillIssued = new Map<string, number>();
+  const templateIssued = new Map<string, number>();
+  for (const row of rows) {
+    skillIssued.set(row.skill, (skillIssued.get(row.skill) ?? 0) + row.issued);
+    const key = `${row.skill}\0${row.templateId}`;
+    templateIssued.set(key, (templateIssued.get(key) ?? 0) + row.issued);
+  }
+  return rows.map((row) => {
+    const skillTotal = skillIssued.get(row.skill) ?? 0;
+    const templateTotal = templateIssued.get(`${row.skill}\0${row.templateId}`) ?? 0;
+    const share = skillTotal === 0 ? 0 : templateTotal / skillTotal;
+    return {
+      ...row,
+      switchRate: row.issued === 0 ? 0 : (row.templateSwitch + row.exhaustedSwitch) / row.issued,
+      share,
+      aboveShareCap: share > TEMPLATE_SHARE_CAP,
+    };
+  });
+}
+
 export type StepPractice = {
   skill: string;
   step: number;

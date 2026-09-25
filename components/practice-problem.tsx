@@ -2,7 +2,9 @@ import type { ReactNode } from "react";
 import type { PublicItem } from "@/lib/attempt-contract";
 import { stepClass } from "@/lib/palette";
 
-/** Problem chrome. Step words stay Warm-up, Steady, or Stretch. */
+/**
+ * Problem chrome. The concept name is the header. A skill change is not a toast.
+ */
 export function PracticeProblem({
   item,
   answerSlot,
@@ -27,6 +29,7 @@ export function PracticeProblem({
         >
           {word}
         </span>
+        <span data-testid="concept-name">{item.skill}</span>
         <span>{item.pack === "fractions" ? "Fractions" : "Operations"}</span>
       </div>
       {item.layout === "column" && item.columnLines && item.columnLines.length > 0 ? (

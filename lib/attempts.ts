@@ -615,6 +615,7 @@ export function submitAnswer(
           ...(flags.length === 0 && correct ? { solidify: instance.whyItWorks ?? "" } : {}),
         });
       }
+      const savedView = readSkillClientView(db, childId, skillItem.skill);
       economy = planAttemptEconomy(db, {
         childId,
         sessionId,
@@ -626,7 +627,9 @@ export function submitAnswer(
         flags,
         practiceLane: session.practice_lane,
         history: evidenceForSkill(db, childId, skillItem.skill),
-        previousBand: readSkillClientView(db, childId, skillItem.skill)?.bandLabel ?? null,
+        previousBand: savedView?.bandLabel ?? null,
+        countsForBand: instance.evidenceEligible,
+        savedClientView: savedView,
       });
       if (instance.evidenceEligible) {
         saveSkillState(db, childId, skillItem.skill, economy.clientView);

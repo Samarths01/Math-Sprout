@@ -17,7 +17,7 @@ import { DomainError } from "@/lib/domain";
 import { loadQualifyingDays, projectHeat } from "@/lib/fuel";
 import { bumpDifficulty, ensureLearnerProgress } from "@/lib/learner-state";
 import { calendarDaysBetween, localDate, localWeekRange } from "@/lib/local-time";
-import { MasteryEstimator, type PracticeLane, type SkillEvidence } from "@/lib/mastery";
+import { MasteryEstimator, assessWindow, type PracticeLane, type SkillEvidence } from "@/lib/mastery";
 import { POLICY_VERSION } from "@/lib/policy";
 import { emptyStreak, type StreakRecord, type StreakState } from "@/lib/streak";
 
@@ -215,6 +215,15 @@ function gateInputFor(
   };
 }
 
+/** Band view for a non-evidence attempt when this skill has no saved view yet. */
+function emptyClientView(): ClientView {
+  return {
+    bandLabel: assessWindow([]).bandLabel,
+    showConceptChip: false,
+    celebrationTier: "none",
+  };
+}
+
 export function planAttemptEconomy(
   db: Database.Database,
   input: {
@@ -229,6 +238,12 @@ export function planAttemptEconomy(
     practiceLane: PracticeLane;
     history: readonly SkillEvidence[];
     previousBand: BandLabel | null;
+    /**
+     * False for a non-evidence attempt. The saved band view is returned as-is,
+     * and nothing that depends on evidence is minted.
+     */
+    countsForBand?: boolean;
+    savedClientView?: ClientView | null;
   },
 ): AttemptEconomy {
   const integrity = resolveCelebration({ correct: input.correct, flags: input.flags });
@@ -265,7 +280,7 @@ export function planAttemptEconomy(
         reason: attemptReason(input.flags, input.correct, input.practiceLane),
       },
     });
-    if (qualifies && input.correct) {
+    if (qualifies && input.correct && input.countsForBand !== false) {
       mints.push({
         kind: "ConceptProgressTick",
         idempotencyKey: `${input.idempotencyKey}:ConceptProgressTick`,
@@ -303,16 +318,19 @@ export function planAttemptEconomy(
     integrityLane: integrity.lane,
     practiceLane: input.practiceLane,
   });
-  const clientView = estimator.toClientView({
-    correct: input.correct,
-    lane: integrity.lane,
-    celebrationTier,
-    practiceLane: input.practiceLane,
-    history: input.history,
-  });
+  const countsForBand = input.countsForBand !== false;
+  const clientView = countsForBand
+    ? estimator.toClientView({
+        correct: input.correct,
+        lane: integrity.lane,
+        celebrationTier,
+        practiceLane: input.practiceLane,
+        history: input.history,
+      })
+    : (input.savedClientView ?? emptyClientView());
 
   const withBands = [...gated];
-  if (bandMoved(input.previousBand, clientView.bandLabel)) {
+  if (countsForBand && bandMoved(input.previousBand, clientView.bandLabel)) {
     withBands.push({
       kind: "MasteryBandTransition",
       idempotencyKey: `${input.idempotencyKey}:MasteryBandTransition`,
@@ -327,7 +345,11 @@ export function planAttemptEconomy(
       },
     });
   }
-  if (clientView.bandLabel === "Got it" && input.previousBand !== "Got it") {
+  if (
+    countsForBand &&
+    clientView.bandLabel === "Got it" &&
+    input.previousBand !== "Got it"
+  ) {
     withBands.push({
       kind: "BadgeMilestone",
       idempotencyKey: `badge:${input.skill}:Got it`,
