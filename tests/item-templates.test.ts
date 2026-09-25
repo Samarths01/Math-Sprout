@@ -4077,6 +4077,173 @@ describe("item templates and issuance", () => {
     expect(summary.minutes).toBe(PRACTICE_SESSION_LENGTH);
   });
 
+  it("saves a parked answer behind a newer attempt as a late replay", async () => {
+    const db = tempDb();
+    const { guardian, child, session } = granted(db, "late-replay@example.com");
+    const token = createSession(db, guardian.id);
+    const older = readItemInstance(db, session.item.itemInstanceId ?? "");
+    if (!older) throw new Error("session did not issue");
+    expect(older.evidenceEligible).toBe(true);
+    const skillOf = (templateId: string, templateVersion: number) =>
+      (
+        db
+          .prepare(
+            `SELECT skill_id AS skillId FROM item_template_versions
+             WHERE template_id = ? AND template_version = ?`,
+          )
+          .get(templateId, templateVersion) as { skillId: string }
+      ).skillId;
+    const skillId = skillOf(older.templateId, older.templateVersion);
+    const newer = issueForProgression(db, {
+      childId: child.id,
+      sessionId: session.sessionId,
+      skillId,
+      idempotencyKey: "late-replay-newer-issue",
+      now: new Date(Date.parse(older.issuedAt) + 5_000).toISOString(),
+      allowSoleTemplateBackToBack: true,
+    });
+    expect(skillOf(newer.templateId, newer.templateVersion)).toBe(skillId);
+    expect(Date.parse(newer.issuedAt)).toBeGreaterThan(Date.parse(older.issuedAt));
+    const newerAt = new Date(Date.parse(newer.issuedAt) + 3_000).toISOString();
+    const scoredNewer = submitAnswer(
+      db,
+      guardian.id,
+      child.id,
+      {
+        idempotencyKey: "late-replay-newer-score",
+        sessionId: session.sessionId,
+        itemId: session.item.id,
+        itemInstanceId: newer.itemInstanceId,
+        answer: newer.canonicalAnswer,
+        shownAt: new Date(Date.parse(newerAt) - 2_000).toISOString(),
+        submittedAt: newerAt,
+      },
+      { now: newerAt },
+    );
+    if (isFormatRejected(scoredNewer)) throw new Error("a readable answer was rejected");
+    const bandAfterNewer = db
+      .prepare(
+        `SELECT skill, band_label AS bandLabel, show_concept_chip AS chip, celebration_tier AS tier
+         FROM learner_skill_state WHERE child_id = ? ORDER BY skill`,
+      )
+      .all(child.id);
+    const parked: QueuedAttempt = {
+      idempotencyKey: "late-replay-older",
+      childId: child.id,
+      sessionId: session.sessionId,
+      itemId: session.item.id,
+      itemInstanceId: older.itemInstanceId,
+      answer: older.canonicalAnswer,
+      shownAt: new Date(Date.parse(older.issuedAt) + 1_000).toISOString(),
+      submittedAt: new Date(Date.parse(older.issuedAt) + 3_000).toISOString(),
+    };
+    const queue = createAttemptQueue(
+      memoryQueueStore({
+        version: 1,
+        pending: [],
+        blocked: [],
+        parked: [{ ...parked, message: interfaceCopy("offline.parked.kid") }],
+        dropped: [],
+        synced: [],
+      }),
+    );
+    const synced = await queue.retryParkedOnce(async (attempt) => {
+      const posted = await postAttemptRoute(db, token, child.id, attempt);
+      expect(posted.status).toBe(200);
+      if (!posted.body.attemptId) throw new Error("late replay was not saved");
+      return { ok: true as const, result: posted.body as AttemptResult };
+    });
+    expect(synced.parked).toEqual([]);
+    const saved = savedItemEvidence(db, older.itemInstanceId);
+    expect(saved.attempts).toHaveLength(1);
+    expect(saved.xp).toHaveLength(1);
+    const row = db
+      .prepare(
+        `SELECT estimator_evidence AS evidence, evidence_reason AS reason
+         FROM attempts WHERE id = ?`,
+      )
+      .get(saved.attempts[0]?.id) as { evidence: number; reason: string | null };
+    expect(row).toEqual({ evidence: 0, reason: "late_replay" });
+    expect(
+      db
+        .prepare(
+          `SELECT skill, band_label AS bandLabel, show_concept_chip AS chip, celebration_tier AS tier
+           FROM learner_skill_state WHERE child_id = ? ORDER BY skill`,
+        )
+        .all(child.id),
+    ).toEqual(bandAfterNewer);
+    const honest = db
+      .prepare(
+        `SELECT qualifies FROM qualifying_events
+         WHERE attempt_id = ? AND kind = 'HonestAttempt'`,
+      )
+      .get(saved.attempts[0]?.id) as { qualifies: number };
+    expect(honest.qualifies).toBe(1);
+  });
+
+  it("counts a parked answer normally when no newer attempt exists on that skill", async () => {
+    const db = tempDb();
+    const { guardian, child, session } = granted(db, "on-time-replay@example.com");
+    const token = createSession(db, guardian.id);
+    const screen = readItemInstance(db, session.item.itemInstanceId ?? "");
+    if (!screen) throw new Error("session did not issue");
+    expect(screen.evidenceEligible).toBe(true);
+    const parked: QueuedAttempt = {
+      idempotencyKey: "on-time-parked",
+      childId: child.id,
+      sessionId: session.sessionId,
+      itemId: session.item.id,
+      itemInstanceId: screen.itemInstanceId,
+      answer: screen.canonicalAnswer,
+      shownAt: new Date(Date.parse(screen.issuedAt) + 1_000).toISOString(),
+      submittedAt: new Date(Date.parse(screen.issuedAt) + 3_000).toISOString(),
+    };
+    const queue = createAttemptQueue(
+      memoryQueueStore({
+        version: 1,
+        pending: [],
+        blocked: [],
+        parked: [{ ...parked, message: interfaceCopy("offline.parked.kid") }],
+        dropped: [],
+        synced: [],
+      }),
+    );
+    await queue.retryParkedOnce(async (attempt) => {
+      const posted = await postAttemptRoute(db, token, child.id, attempt);
+      expect(posted.status).toBe(200);
+      if (!posted.body.attemptId) throw new Error("parked answer was not saved");
+      return { ok: true as const, result: posted.body as AttemptResult };
+    });
+    const saved = savedItemEvidence(db, screen.itemInstanceId);
+    expect(saved.attempts).toHaveLength(1);
+    expect(saved.xp).toHaveLength(1);
+    const row = db
+      .prepare(
+        `SELECT estimator_evidence AS evidence, evidence_reason AS reason, correct
+         FROM attempts WHERE id = ?`,
+      )
+      .get(saved.attempts[0]?.id) as { evidence: number; reason: string | null; correct: number };
+    expect(row).toEqual({ evidence: 1, reason: null, correct: 1 });
+    const band = db
+      .prepare(`SELECT band_label AS bandLabel FROM learner_skill_state WHERE child_id = ?`)
+      .get(child.id) as { bandLabel: string };
+    expect(band.bandLabel).toBeTruthy();
+    const honest = db
+      .prepare(
+        `SELECT qualifies FROM qualifying_events
+         WHERE attempt_id = ? AND kind = 'HonestAttempt'`,
+      )
+      .get(saved.attempts[0]?.id) as { qualifies: number };
+    expect(honest.qualifies).toBe(1);
+    const day = db
+      .prepare(
+        `SELECT COUNT(*) AS count FROM qualifying_events
+         WHERE child_id = ? AND kind = 'QualifyingPracticeDay'`,
+      )
+      .get(child.id) as { count: number };
+    expect(day.count).toBe(1);
+  });
+
   it("posts each queued key once when two flushes start together", async () => {
     const queue = createAttemptQueue(memoryQueueStore());
     const first: QueuedAttempt = {

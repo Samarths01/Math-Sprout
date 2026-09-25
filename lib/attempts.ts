@@ -452,6 +452,32 @@ export function startPracticeSession(
   return presentSession(db, childId, open.immediate());
 }
 
+/**
+ * A later item of this skill already has a saved attempt.
+ * Compared on server `issued_at` only. Device clocks are not read.
+ */
+function skillHasLaterIssuedAttempt(
+  db: Database.Database,
+  childId: string,
+  skillId: string,
+  issuedAt: string,
+): boolean {
+  const row = db
+    .prepare(
+      `SELECT 1 AS ok
+       FROM attempts a
+       JOIN item_instances later ON later.item_instance_id = a.item_instance_id
+       JOIN item_template_versions t
+         ON t.template_id = later.template_id AND t.template_version = later.template_version
+       WHERE a.child_id = ?
+         AND t.skill_id = ?
+         AND later.issued_at > ?
+       LIMIT 1`,
+    )
+    .get(childId, skillId, issuedAt) as { ok: number } | undefined;
+  return row !== undefined;
+}
+
 export function submitAnswer(
   db: Database.Database,
   guardianId: string,
@@ -528,6 +554,7 @@ export function submitAnswer(
     let templateId: string | null = null;
     let difficultyStep: number | null = null;
     let estimatorEvidence: number | null = null;
+    let evidenceReason: string | null = null;
     let attemptOutcome: "correct" | "incorrect" | "form_mismatch" = "incorrect";
     const skipEconomy = false;
 
@@ -638,7 +665,12 @@ export function submitAnswer(
       const formMiss = verdict === "form_mismatch";
       const valueMiss = verdict === "incorrect" || formMiss;
       attemptOutcome = formMiss ? "form_mismatch" : correct ? "correct" : "incorrect";
-      estimatorEvidence = instance.evidenceEligible ? 1 : 0;
+      const lateReplay =
+        skillRow !== undefined &&
+        skillHasLaterIssuedAttempt(db, childId, skillRow.skill_id, instance.issuedAt);
+      const countsAsEvidence = instance.evidenceEligible && !lateReplay;
+      estimatorEvidence = countsAsEvidence ? 1 : 0;
+      evidenceReason = lateReplay ? "late_replay" : null;
       if (formMiss && flags.length === 0 && instance.requireForm) {
         const copy = wrongFormCopy({
           typed: normalizedTypedAnswer(input.answer),
@@ -678,10 +710,10 @@ export function submitAnswer(
         practiceLane: session.practice_lane,
         history: evidenceForSkill(db, childId, skillItem.skill),
         previousBand: savedView?.bandLabel ?? null,
-        countsForBand: instance.evidenceEligible,
+        countsForBand: countsAsEvidence,
         savedClientView: savedView,
       });
-      if (instance.evidenceEligible) {
+      if (countsAsEvidence) {
         saveSkillState(db, childId, skillItem.skill, economy.clientView);
       }
       consumeItemInstance(db, instance, idempotencyKey, submittedAt);
@@ -717,12 +749,14 @@ export function submitAnswer(
          id, child_id, session_id, idempotency_key, item_id, answer, shown_at,
          submitted_at, correct, lane, celebration_tier, flags_json, beats_json,
          client_view_json, created_at, policy_version, build_sha, resume_presentation,
-         item_instance_id, template_id, difficulty_step, estimator_evidence, outcome
+         item_instance_id, template_id, difficulty_step, estimator_evidence, outcome,
+         evidence_reason
        ) VALUES (
          @id, @child_id, @session_id, @idempotency_key, @item_id, @answer, @shown_at,
          @submitted_at, @correct, @lane, @celebration_tier, @flags_json, @beats_json,
          @client_view_json, @created_at, @policy_version, @build_sha, @resume_presentation,
-         @item_instance_id, @template_id, @difficulty_step, @estimator_evidence, @outcome
+         @item_instance_id, @template_id, @difficulty_step, @estimator_evidence, @outcome,
+         @evidence_reason
        )`,
     ).run({
       id: attemptId,
@@ -748,6 +782,7 @@ export function submitAnswer(
       difficulty_step: difficultyStep,
       estimator_evidence: estimatorEvidence,
       outcome: attemptOutcome,
+      evidence_reason: evidenceReason,
     });
     if (!skipEconomy) commitAttemptEconomy(db, {
       childId,
