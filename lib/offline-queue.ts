@@ -84,14 +84,24 @@ export function consentQueueReason(
 }
 
 /**
- * Missing or invalid instance ids are permanent. 5xx stays retryable.
- * Other statuses return null so the caller keeps its existing mapping.
+ * Missing or invalid instance ids are permanent when the body names that case.
+ * An unknown instance is 404 with `code: unknown_instance`. An already-used
+ * instance is 409 with `code: already_locked`. Other 404s and 409s stay
+ * retryable, including a missing session, a missing child, and a routing 404.
+ * 5xx stays retryable. Other statuses return null so the caller keeps its
+ * existing mapping.
  */
 export function classifyAttemptFailure(
   status: number,
-  body: { error?: unknown; retryable?: unknown } | null,
+  body: { error?: unknown; retryable?: unknown; code?: unknown } | null,
 ): Extract<SyncPost, { ok: false; reason: "invalid_attempt" | "error" }> | null {
-  if (status === 400 && body?.error === "invalid_attempt" && body.retryable === false) {
+  const unknownInstance = status === 404 && body?.code === "unknown_instance";
+  const alreadyUsed = status === 409 && body?.code === "already_locked";
+  if (
+    (status === 400 && body?.error === "invalid_attempt" && body.retryable === false) ||
+    unknownInstance ||
+    alreadyUsed
+  ) {
     return { ok: false, reason: "invalid_attempt" };
   }
   if (status >= 500) {

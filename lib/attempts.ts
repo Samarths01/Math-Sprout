@@ -535,12 +535,32 @@ export function submitAnswer(
 
     if (input.itemInstanceId) {
       const instance = readItemInstance(db, input.itemInstanceId);
-      if (!instance) throw new DomainError("That problem is not in this practice pack.", 404);
+      if (!instance) {
+        throw new DomainError(
+          "That problem is not in this practice pack.",
+          404,
+          undefined,
+          undefined,
+          "unknown_instance",
+        );
+      }
       if (instance.childId !== childId || instance.sessionId !== sessionId) {
-        throw new DomainError("That problem is already locked.", 409);
+        throw new DomainError(
+          "That problem is already locked.",
+          409,
+          undefined,
+          undefined,
+          "already_locked",
+        );
       }
       if (instance.consumedAt) {
-        throw new DomainError("That problem is already locked.", 409);
+        throw new DomainError(
+          "That problem is already locked.",
+          409,
+          undefined,
+          undefined,
+          "already_locked",
+        );
       }
       const skillRow = db
         .prepare(
