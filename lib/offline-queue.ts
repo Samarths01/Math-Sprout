@@ -10,7 +10,9 @@ export type QueuedAttempt = {
   sessionId: string;
   itemId: string;
   answer: string;
+  /** When the item was shown. Captured at Check and sent unchanged on every retry. */
   shownAt: string;
+  /** When the child pressed Check. Captured then and sent unchanged on every retry. */
   submittedAt: string;
   itemInstanceId?: string;
   /** Retryable sync failures so far. A parked try is no longer pending. */

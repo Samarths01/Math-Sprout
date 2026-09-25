@@ -1,3 +1,4 @@
+import { PRACTICE_SESSION_LENGTH } from "@/lib/session-plan";
 import type { WrongFormReason } from "@/lib/wrong-form-copy";
 
 export const FOUR_BEAT_KEYS = [
@@ -93,6 +94,25 @@ export type AttemptResult = FourBeat & {
 
 export const TOO_FAST_MS = 500;
 export const SPAM_WINDOW_MS = 10_000;
+
+/**
+ * Counted response time for one try.
+ * Latency is `submittedAt` minus `shownAt`. Both are captured on the device
+ * when the child presses Check and are stored on the attempt. The server
+ * does not use the time it receives the request.
+ * There is no minutes-cap constant. One try counts at most
+ * `PRACTICE_SESSION_LENGTH` minutes, so a skewed device clock cannot add
+ * more than one session to the parent card. A negative or non-finite span
+ * counts as 0, which the too-fast flag treats as too fast.
+ */
+export const ATTEMPT_LATENCY_CAP_MS = PRACTICE_SESSION_LENGTH * 60_000;
+
+export function responseLatencyMs(shownAt: string, submittedAt: string): number {
+  const raw = Date.parse(submittedAt) - Date.parse(shownAt);
+  if (!Number.isFinite(raw) || raw < 0) return 0;
+  if (raw > ATTEMPT_LATENCY_CAP_MS) return ATTEMPT_LATENCY_CAP_MS;
+  return raw;
+}
 /** Earlier attempts allowed inside the window before the next one is spam. */
 export const SPAM_MAX_IN_WINDOW = 8;
 
@@ -102,6 +122,7 @@ export const XP_AMOUNT: Record<CelebrationTier, number> = {
   full: 5,
 };
 
+/** `elapsedMs` is `responseLatencyMs`: the capped device span, not receipt time. */
 export function integrityFlags(input: {
   answer: string;
   elapsedMs: number;

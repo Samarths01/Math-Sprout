@@ -7,10 +7,11 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { POST as submitAttemptRoute } from "@/app/api/children/[id]/attempts/route";
 import { POST as issueItemsRoute } from "@/app/api/children/[id]/sessions/[sessionId]/items/route";
 import Database from "better-sqlite3";
-import type { AttemptResult } from "@/lib/attempt-contract";
+import { ATTEMPT_LATENCY_CAP_MS, responseLatencyMs, type AttemptResult } from "@/lib/attempt-contract";
 import { currentAppBuildSha } from "@/lib/app-build";
 import { parseAnswer, rationalsEqual } from "@/lib/answer-parser";
 import { advancePracticeSlot, parseSubmitAttempt, startPracticeSession, submitAnswer, submitAttempt } from "@/lib/attempts";
+import { readAttemptLog } from "@/lib/attempt-log";
 import { choosePracticeLane, endPracticeSession } from "@/lib/boundary";
 import { interfaceCopy } from "@/lib/interface-copy";
 import { AnswerBlank } from "@/components/answer-blank";
@@ -3979,7 +3980,22 @@ describe("item templates and issuance", () => {
     const firstSave = savedItemEvidence(db, screen.itemInstanceId);
     expect(firstSave.attempts).toHaveLength(1);
     expect(firstSave.xp).toHaveLength(1);
+    const storedTimes = db
+      .prepare(
+        `SELECT shown_at AS shownAt, submitted_at AS submittedAt
+         FROM attempts WHERE id = ?`,
+      )
+      .get(firstSave.attempts[0]?.id) as { shownAt: string; submittedAt: string };
+    expect(storedTimes.shownAt).toBe(saved.shownAt);
+    expect(storedTimes.submittedAt).toBe(saved.submittedAt);
+    const queuedLatency = Date.parse(saved.submittedAt) - Date.parse(saved.shownAt);
+    expect(Date.parse(storedTimes.submittedAt) - Date.parse(storedTimes.shownAt)).toBe(queuedLatency);
+    expect(readAttemptLog(db, firstSave.attempts[0]?.id ?? "").latencyMs).toBe(queuedLatency);
+    expect(timedOut.parked[0]?.shownAt).toBe(saved.shownAt);
+    expect(timedOut.parked[0]?.submittedAt).toBe(saved.submittedAt);
     const replayed = await queue.retryParkedOnce(async (attempt) => {
+      expect(attempt.shownAt).toBe(saved.shownAt);
+      expect(attempt.submittedAt).toBe(saved.submittedAt);
       const posted = await postAttemptRoute(db, token, child.id, attempt);
       expect(posted.status).toBe(200);
       expect(posted.body.replayed).toBe(true);
@@ -3994,6 +4010,71 @@ describe("item templates and issuance", () => {
     expect(afterReplay.attempts).toHaveLength(1);
     expect(afterReplay.xp).toHaveLength(1);
     expect(afterReplay).toEqual(firstSave);
+    const stillStored = db
+      .prepare(
+        `SELECT shown_at AS shownAt, submitted_at AS submittedAt
+         FROM attempts WHERE id = ?`,
+      )
+      .get(firstSave.attempts[0]?.id) as { shownAt: string; submittedAt: string };
+    expect(stillStored).toEqual(storedTimes);
+  });
+
+  it("counts device latency for the too-fast flag and caps parent minutes", () => {
+    expect(responseLatencyMs("2026-06-15T18:00:02.000Z", "2026-06-15T18:00:01.000Z")).toBe(0);
+    expect(responseLatencyMs("not-a-time", "also-not")).toBe(0);
+    const shown = "2026-06-15T16:00:00.000Z";
+    const over = new Date(Date.parse(shown) + ATTEMPT_LATENCY_CAP_MS + 60_000).toISOString();
+    expect(responseLatencyMs(shown, over)).toBe(ATTEMPT_LATENCY_CAP_MS);
+    const db = tempDb();
+    const { guardian, child, session } = granted(db, "latency-cap@example.com");
+    const screen = readItemInstance(db, session.item.itemInstanceId ?? "");
+    if (!screen) throw new Error("session did not issue");
+    const fast = submitAnswer(
+      db,
+      guardian.id,
+      child.id,
+      {
+        idempotencyKey: "latency-too-fast",
+        sessionId: session.sessionId,
+        itemId: session.item.id,
+        itemInstanceId: screen.itemInstanceId,
+        answer: screen.canonicalAnswer,
+        shownAt: WHEN,
+        submittedAt: WHEN,
+      },
+      { now: WHEN },
+    );
+    if (isFormatRejected(fast)) throw new Error("a readable answer was rejected");
+    expect(fast.flags).toContain("too_fast");
+    const fastRow = db
+      .prepare(`SELECT shown_at AS shownAt, submitted_at AS submittedAt FROM attempts WHERE id = ?`)
+      .get(fast.attemptId) as { shownAt: string; submittedAt: string };
+    expect(readAttemptLog(db, fast.attemptId).latencyMs).toBe(0);
+    expect(fastRow.shownAt).toBe(WHEN);
+    expect(fastRow.submittedAt).toBe(WHEN);
+    const next = readItemInstance(db, fast.nextItem.itemInstanceId ?? "");
+    if (!next) throw new Error("next item was not issued");
+    const longSubmitted = new Date(Date.parse(WHEN) + ATTEMPT_LATENCY_CAP_MS + 30 * 60_000).toISOString();
+    const capped = submitAnswer(
+      db,
+      guardian.id,
+      child.id,
+      {
+        idempotencyKey: "latency-capped",
+        sessionId: session.sessionId,
+        itemId: session.item.id,
+        itemInstanceId: next.itemInstanceId,
+        answer: next.canonicalAnswer,
+        shownAt: WHEN,
+        submittedAt: longSubmitted,
+      },
+      { now: longSubmitted },
+    );
+    if (isFormatRejected(capped)) throw new Error("a readable answer was rejected");
+    expect(capped.flags).not.toContain("too_fast");
+    expect(readAttemptLog(db, capped.attemptId).latencyMs).toBe(ATTEMPT_LATENCY_CAP_MS);
+    const summary = readParentSummary(db, guardian.id, child.id, longSubmitted);
+    expect(summary.minutes).toBe(PRACTICE_SESSION_LENGTH);
   });
 
   it("posts each queued key once when two flushes start together", async () => {

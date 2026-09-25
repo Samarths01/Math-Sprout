@@ -3,6 +3,7 @@ import type Database from "better-sqlite3";
 import {
   FOUR_BEAT_KEYS,
   integrityFlags,
+  responseLatencyMs,
   type AttemptResult,
   type FourBeat,
   type IntegrityFlag,
@@ -508,7 +509,7 @@ export function submitAnswer(
          WHERE child_id = ? AND submitted_at > ? AND submitted_at <= ?`,
       )
       .get(childId, windowStart, submittedAt) as { count: number };
-    const elapsedMs = Date.parse(submittedAt) - Date.parse(shownAt);
+    const elapsedMs = responseLatencyMs(shownAt, submittedAt);
     const flags = integrityFlags({
       answer: input.answer,
       elapsedMs,
