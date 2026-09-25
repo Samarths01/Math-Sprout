@@ -156,6 +156,9 @@ export function migrateItemTemplates(db: Database.Database): void {
   if (addSessionColumn(db, "slot_seq", "slot_seq INTEGER NOT NULL DEFAULT 0")) {
     db.exec(`UPDATE practice_sessions SET slot_seq = item_index`);
   }
+  // Older rows keep a linear walk: lane start 0 and overflow 0 reproduce slot_seq modulo the catalog.
+  addSessionColumn(db, "lane_start", "lane_start INTEGER NOT NULL DEFAULT 0");
+  addSessionColumn(db, "overflow_offset", "overflow_offset INTEGER NOT NULL DEFAULT 0");
   addIssueReason(db);
   addRequestedSkill(db);
   widenIssueReason(db);

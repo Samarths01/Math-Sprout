@@ -4,6 +4,7 @@ import { DomainError, getChild } from "@/lib/domain";
 import { asRecord, assertSameOrigin, errorResponse, readJson, requireGuardian } from "@/lib/http";
 import { readPracticeSession } from "@/lib/learner-state";
 import { itemAt } from "@/lib/item-catalog";
+import { plannedCatalogIndexes } from "@/lib/session-plan";
 import { ISSUE_BATCH_CAP, issueItemBatch, publicItemForInstance } from "@/lib/templates/issue";
 
 export const runtime = "nodejs";
@@ -29,16 +30,23 @@ export async function POST(request: Request, context: Context) {
     getChild(db, guardian.id, id);
     const session = readPracticeSession(db, id, sessionId);
     if (!session) throw new DomainError("Practice session not found.", 404);
+    const indexes = plannedCatalogIndexes(
+      session.lane_start,
+      session.overflow_offset,
+      session.slot_seq - session.lane_start,
+      count,
+    );
     const instances = issueItemBatch(db, {
       childId: id,
       sessionId,
       idempotencyKey,
       count,
-      itemIndex: session.item_index,
+      itemIndex: indexes[0] ?? session.item_index,
+      indexes,
     });
     return NextResponse.json({
       items: instances.map((instance, index) =>
-        publicItemForInstance(db, instance, itemAt(session.item_index + index)),
+        publicItemForInstance(db, instance, itemAt(indexes[index] ?? session.item_index)),
       ),
     });
   } catch (error) {

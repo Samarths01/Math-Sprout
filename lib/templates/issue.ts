@@ -3,6 +3,7 @@ import type Database from "better-sqlite3";
 import type { PublicItem } from "@/lib/attempt-contract";
 import { DomainError } from "@/lib/domain";
 import { ITEM_CATALOG, itemAt } from "@/lib/item-catalog";
+import { skillIndexForPosition } from "@/lib/session-plan";
 import { answersMatch, canonicalValueKey, type RequireForm } from "@/lib/templates/rational";
 import { eligibleDraws, seeded, type Rng } from "@/lib/templates/engine";
 import {
@@ -304,15 +305,25 @@ export function presentIssuedItem(
   db: Database.Database,
   childId: string,
   sessionId: string,
-  itemIndex: number,
+  slotSeq: number,
   now?: string,
 ): PublicItem {
-  const catalog = itemAt(itemIndex);
+  const plan = db
+    .prepare(
+      `SELECT lane_start AS laneStart, overflow_offset AS overflowOffset
+       FROM practice_sessions WHERE id = ?`,
+    )
+    .get(sessionId) as { laneStart: number; overflowOffset: number } | undefined;
+  const catalog = itemAt(
+    plan
+      ? skillIndexForPosition(plan.laneStart, plan.overflowOffset, slotSeq - plan.laneStart)
+      : slotSeq,
+  );
   const instance = issueForProgression(db, {
     childId,
     sessionId,
     skillId: catalog.skill,
-    idempotencyKey: sessionSlotKey(sessionId, itemIndex),
+    idempotencyKey: sessionSlotKey(sessionId, slotSeq),
     now,
   });
   return publicItemForInstance(db, instance, catalog);
@@ -842,6 +853,8 @@ export function issueItemBatch(
     idempotencyKey: string;
     count: number;
     itemIndex: number;
+    /** Catalog indexes for each batch slot. Omit to walk forward from `itemIndex`. */
+    indexes?: number[];
     now?: string;
   },
 ): ItemInstance[] {
@@ -854,7 +867,7 @@ export function issueItemBatch(
   const toIssue = Math.min(input.count, Math.max(0, room));
   const issued: ItemInstance[] = [];
   for (let slot = 0; slot < toIssue; slot += 1) {
-    const catalog = itemAt(input.itemIndex + slot);
+    const catalog = itemAt(input.indexes?.[slot] ?? input.itemIndex + slot);
     issued.push(
       issueForProgression(db, {
         childId: input.childId,

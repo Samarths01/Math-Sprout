@@ -8,7 +8,7 @@ import Database from "better-sqlite3";
 import type { AttemptResult } from "@/lib/attempt-contract";
 import { currentAppBuildSha } from "@/lib/app-build";
 import { parseAnswer, rationalsEqual } from "@/lib/answer-parser";
-import { parseSubmitAttempt, startPracticeSession, submitAnswer, submitAttempt } from "@/lib/attempts";
+import { advancePracticeSlot, parseSubmitAttempt, startPracticeSession, submitAnswer, submitAttempt } from "@/lib/attempts";
 import { AnswerBlank } from "@/components/answer-blank";
 import { PracticeProblem } from "@/components/practice-problem";
 import { PracticeFeedback } from "@/components/practice-feedback";
@@ -68,6 +68,14 @@ import {
   skillStepPools,
 } from "@/lib/templates/pools";
 import { ITEM_CATALOG, itemAt } from "@/lib/item-catalog";
+import {
+  assertOverflowCoprime,
+  catalogSkillCount,
+  OVERFLOW_OFFSET_SQL,
+  overflowSlotCount,
+  PRACTICE_SESSION_LENGTH,
+  skillIndexForPosition,
+} from "@/lib/session-plan";
 import { answersMatch } from "@/lib/templates/rational";
 import { ISSUANCE_TEMPLATE_COLUMNS, issuanceTemplateSelect, migrateItemTemplates, seedTemplateVersions } from "@/lib/templates/store";
 import type { TemplateVersion } from "@/lib/templates/types";
@@ -260,8 +268,8 @@ function openRotationSession(
 /**
  * One catalog rotation. Each practice is its own 15-item session.
  * Omit `startIndex` to carry the slot across sessions (the older continuous
- * model). Pass `startIndex` to restart every session there, which is what
- * `startIndexForLane` does in production.
+ * model). Pass `startIndex` to restart every session there. Production cohorts
+ * do not use this helper. They create rows with `startPracticeSession`.
  */
 function issueRotationWeek(
   db: Database.Database,
@@ -364,6 +372,7 @@ type LaneCohortReport = {
   exactRepeats: number;
   exhaustedRepeats: number;
   minDistinctTemplates: number;
+  backToBackShared: number;
   skills: Array<{
     skill: string;
     overall: number;
@@ -373,6 +382,8 @@ type LaneCohortReport = {
     worst: number;
     worstChild: string;
     worstChildren: number;
+    worstRequests: number;
+    poolSize: number;
     minDistinct: number;
   }>;
 };
@@ -435,10 +446,99 @@ function exactRepeatCount(db: Database.Database, childId: string): number {
   return keys.length - new Set(keys).size;
 }
 
+function stepOnePoolSize(skill: string): number {
+  return skillStepPools().find((pool) => pool.skill === skill && pool.step === 1)?.size ?? 0;
+}
+
+function closePracticeSession(db: Database.Database, sessionId: string): void {
+  db.prepare(`UPDATE practice_sessions SET phase = 'closed' WHERE id = ?`).run(sessionId);
+}
+
+function readSessionPlan(db: Database.Database, sessionId: string): {
+  laneStart: number;
+  overflowOffset: number;
+  slotSeq: number;
+  itemIndex: number;
+} {
+  const row = db
+    .prepare(
+      `SELECT lane_start AS laneStart, overflow_offset AS overflowOffset,
+              slot_seq AS slotSeq, item_index AS itemIndex
+       FROM practice_sessions WHERE id = ?`,
+    )
+    .get(sessionId) as
+    | { laneStart: number; overflowOffset: number; slotSeq: number; itemIndex: number }
+    | undefined;
+  if (!row) throw new Error(`missing practice session ${sessionId}`);
+  return row;
+}
+
+function recordIssuedSkill(
+  db: Database.Database,
+  itemInstanceId: string,
+  plannedSkill: string,
+  switches: string[],
+): void {
+  const instance = readItemInstance(db, itemInstanceId);
+  if (!instance) throw new Error("missing issued item");
+  expect(instance.requestedSkillId).toBe(plannedSkill);
+  expect(instance.issueReason).not.toBe("exhausted_repeat");
+  expect(instance.repeatForced).toBe(false);
+  expect(instance.difficultyStep).toBe(1);
+  const issuedSkill = skillOfIssued(db, instance.templateId, instance.templateVersion);
+  const switched =
+    instance.issueReason === "template_switch" || instance.issueReason === "exhausted_switch";
+  if (issuedSkill !== plannedSkill || switched) {
+    expect(switched, `${plannedSkill} -> ${issuedSkill} (${instance.issueReason})`).toBe(true);
+    expect(issuedSkill).not.toBe(plannedSkill);
+    switches.push(`${plannedSkill} -> ${issuedSkill} (${instance.issueReason})`);
+  }
+}
+
 /**
- * Twenty fresh child ids, no pinned prefixes. Each session restarts at the
- * production start index. Switch rates are recorded. A rate above 10% is not
- * a failure: rotation is unchanged.
+ * Items come from the row `startPracticeSession` just inserted. The slot
+ * advances with `advancePracticeSlot`, the same write a scored attempt uses.
+ */
+function issueStoredOffsetSession(
+  db: Database.Database,
+  guardianId: string,
+  childId: string,
+  items: number,
+): { switches: string[]; doubled: string[]; laneStart: number; overflowOffset: number } {
+  const started = startPracticeSession(db, guardianId, childId);
+  const opened = readSessionPlan(db, started.sessionId);
+  const switches: string[] = [];
+  const doubled: string[] = [];
+  const skillCount = catalogSkillCount();
+  const overflow = overflowSlotCount();
+  for (let position = 0; position < items; position += 1) {
+    const current = readSessionPlan(db, started.sessionId);
+    const plannedSkill = itemAt(
+      skillIndexForPosition(current.laneStart, current.overflowOffset, position),
+    ).skill;
+    const item =
+      position === 0
+        ? started.item
+        : presentIssuedItem(db, childId, started.sessionId, current.slotSeq);
+    if (!item.itemInstanceId) throw new Error("slot was not issued");
+    recordIssuedSkill(db, item.itemInstanceId, plannedSkill, switches);
+    if (overflow > 0 && position >= skillCount && position < skillCount + overflow) {
+      doubled.push(plannedSkill);
+    }
+    if (position + 1 < items) advancePracticeSlot(db, started.sessionId, current.slotSeq);
+  }
+  closePracticeSession(db, started.sessionId);
+  return {
+    switches,
+    doubled,
+    laneStart: opened.laneStart,
+    overflowOffset: opened.overflowOffset,
+  };
+}
+
+/**
+ * Twenty fresh child ids, no pinned prefixes. Each session is created by
+ * `startPracticeSession`, so the overflow offset is the one stored on the row.
  */
 function measureProductionCohort(
   db: Database.Database,
@@ -455,6 +555,7 @@ function measureProductionCohort(
   const distinctByChild: Array<Array<{ skill: string; templates: number }>> = [];
   let maxSessionSwitches = 0;
   let exactRepeats = 0;
+  let backToBackShared = 0;
   let startIndex = -1;
   for (let index = 0; index < childCount; index += 1) {
     const child = createChild(db, guardian.id, { displayName: "Ava" });
@@ -464,17 +565,21 @@ function measureProductionCohort(
     const childStart = productionStartIndex(db, child.id, input.kind);
     if (index === 0) startIndex = childStart;
     expect(childStart).toBe(startIndex);
-    const rotation = issueRotationWeek(db, child.id, Date.parse(WHEN), {
-      sessionsPerDay: input.sessionsPerDay,
-      itemsPerSession: 15,
-      days: 7,
-      keyPrefix: child.id,
-      startIndex: childStart,
-    });
-    maxSessionSwitches = Math.max(
-      maxSessionSwitches,
-      rotation.sessions.reduce((max, session) => Math.max(max, session.switches.length), 0),
-    );
+    let previousDoubled: string[] | null = null;
+    for (let day = 0; day < 7; day += 1) {
+      for (let practice = 0; practice < input.sessionsPerDay; practice += 1) {
+        const played = issueStoredOffsetSession(
+          db,
+          guardian.id,
+          child.id,
+          PRACTICE_SESSION_LENGTH,
+        );
+        expect(played.laneStart, `${input.label} day ${day + 1}`).toBe(childStart);
+        if (previousDoubled?.some((skill) => played.doubled.includes(skill))) backToBackShared += 1;
+        previousDoubled = played.doubled;
+        maxSessionSwitches = Math.max(maxSessionSwitches, played.switches.length);
+      }
+    }
     exactRepeats += exactRepeatCount(db, child.id);
     distinctByChild.push(distinctTemplatesBySkill(db, child.id));
     perChild.push(catalogSkillRates(db, child.id));
@@ -483,9 +588,10 @@ function measureProductionCohort(
     let issued = 0;
     let templateSwitch = 0;
     let exhaustedSwitch = 0;
-    let worstRate = 0;
+    let worstRate = -1;
     let worstChild = "";
     let worstChildren = 0;
+    let worstRequests = 0;
     for (let index = 0; index < perChild.length; index += 1) {
       const row = perChild[index]?.find((itemRate) => itemRate.skill === item.skill);
       if (!row) continue;
@@ -496,7 +602,8 @@ function measureProductionCohort(
         worstRate = row.rate;
         worstChild = `child ${String(index).padStart(2, "0")}`;
         worstChildren = 1;
-      } else if (row.issued > 0 && row.rate === worstRate) {
+        worstRequests = row.issued;
+      } else if (row.rate === worstRate) {
         worstChildren += 1;
       }
     }
@@ -510,9 +617,11 @@ function measureProductionCohort(
       overallText: `${switches}/${issued}`,
       templateSwitch,
       exhaustedSwitch,
-      worst: worstRate,
+      worst: worstRate < 0 ? 0 : worstRate,
       worstChild,
       worstChildren,
+      worstRequests,
+      poolSize: stepOnePoolSize(item.skill),
       minDistinct: Math.min(...counts),
     };
   });
@@ -530,19 +639,27 @@ function measureProductionCohort(
     exactRepeats,
     exhaustedRepeats,
     minDistinctTemplates: Math.min(...skills.map((row) => row.minDistinct)),
+    backToBackShared,
     skills,
   };
 }
 
 function formatLaneCohort(report: LaneCohortReport): string {
+  const equiv = report.skills.find((row) => row.skill === SKILLS.equiv);
   const lines = [
     `${report.label}: start index ${report.startIndex} (${report.startSkill}), ${report.sessionsPerDay} session(s)/day, ${report.childCount} children`,
     `max switches in one session ${report.maxSessionSwitches}; exact repeats ${report.exactRepeats}; exhausted_repeat ${report.exhaustedRepeats}; min distinct templates ${report.minDistinctTemplates}`,
+    `back-to-back doubled skills shared: ${report.backToBackShared}`,
     ...report.skills.map(
       (row) =>
-        `${row.skill}: ${(row.overall * 100).toFixed(1)}% (${row.overallText}; template ${row.templateSwitch}, exhausted ${row.exhaustedSwitch}); worst child-week ${(row.worst * 100).toFixed(1)}% (${row.worst === 0 ? "none" : row.worstChildren === report.childCount ? "every child" : `${row.worstChildren} children, first ${row.worstChild}`}); min distinct ${row.minDistinct}`,
+        `${row.skill}: ${(row.overall * 100).toFixed(1)}% (${row.overallText}; template ${row.templateSwitch}, exhausted ${row.exhaustedSwitch}); worst child-week ${(row.worst * 100).toFixed(1)}% (${row.worst === 0 ? "none" : row.worstChildren === report.childCount ? "every child" : `${row.worstChildren} children, first ${row.worstChild}`}); worst child requests ${row.worstRequests}/${row.poolSize}; min distinct ${row.minDistinct}`,
     ),
   ];
+  if (equiv) {
+    lines.push(
+      `equivalent fractions: ${(equiv.overall * 100).toFixed(1)}% (${equiv.overallText}; template ${equiv.templateSwitch}, exhausted ${equiv.exhaustedSwitch}); worst child-week ${(equiv.worst * 100).toFixed(1)}%; worst child requests ${equiv.worstRequests}/${equiv.poolSize}`,
+    );
+  }
   return lines.join("\n");
 }
 
@@ -4573,6 +4690,141 @@ describe("item templates and issuance", () => {
     expect(repeatPoolReport(db, child.id)).toEqual([]);
   }, 30_000);
 
+  it("rejects an overflow that is not coprime with the catalog", () => {
+    expect(overflowSlotCount()).toBe(PRACTICE_SESSION_LENGTH - catalogSkillCount());
+    expect(() => assertOverflowCoprime(overflowSlotCount(), catalogSkillCount())).not.toThrow();
+    expect(() => assertOverflowCoprime(0, catalogSkillCount())).not.toThrow();
+    expect(() => assertOverflowCoprime(-3, catalogSkillCount())).not.toThrow();
+    expect(() => assertOverflowCoprime(4, 6)).toThrow(/must be coprime/);
+    expect(skillIndexForPosition(4, 9, 12, 11, 0)).toBe((4 + 12) % 11);
+  });
+
+  it("keeps the overflow offset when the same session starts again", () => {
+    const db = tempDb();
+    const { guardian, child, session } = granted(db, "offset-retry@example.com");
+    const first = readSessionPlan(db, session.sessionId);
+    const again = startPracticeSession(db, guardian.id, child.id);
+    expect(again.sessionId).toBe(session.sessionId);
+    const second = readSessionPlan(db, again.sessionId);
+    expect(second.overflowOffset).toBe(first.overflowOffset);
+    expect(second.laneStart).toBe(first.laneStart);
+    const count = db.prepare(`SELECT COUNT(*) AS count FROM practice_sessions WHERE child_id = ?`).get(child.id) as {
+      count: number;
+    };
+    expect(count.count).toBe(1);
+  });
+
+  it("lets two sessions created together share an offset without double-counting", () => {
+    const db = tempDb();
+    const guardian = createGuardian(db, {
+      email: "offset-share@example.com",
+      password: "correct-horse",
+      timezone: "America/Los_Angeles",
+    });
+    const child = createChild(db, guardian.id, { displayName: "Ava" });
+    setConsent(db, guardian.id, child.id, "grant");
+    const overflow = overflowSlotCount();
+    const skills = catalogSkillCount();
+    db.prepare(
+      `INSERT INTO practice_sessions (
+         id, child_id, status, item_index, slot_seq, started_at, practice_lane, phase,
+         policy_version, lane_start, overflow_offset
+       )
+       SELECT 'same-a', ?, 'active', 4, 4, ?, 'challenge', 'closed', ?, 4, ${OVERFLOW_OFFSET_SQL}
+       UNION ALL
+       SELECT 'same-b', ?, 'active', 4, 4, ?, 'challenge', 'closed', ?, 4, ${OVERFLOW_OFFSET_SQL}`,
+    ).run(
+      child.id,
+      WHEN,
+      POLICY_VERSION,
+      overflow,
+      overflow,
+      child.id,
+      skills,
+      child.id,
+      WHEN,
+      POLICY_VERSION,
+      overflow,
+      overflow,
+      child.id,
+      skills,
+    );
+    const stored = db
+      .prepare(
+        `SELECT id, overflow_offset AS overflowOffset FROM practice_sessions
+         WHERE child_id = ? ORDER BY id`,
+      )
+      .all(child.id) as Array<{ id: string; overflowOffset: number }>;
+    expect(stored).toEqual([
+      { id: "same-a", overflowOffset: 0 },
+      { id: "same-b", overflowOffset: 0 },
+    ]);
+    productionStartIndex(db, child.id, "challenge");
+    const session = startPracticeSession(db, guardian.id, child.id);
+    const third = readSessionPlan(db, session.sessionId);
+    expect(session.sessionId).not.toBe("same-a");
+    expect(third.overflowOffset).toBe((overflow * 2) % skills);
+    expect(third.laneStart).toBe(4);
+  });
+
+  it("rotates doubled skills across consecutive challenge sessions", () => {
+    const db = tempDb();
+    const guardian = createGuardian(db, {
+      email: "offset-rotate@example.com",
+      password: "correct-horse",
+      timezone: "America/Los_Angeles",
+    });
+    const child = createChild(db, guardian.id, { displayName: "Ava" });
+    setConsent(db, guardian.id, child.id, "grant");
+    const start = productionStartIndex(db, child.id, "challenge");
+    expect(start).toBe(4);
+    const sets: string[][] = [];
+    for (let session = 0; session < 3; session += 1) {
+      const played = issueStoredOffsetSession(db, guardian.id, child.id, PRACTICE_SESSION_LENGTH);
+      expect(played.laneStart).toBe(start);
+      expect(played.doubled).toHaveLength(overflowSlotCount());
+      expect(played.overflowOffset).toBe((overflowSlotCount() * session) % catalogSkillCount());
+      if (sets.length > 0) {
+        const previous = sets[sets.length - 1] ?? [];
+        expect(played.doubled.filter((skill) => previous.includes(skill))).toEqual([]);
+      }
+      sets.push(played.doubled);
+    }
+    expect(new Set(sets.map((skills) => skills.join("|"))).size).toBe(3);
+  });
+
+  it("doubles every skill overflowSlots times across one catalog of sessions", () => {
+    const db = tempDb();
+    const guardian = createGuardian(db, {
+      email: "offset-cycle@example.com",
+      password: "correct-horse",
+      timezone: "America/Los_Angeles",
+    });
+    const child = createChild(db, guardian.id, { displayName: "Ava" });
+    setConsent(db, guardian.id, child.id, "grant");
+    const start = productionStartIndex(db, child.id, "challenge");
+    const overflow = overflowSlotCount();
+    const skillCount = catalogSkillCount();
+    expect(start).toBe(4);
+    expect(skillCount).toBe(11);
+    const counts = new Map(ITEM_CATALOG.map((item) => [item.skill, 0]));
+    let previous: string[] | null = null;
+    for (let session = 0; session < skillCount; session += 1) {
+      const played = issueStoredOffsetSession(db, guardian.id, child.id, PRACTICE_SESSION_LENGTH);
+      expect(played.laneStart, `session ${session}`).toBe(start);
+      expect(played.overflowOffset).toBe((overflow * session) % skillCount);
+      expect(played.doubled).toHaveLength(overflow);
+      if (previous) {
+        expect(played.doubled.filter((skill) => previous?.includes(skill))).toEqual([]);
+      }
+      previous = played.doubled;
+      for (const skill of played.doubled) counts.set(skill, (counts.get(skill) ?? 0) + 1);
+    }
+    for (const item of ITEM_CATALOG) {
+      expect(counts.get(item.skill), item.skill).toBe(overflow);
+    }
+  }, 60_000);
+
   const productionCohorts: Array<{ kind: LaneKind; label: string; index: number }> = [
     { kind: "recommended", label: "recommended start", index: 2 },
     { kind: "challenge", label: "challenge start", index: 4 },
@@ -4595,6 +4847,12 @@ describe("item templates and issuance", () => {
         const text = formatLaneCohort(report);
         console.log(text);
         appendFileSync("/tmp/rotation-lane-cohorts.txt", `${text}\n\n`);
+        expect(report.maxSessionSwitches, text).toBeLessThanOrEqual(1);
+        const over = report.skills.filter((row) => row.worst > MAX_SKILL_SWITCH_RATE);
+        expect(
+          over.map((row) => `${row.skill}: worst ${(row.worst * 100).toFixed(1)}%`),
+          text,
+        ).toEqual([]);
       }, sessionsPerDay === 2 ? 180_000 : 120_000);
     }
   }
