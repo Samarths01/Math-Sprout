@@ -58,9 +58,8 @@ import {
 } from "@/lib/unparseable";
 import {
   normalizedTypedAnswer,
-  readWrongFormReason,
   wrongFormCopy,
-  type WrongFormReason,
+  wrongFormReasonFor,
 } from "@/lib/wrong-form-copy";
 
 const KEY_PATTERN = /^[A-Za-z0-9_-]{8,80}$/;
@@ -97,6 +96,7 @@ type AttemptRow = {
   beats_json: string;
   client_view_json: string;
   resume_presentation: "live" | "quiet";
+  item_instance_id: string | null;
 };
 
 assertBankMatchesCatalog();
@@ -215,7 +215,7 @@ function findAttempt(
     .prepare(
       `SELECT id, child_id, session_id, idempotency_key, item_id, answer, correct,
               lane, celebration_tier, flags_json, beats_json, client_view_json,
-              resume_presentation
+              resume_presentation, item_instance_id
        FROM attempts
        WHERE child_id = ? AND idempotency_key = ?`,
     )
@@ -253,6 +253,21 @@ function readClientView(
   return { bandLabel, showConceptChip, celebrationTier };
 }
 
+function wrongFormReasonFromAttempt(
+  db: Database.Database,
+  row: AttemptRow,
+  flags: readonly IntegrityFlag[],
+) {
+  if (!row.item_instance_id) return undefined;
+  const instance = readItemInstance(db, row.item_instance_id);
+  if (!instance) return undefined;
+  return wrongFormReasonFor({
+    flags,
+    formMismatch: gradeStoredAnswer(instance, row.answer) === "form_mismatch",
+    required: instance.requireForm,
+  });
+}
+
 function resultFromRow(
   db: Database.Database,
   row: AttemptRow,
@@ -274,7 +289,8 @@ function resultFromRow(
     .get(row.session_id) as { slot_seq: number } | undefined;
   if (!session) throw new DomainError("Practice session not found.", 404);
   const beats = readBeats(row.beats_json);
-  const reason = readWrongFormReason(JSON.parse(row.beats_json) as unknown);
+  const flags = JSON.parse(row.flags_json) as IntegrityFlag[];
+  const reason = wrongFormReasonFromAttempt(db, row, flags);
   if (row.celebration_tier === "full" && credits.length === 0) {
     throw new DomainError("full celebration requires a mint.", 500);
   }
@@ -282,7 +298,6 @@ function resultFromRow(
     throw new DomainError("quietXp celebration requires a mint.", 500);
   }
   const clientView = readClientView(row.client_view_json, row.celebration_tier);
-  const flags = JSON.parse(row.flags_json) as IntegrityFlag[];
   return {
     attemptId: row.id,
     idempotencyKey: row.idempotency_key,
@@ -444,7 +459,6 @@ export function submitAnswer(
     let difficultyStep: number | null = null;
     let estimatorEvidence: number | null = null;
     let attemptOutcome: "correct" | "incorrect" | "form_mismatch" = "incorrect";
-    let childReason: WrongFormReason | undefined;
     let skipEconomy = false;
 
     const issuedOnSession = db
@@ -546,7 +560,6 @@ export function submitAnswer(
           tryNext: copy.tryNext,
           lockIn: copy.lockIn,
         };
-        childReason = copy.reason;
       } else {
         const focus = valueMiss ? focusForStoredAnswer(instance, input.answer) : null;
         beats = buildFourBeat({
@@ -574,14 +587,6 @@ export function submitAnswer(
         history: evidenceForSkill(db, childId, skillItem.skill),
         previousBand: readSkillClientView(db, childId, skillItem.skill)?.bandLabel ?? null,
       });
-      if (formMiss) {
-        economy = {
-          lane: economy.lane,
-          celebrationTier: "none",
-          mints: [],
-          clientView: { ...economy.clientView, celebrationTier: "none" },
-        };
-      }
       if (instance.evidenceEligible) {
         saveSkillState(db, childId, skillItem.skill, economy.clientView);
       }
@@ -638,7 +643,7 @@ export function submitAnswer(
       lane: economy.lane,
       celebration_tier: economy.celebrationTier,
       flags_json: JSON.stringify(flags),
-      beats_json: JSON.stringify(childReason ? { ...beats, reason: childReason } : beats),
+      beats_json: JSON.stringify(beats),
       client_view_json: JSON.stringify(economy.clientView),
       created_at: createdAt,
       policy_version: POLICY_VERSION,

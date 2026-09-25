@@ -1644,15 +1644,10 @@ describe("item templates and issuance", () => {
     expect(wrongValue.row).toEqual({ outcome: "incorrect", correct: 0, estimator_evidence: 1 });
     expect(formOnImproper.result.correct).toBe(false);
     expect(wrongValue.result.correct).toBe(false);
-    expect(formOnImproper.result.lane).toBe("celebrate");
     expect(formOnImproper.result.lane).toBe(wrongValue.result.lane);
-    expect(formOnImproper.result.xpAmount).toBe(0);
-    expect(formOnImproper.result.celebrationTier).toBe("none");
-    expect(wrongValue.result.xpAmount).toBeGreaterThan(0);
-    expect(formOnImproper.result.clientView.bandLabel).toBe(wrongValue.result.clientView.bandLabel);
-    expect(formOnImproper.result.clientView.showConceptChip).toBe(
-      wrongValue.result.clientView.showConceptChip,
-    );
+    expect(formOnImproper.result.xpAmount).toBe(wrongValue.result.xpAmount);
+    expect(formOnImproper.result.celebrationTier).toBe(wrongValue.result.celebrationTier);
+    expect(formOnImproper.result.clientView).toEqual(wrongValue.result.clientView);
     expect(JSON.stringify(formOnImproper.result)).not.toContain("form_mismatch");
     expect(JSON.stringify(formOnLowest.result)).not.toContain("form_mismatch");
     expect(JSON.stringify(wrongValue.result)).not.toContain("form_mismatch");
@@ -2314,6 +2309,15 @@ describe("item templates and issuance", () => {
         ),
       );
       expect(JSON.stringify(scored)).not.toContain("form_mismatch");
+      const stored = db
+        .prepare(`SELECT beats_json FROM attempts WHERE id = ?`)
+        .get(scored.attemptId) as { beats_json: string };
+      expect(Object.keys(JSON.parse(stored.beats_json) as object).sort()).toEqual([
+        "lockIn",
+        "oneFocus",
+        "tryNext",
+        "whatWentWell",
+      ]);
     }
   });
 
@@ -2424,75 +2428,80 @@ describe("item templates and issuance", () => {
       expect(html).toContain('data-beat-label="Lock in"');
       expect(html).not.toContain('data-beat-label="Try next"');
       expect(html).not.toContain("A sprout for that try.");
-      expect(html).not.toContain("A quiet sprout. This one stays small.");
+      expect(html).toContain("A quiet sprout. This one stays small.");
     }
   });
 
-  it("keeps the wrong-form verdict blue and mints nothing", () => {
+  it("keeps the wrong-form verdict blue and mints like a wrong-value miss", () => {
     const db = tempDb();
-    const { guardian, child, session } = granted(db, "no-mint@example.com");
-    const before = db
-      .prepare(`SELECT streak_state, last_qualifying_day FROM learner_progress WHERE child_id = ?`)
-      .get(child.id) as { streak_state: string | null; last_qualifying_day: string | null };
-    const issued = issueForProgression(db, {
-      childId: child.id,
-      sessionId: session.sessionId,
-      skillId: SKILLS.equiv,
-      idempotencyKey: "no-mint-issue",
-      now: WHEN,
-    });
-    db.prepare(
-      `UPDATE item_instances
-       SET canonical_answer = '1/2', answer_line = '1/2', require_form = 'lowest_terms', compare_mode = 'rational'
-       WHERE item_instance_id = ?`,
-    ).run(issued.itemInstanceId);
-    const scored = submitAnswer(
-      db,
-      guardian.id,
-      child.id,
-      {
-        idempotencyKey: "no-mint-score",
+    const scoreMiss = (email: string, answer: string, key: string) => {
+      const { guardian, child, session } = granted(db, email);
+      const before = db
+        .prepare(`SELECT streak_state, last_qualifying_day FROM learner_progress WHERE child_id = ?`)
+        .get(child.id) as { streak_state: string | null; last_qualifying_day: string | null };
+      const issued = issueForProgression(db, {
+        childId: child.id,
         sessionId: session.sessionId,
-        itemId: session.item.id,
-        itemInstanceId: issued.itemInstanceId,
-        answer: "2/4",
-        shownAt: shown(),
-        submittedAt: WHEN,
-      },
-      { now: WHEN },
-    );
-    if (isFormatRejected(scored)) throw new Error("a readable answer was rejected");
-    expect(scored.correct).toBe(false);
-    expect(scored.celebrationTier).toBe("none");
-    expect(scored.xpAmount).toBe(0);
-    expect(scored.eventIds).toEqual([]);
-    expect(scored.fuel).toEqual({ credit: 0, heatEventId: null, pieceEventIds: [] });
-    expect(xpCount(db, scored.attemptId)).toBe(0);
-    const qualifying = db
-      .prepare(`SELECT COUNT(*) AS count FROM qualifying_events WHERE attempt_id = ?`)
-      .get(scored.attemptId) as { count: number };
-    expect(qualifying.count).toBe(0);
-    const streak = db
-      .prepare(`SELECT streak_state, last_qualifying_day FROM learner_progress WHERE child_id = ?`)
-      .get(child.id) as { streak_state: string | null; last_qualifying_day: string | null };
-    expect(streak.last_qualifying_day).toBe(before.last_qualifying_day);
-    expect(streak.streak_state).toBe(before.streak_state);
-    const consumed = db
-      .prepare(`SELECT consumed_at FROM item_instances WHERE item_instance_id = ?`)
-      .get(issued.itemInstanceId) as { consumed_at: string | null };
-    expect(consumed.consumed_at).not.toBeNull();
-    const evidence = evidenceForSkill(db, child.id, SKILLS.equiv);
-    expect(evidence).toEqual([{ correct: false, lane: "celebrate", practiceLane: "recommended" }]);
-    expect(() =>
-      submitAnswer(
+        skillId: SKILLS.equiv,
+        idempotencyKey: `${key}-issue`,
+        now: WHEN,
+      });
+      db.prepare(
+        `UPDATE item_instances
+         SET canonical_answer = '1/2', answer_line = '1/2', require_form = 'lowest_terms', compare_mode = 'rational'
+         WHERE item_instance_id = ?`,
+      ).run(issued.itemInstanceId);
+      const scored = submitAnswer(
         db,
         guardian.id,
         child.id,
         {
-          idempotencyKey: "no-mint-retry",
+          idempotencyKey: `${key}-score`,
           sessionId: session.sessionId,
           itemId: session.item.id,
           itemInstanceId: issued.itemInstanceId,
+          answer,
+          shownAt: shown(),
+          submittedAt: WHEN,
+        },
+        { now: WHEN },
+      );
+      if (isFormatRejected(scored)) throw new Error("a readable answer was rejected");
+      const streak = db
+        .prepare(`SELECT streak_state, last_qualifying_day FROM learner_progress WHERE child_id = ?`)
+        .get(child.id) as { streak_state: string | null; last_qualifying_day: string | null };
+      return { guardian, child, session, issued, scored, before, streak };
+    };
+    const formMiss = scoreMiss("form-mint@example.com", "2/4", "form-mint");
+    const valueMiss = scoreMiss("value-mint@example.com", "3/4", "value-mint");
+    const scored = formMiss.scored;
+    expect(scored.correct).toBe(false);
+    expect(scored.celebrationTier).toBe(valueMiss.scored.celebrationTier);
+    expect(scored.xpAmount).toBe(valueMiss.scored.xpAmount);
+    expect(scored.xpAmount).toBeGreaterThan(0);
+    expect(scored.eventIds).toHaveLength(valueMiss.scored.eventIds.length);
+    expect(scored.fuel.credit).toBe(valueMiss.scored.fuel.credit);
+    expect(Boolean(scored.fuel.heatEventId)).toBe(Boolean(valueMiss.scored.fuel.heatEventId));
+    expect(scored.fuel.pieceEventIds).toHaveLength(valueMiss.scored.fuel.pieceEventIds.length);
+    expect(xpCount(db, scored.attemptId)).toBe(xpCount(db, valueMiss.scored.attemptId));
+    expect(formMiss.streak).toEqual(valueMiss.streak);
+    expect(formMiss.streak.last_qualifying_day).not.toBe(formMiss.before.last_qualifying_day);
+    const consumed = db
+      .prepare(`SELECT consumed_at FROM item_instances WHERE item_instance_id = ?`)
+      .get(formMiss.issued.itemInstanceId) as { consumed_at: string | null };
+    expect(consumed.consumed_at).not.toBeNull();
+    const evidence = evidenceForSkill(db, formMiss.child.id, SKILLS.equiv);
+    expect(evidence).toEqual([{ correct: false, lane: "celebrate", practiceLane: "recommended" }]);
+    expect(() =>
+      submitAnswer(
+        db,
+        formMiss.guardian.id,
+        formMiss.child.id,
+        {
+          idempotencyKey: "no-mint-retry",
+          sessionId: formMiss.session.sessionId,
+          itemId: formMiss.session.item.id,
+          itemInstanceId: formMiss.issued.itemInstanceId,
           answer: "1/2",
           shownAt: shown(),
           submittedAt: WHEN,
@@ -2594,7 +2603,159 @@ describe("item templates and issuance", () => {
       count: number;
     };
     expect(attempts.count).toBe(1);
-    expect(xpCount(db, first.attemptId)).toBe(0);
+    expect(xpCount(db, first.attemptId)).toBe(xpCount(db, replay.attemptId));
+    expect(replay.xpAmount).toBe(first.xpAmount);
+    expect(replay.xpAmount).toBeGreaterThan(0);
+  });
+
+  it("gives blank, unreadable, and too-fast answers no wrong_form reason", () => {
+    const db = tempDb();
+    const { guardian, child, session } = granted(db, "no-reason@example.com");
+    const issue = (key: string) => {
+      const issued = issueForProgression(db, {
+        childId: child.id,
+        sessionId: session.sessionId,
+        skillId: SKILLS.equiv,
+        idempotencyKey: key,
+        now: WHEN,
+      });
+      db.prepare(
+        `UPDATE item_instances
+         SET canonical_answer = '1/2', answer_line = '1/2', require_form = 'lowest_terms', compare_mode = 'rational'
+         WHERE item_instance_id = ?`,
+      ).run(issued.itemInstanceId);
+      return issued;
+    };
+    const blankItem = issue("no-reason-blank-issue");
+    const blank = submitAnswer(
+      db,
+      guardian.id,
+      child.id,
+      {
+        idempotencyKey: "no-reason-blank-score",
+        sessionId: session.sessionId,
+        itemId: session.item.id,
+        itemInstanceId: blankItem.itemInstanceId,
+        answer: "   ",
+        shownAt: shown(),
+        submittedAt: WHEN,
+      },
+      { now: WHEN },
+    );
+    if (isFormatRejected(blank)) throw new Error("a blank answer was rejected as unreadable");
+    expect(blank.flags).toContain("empty_answer");
+    expect(blank.reason).toBeUndefined();
+
+    const unreadableItem = issue("no-reason-unreadable-issue");
+    const rejected = submitAnswer(
+      db,
+      guardian.id,
+      child.id,
+      {
+        idempotencyKey: "no-reason-unreadable-score",
+        sessionId: session.sessionId,
+        itemId: session.item.id,
+        itemInstanceId: unreadableItem.itemInstanceId,
+        answer: "nope",
+        shownAt: shown(),
+        submittedAt: WHEN,
+      },
+      { now: WHEN },
+    );
+    if (!isFormatRejected(rejected)) throw new Error("expected format_rejected");
+    expect(rejected).not.toHaveProperty("reason");
+    const rejects = db
+      .prepare(`SELECT COUNT(*) AS count FROM answer_format_rejects WHERE item_instance_id = ?`)
+      .get(unreadableItem.itemInstanceId) as { count: number };
+    expect(rejects.count).toBe(1);
+    const attemptsForReject = db
+      .prepare(`SELECT COUNT(*) AS count FROM attempts WHERE item_instance_id = ?`)
+      .get(unreadableItem.itemInstanceId) as { count: number };
+    expect(attemptsForReject.count).toBe(0);
+
+    const fastItem = issue("no-reason-fast-issue");
+    const tooFast = submitAnswer(
+      db,
+      guardian.id,
+      child.id,
+      {
+        idempotencyKey: "no-reason-fast-score",
+        sessionId: session.sessionId,
+        itemId: session.item.id,
+        itemInstanceId: fastItem.itemInstanceId,
+        answer: "2/4",
+        shownAt: WHEN,
+        submittedAt: WHEN,
+      },
+      { now: WHEN },
+    );
+    if (isFormatRejected(tooFast)) throw new Error("a readable answer was rejected");
+    expect(tooFast.flags).toContain("too_fast");
+    expect(tooFast.reason).toBeUndefined();
+    const stored = db
+      .prepare(`SELECT outcome, beats_json FROM attempts WHERE id = ?`)
+      .get(tooFast.attemptId) as { outcome: string; beats_json: string };
+    expect(stored.outcome).toBe("form_mismatch");
+    expect(stored.beats_json).not.toContain("wrong_form");
+  });
+
+  it("keeps the wrong_form reason when an offline try syncs and replays", async () => {
+    const db = tempDb();
+    const { guardian, child, session } = granted(db, "offline-form@example.com");
+    const issued = issueForProgression(db, {
+      childId: child.id,
+      sessionId: session.sessionId,
+      skillId: SKILLS.equiv,
+      idempotencyKey: "offline-form-issue",
+      now: WHEN,
+    });
+    db.prepare(
+      `UPDATE item_instances
+       SET canonical_answer = '1/2', answer_line = '1/2', require_form = 'lowest_terms', compare_mode = 'rational'
+       WHERE item_instance_id = ?`,
+    ).run(issued.itemInstanceId);
+    const queued = {
+      idempotencyKey: "offline-form-score",
+      childId: child.id,
+      sessionId: session.sessionId,
+      itemId: session.item.id,
+      itemInstanceId: issued.itemInstanceId,
+      answer: "2/4",
+      shownAt: shown(),
+      submittedAt: WHEN,
+    };
+    const queue = createAttemptQueue(memoryQueueStore());
+    expect(queue.enqueue(queued).pending).toHaveLength(1);
+    const synced = await queue.reconcile(async (attempt) => {
+      const result = submitAnswer(
+        db,
+        guardian.id,
+        child.id,
+        {
+          idempotencyKey: attempt.idempotencyKey,
+          sessionId: attempt.sessionId,
+          itemId: attempt.itemId,
+          itemInstanceId: attempt.itemInstanceId,
+          answer: attempt.answer,
+          shownAt: attempt.shownAt,
+          submittedAt: attempt.submittedAt,
+        },
+        { now: WHEN },
+      );
+      if (isFormatRejected(result)) return { ok: false as const, reason: "format_rejected" as const, rejected: result };
+      return { ok: true as const, result };
+    });
+    expect(synced.pending).toEqual([]);
+    expect(synced.synced).toHaveLength(1);
+    expect(synced.synced[0]?.reason).toEqual({ kind: "wrong_form", required: "lowest_terms" });
+    const replay = submitAnswer(db, guardian.id, child.id, queued, { now: WHEN });
+    if (isFormatRejected(replay)) throw new Error("a readable answer was rejected");
+    expect(replay.replayed).toBe(true);
+    expect(replay.reason).toEqual({ kind: "wrong_form", required: "lowest_terms" });
+    const stored = db
+      .prepare(`SELECT beats_json FROM attempts WHERE child_id = ?`)
+      .get(child.id) as { beats_json: string };
+    expect(JSON.parse(stored.beats_json)).not.toHaveProperty("reason");
   });
 });
 

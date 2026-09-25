@@ -57,14 +57,21 @@ export function wrongFormCopy(input: {
   };
 }
 
-export function readWrongFormReason(value: unknown): WrongFormReason | undefined {
-  if (!value || typeof value !== "object") return undefined;
-  const reason = (value as { reason?: unknown }).reason;
-  if (!reason || typeof reason !== "object") return undefined;
-  const row = reason as { kind?: unknown; required?: unknown };
-  if (row.kind !== WRONG_FORM_KIND) return undefined;
-  if (row.required !== "lowest_terms" && row.required !== "improper" && row.required !== "mixed") {
+function isWrongFormRequired(value: string | null): value is WrongFormRequired {
+  return value === "lowest_terms" || value === "improper" || value === "mixed";
+}
+
+/**
+ * Built when a stored answer is read back. `beats_json` keeps the four beat
+ * strings only. A blank, unreadable, or flagged try has no reason.
+ */
+export function wrongFormReasonFor(input: {
+  flags: readonly string[];
+  formMismatch: boolean;
+  required: string | null;
+}): WrongFormReason | undefined {
+  if (input.flags.length > 0 || !input.formMismatch || !isWrongFormRequired(input.required)) {
     return undefined;
   }
-  return { kind: WRONG_FORM_KIND, required: row.required };
+  return { kind: WRONG_FORM_KIND, required: input.required };
 }
