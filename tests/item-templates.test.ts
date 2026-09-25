@@ -122,24 +122,6 @@ function granted(db: Database.Database, email = "parent@example.com") {
   return { guardian, child, session };
 }
 
-/** Rotation seeds include the child id. A random id makes a short week miss the template floor. */
-function pinnedRotationChild(db: Database.Database, childId: string, email: string) {
-  const guardian = createGuardian(db, {
-    email,
-    password: "correct-horse",
-    timezone: "America/Los_Angeles",
-  });
-  db.prepare(
-    `INSERT INTO children (id, guardian_id, display_name, timezone, created_at)
-     VALUES (?, ?, 'Ava', 'America/Los_Angeles', ?)`,
-  ).run(childId, guardian.id, WHEN);
-  setConsent(db, guardian.id, childId, "grant");
-  const sessionId = `${childId}-opener`;
-  openRotationSession(db, childId, sessionId, WHEN);
-  presentIssuedItem(db, childId, sessionId, 0, WHEN);
-  return { guardian, childId };
-}
-
 function shown(): string {
   return new Date(Date.parse(WHEN) - 2_000).toISOString();
 }
@@ -291,6 +273,115 @@ function assertDistinctTemplates(db: Database.Database, childId: string): Array<
     "fewer than 3 distinct templates in the week",
   ).toEqual([]);
   return rows;
+}
+
+function medianNumber(values: number[]): number {
+  const sorted = values.slice().sort((left, right) => left - right);
+  const mid = Math.floor(sorted.length / 2);
+  if (sorted.length % 2 === 1) return sorted[mid] ?? 0;
+  return ((sorted[mid - 1] ?? 0) + (sorted[mid] ?? 0)) / 2;
+}
+
+type CohortResult = {
+  worstSessionSwitches: number;
+  summary: Array<{
+    skill: string;
+    overall: number;
+    overallText: string;
+    worst: number;
+    worstChild: string;
+  }>;
+  spread: Array<{ skill: string; min: number; median: number; max: number }>;
+  perChild: SkillSwitchRate[][];
+};
+
+function runChildCohort(
+  db: Database.Database,
+  email: string,
+  input: { childPrefix: string; sessionsPerDay: number },
+): CohortResult {
+  const childCount = 20;
+  const guardian = createGuardian(db, {
+    email,
+    password: "correct-horse",
+    timezone: "America/Los_Angeles",
+  });
+  const insertChild = db.prepare(
+    `INSERT INTO children (id, guardian_id, display_name, timezone, created_at)
+     VALUES (?, ?, ?, 'America/Los_Angeles', ?)`,
+  );
+  const perChild: SkillSwitchRate[][] = [];
+  const distinctByChild: Array<Array<{ skill: string; templates: number }>> = [];
+  let worstSessionSwitches = 0;
+  for (let index = 0; index < childCount; index += 1) {
+    const childId = `${input.childPrefix}-${String(index).padStart(2, "0")}`;
+    insertChild.run(childId, guardian.id, `Child ${index}`, WHEN);
+    const rotation = issueRotationWeek(db, childId, Date.parse(WHEN), {
+      sessionsPerDay: input.sessionsPerDay,
+      itemsPerSession: 15,
+      days: 7,
+      keyPrefix: childId,
+    });
+    worstSessionSwitches = Math.max(worstSessionSwitches, assertAtMostOneSwitch(rotation.sessions));
+    distinctByChild.push(assertDistinctTemplates(db, childId));
+    perChild.push(assertRotationLimits(db, childId));
+  }
+  const skills = perChild[0]?.map((row) => row.skill) ?? [];
+  const summary = skills.map((skill) => {
+    let issued = 0;
+    let exhaustedSwitch = 0;
+    let worstRate = 0;
+    let worstChild = "";
+    for (let index = 0; index < perChild.length; index += 1) {
+      const row = perChild[index]?.find((item) => item.skill === skill);
+      if (!row) continue;
+      issued += row.issued;
+      exhaustedSwitch += row.exhaustedSwitch;
+      if (row.rate > worstRate) {
+        worstRate = row.rate;
+        worstChild = `${input.childPrefix}-${String(index).padStart(2, "0")}`;
+      }
+    }
+    return {
+      skill,
+      overall: issued === 0 ? 0 : exhaustedSwitch / issued,
+      overallText: `${exhaustedSwitch}/${issued}`,
+      worst: worstRate,
+      worstChild,
+    };
+  });
+  const spread = skills.map((skill) => {
+    const counts = distinctByChild.map(
+      (rows) => rows.find((row) => row.skill === skill)?.templates ?? 0,
+    );
+    return {
+      skill,
+      min: Math.min(...counts),
+      median: medianNumber(counts),
+      max: Math.max(...counts),
+    };
+  });
+  return { worstSessionSwitches, summary, spread, perChild };
+}
+
+function assertCohortLimits(result: CohortResult): void {
+  expect(result.worstSessionSwitches).toBeLessThanOrEqual(1);
+  const over = result.summary.filter(
+    (row) => row.overall > MAX_SKILL_SWITCH_RATE || row.worst > MAX_SKILL_SWITCH_RATE,
+  );
+  expect(
+    over.map(
+      (row) =>
+        `${row.skill}: overall ${row.overallText}, worst ${(row.worst * 100).toFixed(1)}% (${row.worstChild})`,
+    ),
+    "cohort switch rate above 10%",
+  ).toEqual([]);
+  expect(result.summary).toHaveLength(ITEM_CATALOG.length);
+  const thin = result.spread.filter((row) => row.min < MIN_DISTINCT_TEMPLATES);
+  expect(
+    thin.map((row) => `${row.skill}: min ${row.min}`),
+    "fewer than 3 distinct templates in a child-week",
+  ).toEqual([]);
 }
 
 function assertAtMostOneSwitch(sessions: SessionSwitchLog[]): number {
@@ -3827,16 +3918,35 @@ describe("item templates and issuance", () => {
     expect(rates.find((row) => row.skill === SKILLS.addLike)?.exhaustedSwitch ?? 0).toBe(0);
   });
 
+  it("issues every fresh template before repeating one", () => {
+    const db = tempDb();
+    const { child, session } = granted(db, "round-robin@example.com");
+    const seen = new Set<string>();
+    for (let index = 0; index < 4; index += 1) {
+      const issued = issueForProgression(db, {
+        childId: child.id,
+        sessionId: session.sessionId,
+        skillId: SKILLS.sub,
+        idempotencyKey: `round-robin-sub-${index}`,
+        now: new Date(Date.parse(WHEN) + index * 1000).toISOString(),
+      });
+      expect(issued.issueReason, issued.templateId).toBe("normal");
+      expect(seen.has(issued.templateId), issued.templateId).toBe(false);
+      seen.add(issued.templateId);
+    }
+    expect(seen.size).toBe(4);
+  });
+
   it("gives a 7-day dogfood run zero exact repeats", () => {
     // Simulation (a): 15 items per session, one session a day, for 7 days.
     // Skills follow the current 11-slot catalog rotation.
-    // The child id is fixed because it is part of the draw seed.
     const itemsPerSession = 15;
     const days = 7;
     const db = tempDb();
-    const childId = "dogfood-00";
-    const { guardian } = pinnedRotationChild(db, childId, "parent@example.com");
-    const rotation = issueRotationWeek(db, childId, Date.parse(WHEN), {
+    const { guardian, child, session } = granted(db);
+    const opened = readItemInstance(db, session.item.itemInstanceId ?? "");
+    if (!opened) throw new Error("session did not issue");
+    const rotation = issueRotationWeek(db, child.id, Date.parse(opened.issuedAt), {
       sessionsPerDay: 1,
       itemsPerSession,
       days,
@@ -3845,7 +3955,7 @@ describe("item templates and issuance", () => {
     const stamp = rotation.stamp;
     const maxSwitches = assertAtMostOneSwitch(rotation.sessions);
     expect(maxSwitches).toBeLessThanOrEqual(1);
-    const distinct = assertDistinctTemplates(db, childId);
+    const distinct = assertDistinctTemplates(db, child.id);
     expect(distinct.every((row) => row.templates >= MIN_DISTINCT_TEMPLATES)).toBe(true);
     expect(ITEM_CATALOG).toHaveLength(11);
     const rows = db
@@ -3853,7 +3963,7 @@ describe("item templates and issuance", () => {
         `SELECT template_id AS templateId, operand_key AS operandKey, issue_reason AS issueReason, repeat_forced AS repeatForced
          FROM item_instances WHERE child_id = ?`,
       )
-      .all(childId) as Array<{
+      .all(child.id) as Array<{
       templateId: string;
       operandKey: string;
       issueReason: string;
@@ -3862,19 +3972,19 @@ describe("item templates and issuance", () => {
     const keys = rows.map((row) => `${row.templateId}:${row.operandKey}`);
     expect(new Set(keys).size).toBe(keys.length);
     expect(rows.every((row) => row.repeatForced === 0)).toBe(true);
-    expect(repeatPoolReport(db, childId), repeatPoolReport(db, childId).join("; ")).toEqual([]);
-    const rates = assertRotationLimits(db, childId);
+    expect(repeatPoolReport(db, child.id), repeatPoolReport(db, child.id).join("; ")).toEqual([]);
+    const rates = assertRotationLimits(db, child.id);
     expect(rates.every((row) => row.rate <= MAX_SKILL_SWITCH_RATE)).toBe(true);
     const end = new Date(stamp).toISOString();
-    expect(exactRepeatRate(db, childId, end).forced).toBe(0);
-    const pools = poolIssuanceCounts(db, childId);
+    expect(exactRepeatRate(db, child.id, end).forced).toBe(0);
+    const pools = poolIssuanceCounts(db, child.id);
     expect(pools.reduce((sum, row) => sum + row.issued, 0)).toBe(rows.length);
     for (const pool of pools) {
       expect(pool.exhaustedRepeat).toBe(0);
       expect(pool.switchRate).toBe(pool.issued === 0 ? 0 : pool.exhaustedSwitch / pool.issued);
     }
-    const home = getChildHome(db, guardian.id, childId);
-    const summary = readParentSummary(db, guardian.id, childId, end);
+    const home = getChildHome(db, guardian.id, child.id);
+    const summary = readParentSummary(db, guardian.id, child.id, end);
     expect(JSON.stringify({ home, summary, pools: "hidden" })).not.toMatch(
       /switchRate|poolIssuance|exhaustedSwitch|exhaustedRepeat/,
     );
@@ -3895,14 +4005,14 @@ describe("item templates and issuance", () => {
 
   it("gives a heavy rotation week zero repeats and a switch rate of at most 10%", () => {
     // Simulation (c): 2 sessions of 15 items a day, for 7 days, on the 11-slot rotation.
-    // The child id is fixed because it is part of the draw seed.
     const sessionsPerDay = 2;
     const itemsPerSession = 15;
     const days = 7;
     const db = tempDb();
-    const childId = "heavy-00";
-    pinnedRotationChild(db, childId, "heavy-rotation@example.com");
-    const rotation = issueRotationWeek(db, childId, Date.parse(WHEN), {
+    const { child, session } = granted(db, "heavy-rotation@example.com");
+    const opened = readItemInstance(db, session.item.itemInstanceId ?? "");
+    if (!opened) throw new Error("session did not issue");
+    const rotation = issueRotationWeek(db, child.id, Date.parse(opened.issuedAt), {
       sessionsPerDay,
       itemsPerSession,
       days,
@@ -3910,79 +4020,44 @@ describe("item templates and issuance", () => {
     });
     const maxSwitches = assertAtMostOneSwitch(rotation.sessions);
     expect(maxSwitches).toBeLessThanOrEqual(1);
-    const distinct = assertDistinctTemplates(db, childId);
+    const distinct = assertDistinctTemplates(db, child.id);
     expect(distinct.every((row) => row.templates >= MIN_DISTINCT_TEMPLATES)).toBe(true);
     expect(ITEM_CATALOG).toHaveLength(11);
-    const rates = assertRotationLimits(db, childId);
+    const rates = assertRotationLimits(db, child.id);
     expect(rates.every((row) => row.rate <= MAX_SKILL_SWITCH_RATE)).toBe(true);
-    expect(repeatPoolReport(db, childId)).toEqual([]);
+    expect(repeatPoolReport(db, child.id)).toEqual([]);
   }, 30_000);
 
-  it("gives 20 children a heavy rotation week under the switch cap", () => {
-    // Each child id is fixed, so the draw seed hashSeed(idempotencyKey:childId) is distinct and stable.
-    // The week is 2 sessions of 15 items for 7 days on the 11-slot rotation, with no session opener.
-    const childCount = 20;
+  it("gives 20 children a one-session week under the template floor", () => {
+    // 1 session of 15 items a day for 7 days. Child ids are fixed and distinct.
+    // There is no session opener. Round-robin must clear 3 templates for every child.
     const db = tempDb();
-    const guardian = createGuardian(db, {
-      email: "cohort@example.com",
-      password: "correct-horse",
-      timezone: "America/Los_Angeles",
+    const result = runChildCohort(db, "cohort-once@example.com", {
+      childPrefix: "once",
+      sessionsPerDay: 1,
     });
-    const insertChild = db.prepare(
-      `INSERT INTO children (id, guardian_id, display_name, timezone, created_at)
-       VALUES (?, ?, ?, 'America/Los_Angeles', ?)`,
-    );
-    const perChild: SkillSwitchRate[][] = [];
-    let worstSessionSwitches = 0;
-    for (let index = 0; index < childCount; index += 1) {
-      const childId = `cohort-${String(index).padStart(2, "0")}`;
-      insertChild.run(childId, guardian.id, `Child ${index}`, WHEN);
-      const rotation = issueRotationWeek(db, childId, Date.parse(WHEN), {
-        sessionsPerDay: 2,
-        itemsPerSession: 15,
-        days: 7,
-        keyPrefix: childId,
-      });
-      worstSessionSwitches = Math.max(worstSessionSwitches, assertAtMostOneSwitch(rotation.sessions));
-      assertDistinctTemplates(db, childId);
-      perChild.push(assertRotationLimits(db, childId));
+    assertCohortLimits(result);
+    for (const rows of result.perChild) {
+      const compare = rows.find((row) => row.skill === SKILLS.compare);
+      expect(compare).toMatchObject({ issued: 9, exhaustedSwitch: 0 });
     }
-    expect(worstSessionSwitches).toBeLessThanOrEqual(1);
-    const skills = perChild[0]?.map((row) => row.skill) ?? [];
-    const summary = skills.map((skill) => {
-      let issued = 0;
-      let exhaustedSwitch = 0;
-      let worstRate = 0;
-      let worstChild = "";
-      for (let index = 0; index < perChild.length; index += 1) {
-        const row = perChild[index]?.find((item) => item.skill === skill);
-        if (!row) continue;
-        issued += row.issued;
-        exhaustedSwitch += row.exhaustedSwitch;
-        if (row.rate > worstRate) {
-          worstRate = row.rate;
-          worstChild = `cohort-${String(index).padStart(2, "0")}`;
-        }
-      }
-      return {
-        skill,
-        overall: issued === 0 ? 0 : exhaustedSwitch / issued,
-        overallText: `${exhaustedSwitch}/${issued}`,
-        worst: worstRate,
-        worstChild,
-      };
+    expect(result.summary.filter((row) => row.overall !== 0 || row.worst !== 0)).toEqual([]);
+  }, 120_000);
+
+  it("gives 20 children a heavy rotation week under the switch cap", () => {
+    // 2 sessions of 15 items a day for 7 days. Child ids are fixed and distinct.
+    // There is no session opener.
+    const db = tempDb();
+    const result = runChildCohort(db, "cohort@example.com", {
+      childPrefix: "cohort",
+      sessionsPerDay: 2,
     });
-    const over = summary.filter((row) => row.overall > MAX_SKILL_SWITCH_RATE || row.worst > MAX_SKILL_SWITCH_RATE);
-    expect(
-      over.map((row) => `${row.skill}: overall ${row.overallText}, worst ${(row.worst * 100).toFixed(1)}% (${row.worstChild})`),
-      "cohort switch rate above 10%",
-    ).toEqual([]);
-    expect(summary).toHaveLength(ITEM_CATALOG.length);
-    for (const rows of perChild) {
+    assertCohortLimits(result);
+    for (const rows of result.perChild) {
       const compare = rows.find((row) => row.skill === SKILLS.compare);
       expect(compare).toMatchObject({ issued: 19, exhaustedSwitch: 0 });
     }
-    expect(summary.filter((row) => row.overall !== 0 || row.worst !== 0)).toEqual([]);
+    expect(result.summary.filter((row) => row.overall !== 0 || row.worst !== 0)).toEqual([]);
   }, 120_000);
 
   it("gives every pool a heavy week with zero exhausted repeats", () => {

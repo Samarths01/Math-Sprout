@@ -369,6 +369,24 @@ function lastTemplateId(db: Database.Database, sessionId: string): string | null
   return row?.template_id ?? null;
 }
 
+function lastIssuedAtByTemplate(
+  db: Database.Database,
+  childId: string,
+  templateIds: readonly string[],
+): Map<string, string> {
+  if (templateIds.length === 0) return new Map();
+  const placeholders = templateIds.map(() => "?").join(", ");
+  const rows = db
+    .prepare(
+      `SELECT template_id AS templateId, MAX(issued_at) AS lastAt
+       FROM item_instances
+       WHERE child_id = ? AND template_id IN (${placeholders})
+       GROUP BY template_id`,
+    )
+    .all(childId, ...templateIds) as Array<{ templateId: string; lastAt: string }>;
+  return new Map(rows.map((row) => [row.templateId, row.lastAt]));
+}
+
 type FrozenDraw = {
   templateId: string;
   templateVersion: number;
@@ -447,19 +465,45 @@ function drawFresh(
     pool.map((item) => item.template.templateId),
     input.since,
   );
-  // Stable order: templates are sorted by id, and eligible draws follow slot order.
-  // Shuffling that unseen list and taking the first cannot skip a fresh item.
-  const unseen: Array<{ choice: ActiveTemplate; draw: ReturnType<typeof eligibleDraws>[number] }> = [];
+  // Round-robin across templates. A template with no fresh item is skipped.
+  // Never-issued templates come first. Equal recency is broken by the seeded
+  // shuffle, then the first item comes from that template's shuffled unseen list.
+  const fresh: Array<{ choice: ActiveTemplate; unseen: ReturnType<typeof eligibleDraws> }> = [];
   for (const choice of pool) {
-    for (const draw of cachedEligibleDraws(choice.template, input.step)) {
+    const unseen = cachedEligibleDraws(choice.template, input.step).filter((draw) => {
       const key = operandKey(draw.operands, draw.canonicalAnswer);
-      if (issued.has(`${choice.template.templateId}\0${key}`)) continue;
-      unseen.push({ choice, draw });
-    }
+      return !issued.has(`${choice.template.templateId}\0${key}`);
+    });
+    if (unseen.length === 0) continue;
+    fresh.push({ choice, unseen });
   }
-  const picked = shuffleWith(unseen, input.rng)[0];
+  if (fresh.length === 0) return null;
+  const lastAt = lastIssuedAtByTemplate(
+    db,
+    input.childId,
+    fresh.map((item) => item.choice.template.templateId),
+  );
+  const neverIssued = fresh.filter((item) => !lastAt.has(item.choice.template.templateId));
+  const oldestAt =
+    neverIssued.length > 0
+      ? null
+      : fresh.reduce((best, candidate) => {
+          const bestAt = lastAt.get(best.choice.template.templateId) ?? "";
+          const candidateAt = lastAt.get(candidate.choice.template.templateId) ?? "";
+          return candidateAt < bestAt ? candidate : best;
+        });
+  const tied =
+    oldestAt === null
+      ? neverIssued
+      : fresh.filter(
+          (item) =>
+            lastAt.get(item.choice.template.templateId) === lastAt.get(oldestAt.choice.template.templateId),
+        );
+  const picked = shuffleWith(tied, input.rng)[0];
   if (!picked) return null;
-  const { choice, draw } = picked;
+  const draw = shuffleWith(picked.unseen, input.rng)[0];
+  if (!draw) return null;
+  const choice = picked.choice;
   return {
     templateId: choice.template.templateId,
     templateVersion: choice.template.version,
