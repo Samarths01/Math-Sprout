@@ -15,6 +15,7 @@ import {
   type ProjectedPiece,
 } from "@/lib/build-goal";
 import { readCompanion } from "@/lib/companion";
+import { accruedXp } from "@/lib/fuel";
 import { openDatabase } from "@/lib/db";
 import { createChild, createGuardian, getChildHome, getParentHome, PARENT_HOME_NARRATIVE, setConsent } from "@/lib/domain";
 import { INTERFACE_COPY } from "@/lib/interface-copy";
@@ -196,7 +197,10 @@ describe("build goal projection", () => {
     expect(pieceIds(view).sort()).toEqual(busPieceIds(db, child.id).sort());
     expect(projectBadges(db, child.id)).toHaveLength(1);
     expect(JSON.stringify(view)).not.toMatch(/score|confidence|xpAmount|percent|judgment|judgement/i);
-    expect(view).not.toHaveProperty("xp");
+    expect(view.glance.xp).toBe(accruedXp(db, child.id));
+    expect(view.glance.pieces).toBe(view.build.active.pieces.length);
+    expect(view.glance.goal).toBe(view.build.active.pieceTarget);
+    expect(view).not.toHaveProperty("score");
   });
 
   it("does not grow the build when the same try is replayed", () => {

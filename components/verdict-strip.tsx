@@ -2,7 +2,7 @@ import { Check } from "lucide-react";
 
 /**
  * Right/wrong under the stem, before the beats.
- * Correct is a mint wash with a check. A miss is amber–coral, not alarm red.
+ * Correct is the only green. A miss is calm blue.
  */
 export function VerdictStrip({ correct }: { correct: boolean }) {
   return (
@@ -12,12 +12,24 @@ export function VerdictStrip({ correct }: { correct: boolean }) {
       role="status"
       className={
         correct
-          ? "inline-flex w-fit items-center gap-2 rounded-lg bg-secondary px-3 py-2 font-sans text-[1.2rem] font-bold leading-tight text-primary"
-          : "inline-flex w-fit items-center gap-2 rounded-lg bg-[oklch(0.94_0.045_55)] px-3 py-2 font-sans text-[1.2rem] font-bold leading-tight text-[oklch(0.40_0.08_45)]"
+          ? "flex h-12 w-full items-center gap-2 rounded-[12px] bg-verdict-correct/12 px-3 font-sans text-[20px] font-bold text-verdict-correct"
+          : "flex h-12 w-full items-center gap-2 rounded-[12px] bg-verdict-miss/12 px-3 font-sans text-[20px] font-bold text-verdict-miss"
       }
     >
-      {correct ? <Check className="size-5 shrink-0" aria-hidden="true" /> : null}
+      {correct ? (
+        <Check className="size-6 shrink-0" aria-hidden="true" />
+      ) : (
+        <MissMark />
+      )}
       {correct ? "Correct" : "Not yet"}
     </p>
+  );
+}
+
+function MissMark() {
+  return (
+    <svg viewBox="0 0 24 24" className="size-6 shrink-0" aria-hidden="true">
+      <circle cx="12" cy="12" r="7" fill="none" stroke="currentColor" strokeWidth="2" />
+    </svg>
   );
 }

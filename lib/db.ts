@@ -47,7 +47,8 @@ CREATE TABLE IF NOT EXISTS practice_sessions (
   practice_lane TEXT NOT NULL DEFAULT 'recommended' CHECK (practice_lane IN ('recommended', 'challenge', 'review')),
   phase TEXT NOT NULL DEFAULT 'practicing' CHECK (phase IN ('practicing', 'boundary', 'closed')),
   progression TEXT CHECK (progression IN ('stay', 'remediate', 'levelUpSlight')),
-  policy_version TEXT NOT NULL DEFAULT '${POLICY_VERSION}'
+  policy_version TEXT NOT NULL DEFAULT '${POLICY_VERSION}',
+  build_sha TEXT
 );
 
 CREATE TABLE IF NOT EXISTS learner_skill_state (
@@ -95,6 +96,7 @@ CREATE TABLE IF NOT EXISTS attempts (
   client_view_json TEXT NOT NULL,
   created_at TEXT NOT NULL,
   policy_version TEXT NOT NULL DEFAULT '${POLICY_VERSION}',
+  build_sha TEXT,
   resume_presentation TEXT NOT NULL DEFAULT 'live' CHECK (resume_presentation IN ('live', 'quiet')),
   UNIQUE (child_id, idempotency_key)
 );
@@ -152,6 +154,7 @@ export function openDatabase(filename: string): Database.Database {
   migrateEconomy(db);
   migratePauseHold(db);
   migrateOfflineCap(db);
+  migrateAppBuild(db);
   return db;
 }
 
@@ -366,6 +369,19 @@ function migratePauseHold(db: Database.Database): void {
     db.exec(
       `ALTER TABLE attempts ADD COLUMN resume_presentation TEXT NOT NULL DEFAULT 'live' CHECK (resume_presentation IN ('live', 'quiet'))`,
     );
+  }
+}
+
+/**
+ * Nullable build tag beside policy_version. Existing rows stay null.
+ * New writes store the resolved app build, which is never empty.
+ */
+function migrateAppBuild(db: Database.Database): void {
+  for (const table of ["practice_sessions", "attempts"] as const) {
+    const columns = tableColumns(db, table);
+    if (columns.size > 0 && !columns.has("build_sha")) {
+      db.exec(`ALTER TABLE ${table} ADD COLUMN build_sha TEXT`);
+    }
   }
 }
 

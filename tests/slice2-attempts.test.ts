@@ -127,6 +127,7 @@ function expectClientViewSealed(result: AttemptResult) {
   expect(JSON.stringify(result)).not.toMatch(
     /scorePercent|confidence|rawConfidence|percentCorrect/i,
   );
+  expect(JSON.stringify(result)).not.toMatch(/build_sha|policy_version|buildSha|policyVersion/);
 }
 
 function xpRows(db: Database.Database) {

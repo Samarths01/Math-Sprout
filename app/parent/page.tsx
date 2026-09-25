@@ -18,6 +18,8 @@ import { currentGuardian } from "@/lib/http";
 import { interfaceCopy } from "@/lib/interface-copy";
 import { readOfflineCap } from "@/lib/offline-cap";
 import { readPauseHold } from "@/lib/pause-hold";
+import { ParentBuildFooter } from "@/components/build-footer";
+import { cachedAppBuildSha, formatParentBuildLabel } from "@/lib/app-build";
 import { ParentOneBreathCard } from "@/components/parent-one-breath";
 import { readParentSummary } from "@/lib/parent-summary";
 import { formatTimeZone } from "@/lib/timezones";
@@ -73,6 +75,7 @@ export default async function ParentHomePage() {
   const guardian = await currentGuardian();
   if (!guardian) redirect("/login");
   const home = getParentHome(getDb(), guardian.id);
+  const buildLabel = formatParentBuildLabel(cachedAppBuildSha());
 
   return (
     <Shell>
@@ -95,8 +98,11 @@ export default async function ParentHomePage() {
           </Link>
         </div>
         <Card>
-          <CardContent className="text-sm leading-6 text-muted-foreground">
-            {home.narrative}
+          <CardContent className="grid gap-3 text-sm leading-6 text-muted-foreground">
+            <p>{home.narrative}</p>
+            <p data-testid="parent-consent-line" data-copy-key="parent.consent.line">
+              {interfaceCopy("parent.consent.line")}
+            </p>
           </CardContent>
         </Card>
         {home.children.length === 0 ? (
@@ -154,6 +160,7 @@ export default async function ParentHomePage() {
           </ul>
         )}
       </main>
+      <ParentBuildFooter label={buildLabel} />
     </Shell>
   );
 }

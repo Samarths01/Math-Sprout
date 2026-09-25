@@ -19,7 +19,10 @@ export function PracticeFeedback({
       <dl className="grid gap-3">
         {frames.map((frame) => (
           <div key={frame.key} className="grid gap-1">
-            <dt className="text-sm font-medium" data-beat-label={frame.label}>
+            <dt
+              className="text-[13px] font-medium tracking-[0.04em] text-label uppercase"
+              data-beat-label={frame.label}
+            >
               {frame.label}
             </dt>
             <dd data-testid={`beat-${frame.key}`} className="text-sm leading-6">

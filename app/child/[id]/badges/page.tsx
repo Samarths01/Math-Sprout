@@ -10,6 +10,7 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
+import { BuildGoalPanel } from "@/components/build-goal-panel";
 import { readCompanion } from "@/lib/companion";
 import { getDb } from "@/lib/db";
 import { DomainError, getChildHome } from "@/lib/domain";
@@ -45,7 +46,8 @@ export default async function BadgeScreenPage({
     throw error;
   }
 
-  const badges = readCompanion(getDb(), home.child.id, new Date().toISOString()).badges;
+  const companion = readCompanion(getDb(), home.child.id, new Date().toISOString());
+  const badges = companion.badges;
 
   return (
     <Shell width="narrow">
@@ -57,6 +59,11 @@ export default async function BadgeScreenPage({
           </h1>
           <p className="text-sm text-muted-foreground">{home.child.displayName}</p>
         </div>
+        <Card>
+          <CardContent>
+            <BuildGoalPanel build={companion.build} />
+          </CardContent>
+        </Card>
         {badges.length === 0 ? (
           <Card data-testid="badge-empty">
             <CardHeader>

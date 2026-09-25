@@ -15,8 +15,10 @@ import {
   type QueuedAttempt,
   type SyncPost,
 } from "@/lib/offline-queue";
+import { markFuelPulse } from "@/lib/fuel-motion";
 import { showResumeCelebration } from "@/lib/pause-hold";
 import { postPauseHoldUntilVisible } from "@/lib/pause-hold-receipt";
+import { stepClass } from "@/lib/palette";
 import { Button } from "@/components/ui/button";
 import {
   Card,
@@ -135,6 +137,14 @@ export function PracticeSession({
         (result) => result.idempotencyKey === waitingKey.current,
       );
       if (synced && showResumeCelebration(synced)) {
+        markFuelPulse(window.sessionStorage, childId, {
+          tier: synced.clientView.celebrationTier,
+          credit: synced.fuel.credit,
+          eventCount: synced.eventIds.length,
+          replayed: synced.replayed,
+          resumeQuiet: false,
+          eventId: synced.eventIds[0] ?? null,
+        });
         setFeedback(synced);
         setSavedOffline(false);
         setHeldNotice(false);
@@ -314,6 +324,14 @@ export function PracticeSession({
     const snapshot = await flush();
     const synced = snapshot.synced.find((result) => result.idempotencyKey === idempotencyKey);
     if (synced && showResumeCelebration(synced)) {
+      markFuelPulse(window.sessionStorage, childId, {
+        tier: synced.clientView.celebrationTier,
+        credit: synced.fuel.credit,
+        eventCount: synced.eventIds.length,
+        replayed: synced.replayed,
+        resumeQuiet: false,
+        eventId: synced.eventIds[0] ?? null,
+      });
       setFeedback(synced);
       setPersistedView(synced.clientView);
       setSavedOffline(false);
@@ -465,12 +483,19 @@ export function PracticeSession({
       ) : (
       <Card>
         <CardHeader>
-          <CardDescription>
-            Grade {item.grade} · {item.pack === "fractions" ? "Fractions" : "Operations"}
+          <CardDescription className="flex items-center gap-2">
+            <span
+              data-testid="difficulty-badge"
+              data-grade={item.grade}
+              className={`inline-flex w-fit items-center rounded-full px-2.5 py-0.5 text-xs font-medium ${stepClass(item.grade)}`}
+            >
+              Grade {item.grade}
+            </span>
+            <span>{item.pack === "fractions" ? "Fractions" : "Operations"}</span>
           </CardDescription>
           <CardTitle
             data-testid="practice-prompt"
-            className="font-heading text-3xl leading-tight"
+            className="font-heading text-[32px] leading-[40px] tracking-tight tabular-nums"
           >
             {item.prompt}
           </CardTitle>
@@ -482,7 +507,7 @@ export function PracticeSession({
               {offlineCapped ? null : (
                 <Button
                   type="button"
-                  className="h-12 text-base"
+                  size="primary"
                   onClick={() => showNext(nextFromFeedback ?? localNext)}
                 >
                   Next problem
@@ -510,9 +535,9 @@ export function PracticeSession({
               {error ? <p className="text-sm text-destructive">{error}</p> : null}
               <Button
                 type="submit"
+                size="primary"
                 data-testid="practice-submit"
                 disabled={busy || offlineCapped}
-                className="h-12 text-base"
               >
                 {busy ? "Checking…" : "Check answer"}
               </Button>

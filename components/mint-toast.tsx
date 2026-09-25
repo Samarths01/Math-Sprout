@@ -38,7 +38,7 @@ export function MintToast({
         role="status"
         className={
           plan.xp === "full"
-            ? "text-sm font-medium leading-6 text-primary"
+            ? "text-sm font-medium leading-6 text-foreground"
             : plan.xp === "quietXp"
               ? "text-sm font-medium leading-6 text-foreground"
               : "text-sm leading-6 text-muted-foreground"

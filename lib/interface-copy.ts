@@ -47,6 +47,13 @@ export const INTERFACE_COPY = {
   "parent.breath.empty": "No practice yet.",
   "parent.breath.emptyToday": "No practice yet today.",
   "parent.breath.noBand": "No band movement yet",
+  "home.focus.kicker": "TODAY'S FOCUS",
+  "home.badges.link": "Badges ›",
+  "home.block.paused": "Practice is paused for now — ask your grown-up.",
+  "home.block.revoked": "Practice is closed for now — ask your grown-up.",
+  "home.block.none": "Practice isn't open yet — ask your grown-up.",
+  "parent.consent.line":
+    "Only a parent can allow practice. Missing, paused, or revoked consent does not start a session.",
 } as const;
 
 export type InterfaceCopyKey = keyof typeof INTERFACE_COPY;
