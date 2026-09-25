@@ -305,3 +305,18 @@ export function createAttemptQueue(store: QueueStore) {
     },
   };
 }
+
+/**
+ * A prefetch or an advance can supersede the batch a queued try belongs to.
+ * Reconcile first. Issuance runs only after the queue has drained. Entries
+ * that reconcile drops as non-retryable are not pending, so they do not block
+ * the next batch. A retryable try still waiting does.
+ */
+export async function issueAfterQueueDrain<T>(
+  reconcile: () => Promise<QueueSnapshot>,
+  issue: () => Promise<T>,
+): Promise<{ snapshot: QueueSnapshot; issued: T | null }> {
+  const snapshot = await reconcile();
+  if (snapshot.pending.length > 0) return { snapshot, issued: null };
+  return { snapshot, issued: await issue() };
+}

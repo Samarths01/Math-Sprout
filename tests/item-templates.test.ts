@@ -5,6 +5,7 @@ import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { POST as submitAttemptRoute } from "@/app/api/children/[id]/attempts/route";
+import { POST as issueItemsRoute } from "@/app/api/children/[id]/sessions/[sessionId]/items/route";
 import Database from "better-sqlite3";
 import type { AttemptResult } from "@/lib/attempt-contract";
 import { currentAppBuildSha } from "@/lib/app-build";
@@ -91,6 +92,7 @@ import {
 import {
   classifyAttemptFailure,
   createAttemptQueue,
+  issueAfterQueueDrain,
   memoryQueueStore,
   reloadLiveSession,
   type QueuedAttempt,
@@ -161,6 +163,29 @@ async function postAttemptRoute(
     { params: Promise.resolve({ id: childId }) },
   );
   const body = (await response.json()) as { error?: string; code?: string; retryable?: boolean; attemptId?: string };
+  return { status: response.status, body };
+}
+
+async function postItemsRoute(
+  db: Database.Database,
+  token: string,
+  childId: string,
+  sessionId: string,
+  idempotencyKey: string,
+  count: number,
+): Promise<{ status: number; body: { error?: string; items?: Array<{ itemInstanceId?: string }> } }> {
+  const globalForDb = globalThis as typeof globalThis & { __mathSproutDb?: Database.Database };
+  globalForDb.__mathSproutDb = db;
+  cookieState.token = token;
+  const response = await issueItemsRoute(
+    new Request(`http://127.0.0.1/api/children/${childId}/sessions/${sessionId}/items`, {
+      method: "POST",
+      headers: { "content-type": "application/json", host: "127.0.0.1" },
+      body: JSON.stringify({ idempotencyKey, count }),
+    }),
+    { params: Promise.resolve({ id: childId, sessionId }) },
+  );
+  const body = (await response.json()) as { error?: string; items?: Array<{ itemInstanceId?: string }> };
   return { status: response.status, body };
 }
 
@@ -3119,6 +3144,171 @@ describe("item templates and issuance", () => {
     expect(snapshot.pending).toEqual([]);
     expect(snapshot.dropped.map((row) => row.idempotencyKey)).toEqual([late.idempotencyKey]);
     expect(JSON.stringify(snapshot.dropped)).not.toContain(late.answer);
+  });
+
+  it("flushes offline answers before a reconnect prefetch", async () => {
+    const db = tempDb();
+    const { guardian, child, session } = granted(db, "flush-first@example.com");
+    const token = createSession(db, guardian.id);
+    const openCount = () =>
+      (
+        db
+          .prepare(
+            `SELECT COUNT(*) AS count FROM item_instances
+             WHERE session_id = ? AND consumed_at IS NULL`,
+          )
+          .get(session.sessionId) as { count: number }
+      ).count;
+    const screenNow = () => {
+      const slot = db
+        .prepare(`SELECT slot_seq AS slotSeq FROM practice_sessions WHERE id = ?`)
+        .get(session.sessionId) as { slotSeq: number };
+      const row = db
+        .prepare(
+          `SELECT item_instance_id AS itemInstanceId FROM item_instances
+           WHERE session_id = ? AND issue_idempotency_key = ?`,
+        )
+        .get(session.sessionId, sessionSlotKey(session.sessionId, slot.slotSeq)) as
+        | { itemInstanceId: string }
+        | undefined;
+      if (!row) throw new Error("screen item is missing");
+      const instance = readItemInstance(db, row.itemInstanceId);
+      if (!instance) throw new Error("screen item is missing");
+      return instance;
+    };
+
+    for (let round = 0; round < 4; round += 1) {
+      const screen = screenNow();
+      const parked = await postItemsRoute(
+        db,
+        token,
+        child.id,
+        session.sessionId,
+        `park-round-${round}x`,
+        1,
+      );
+      expect(parked.status, `round ${round} park`).toBe(200);
+      const parkedId = parked.body.items?.[0]?.itemInstanceId;
+      if (!parkedId) throw new Error("prefetch did not park an item");
+      expect(openCount(), `round ${round} after park`).toBeLessThanOrEqual(OUTSTANDING_UNANSWERED_CAP);
+      const answeredAt = new Date(Date.parse(WHEN) + round * 60_000 + 4_000).toISOString();
+      const moved = submitAnswer(
+        db,
+        guardian.id,
+        child.id,
+        {
+          idempotencyKey: `screen-round-${round}x`,
+          sessionId: session.sessionId,
+          itemId: session.item.id,
+          itemInstanceId: screen.itemInstanceId,
+          answer: screen.canonicalAnswer,
+          shownAt: new Date(Date.parse(answeredAt) - 2_000).toISOString(),
+          submittedAt: answeredAt,
+        },
+        { now: answeredAt },
+      );
+      if (isFormatRejected(moved)) throw new Error("a readable answer was rejected");
+      const older = readItemInstance(db, parkedId);
+      if (!older || older.consumedAt) throw new Error("parked item was already used");
+      expect(openCount(), `round ${round} after screen`).toBeLessThanOrEqual(OUTSTANDING_UNANSWERED_CAP);
+
+      const queue = createAttemptQueue(memoryQueueStore());
+      const offlineKey = `offline-round-${round}x`;
+      const submittedAt = new Date(Date.parse(answeredAt) + 4_000).toISOString();
+      if (round === 0) {
+        queue.enqueue({
+          idempotencyKey: "unknown-round-00",
+          childId: child.id,
+          sessionId: session.sessionId,
+          itemId: session.item.id,
+          itemInstanceId: "not-a-real-instance",
+          answer: "17/3",
+          shownAt: new Date(Date.parse(submittedAt) - 2_000).toISOString(),
+          submittedAt,
+        });
+      }
+      queue.enqueue({
+        idempotencyKey: offlineKey,
+        childId: child.id,
+        sessionId: session.sessionId,
+        itemId: session.item.id,
+        itemInstanceId: parkedId,
+        answer: older.canonicalAnswer,
+        shownAt: new Date(Date.parse(submittedAt) - 2_000).toISOString(),
+        submittedAt,
+      });
+      const steps: string[] = [];
+      const outcome = await issueAfterQueueDrain(
+        () =>
+          queue.reconcile(async (attempt) => {
+            steps.push(`flush:${attempt.idempotencyKey}`);
+            const posted = await postAttemptRoute(db, token, child.id, attempt);
+            if (attempt.idempotencyKey === "unknown-round-00") {
+              expect(posted.status).toBe(404);
+              expect(posted.body.code).toBe("unknown_instance");
+              const classified = classifyAttemptFailure(posted.status, posted.body);
+              if (!classified) throw new Error("unknown instance stayed retryable");
+              return classified;
+            }
+            expect(posted.status, `round ${round} offline answer`).toBe(200);
+            expect(posted.body.code).toBeUndefined();
+            if (!posted.body.attemptId) throw new Error("offline answer was not scored");
+            return { ok: true as const, result: posted.body as AttemptResult };
+          }),
+        async () => {
+          steps.push("prefetch");
+          const next = await postItemsRoute(
+            db,
+            token,
+            child.id,
+            session.sessionId,
+            `reconnect-round-${round}x`,
+            1,
+          );
+          expect(next.status, `round ${round} prefetch`).toBe(200);
+          expect(next.body.items?.length ?? 0).toBeGreaterThan(0);
+          return next;
+        },
+      );
+      expect(steps.at(-1)).toBe("prefetch");
+      expect(steps.indexOf("prefetch")).toBe(steps.length - 1);
+      expect(steps.some((step) => step === `flush:${offlineKey}`)).toBe(true);
+      expect(outcome.issued?.body.items?.length ?? 0).toBeGreaterThan(0);
+      expect(outcome.snapshot.pending).toEqual([]);
+      expect(outcome.snapshot.dropped.map((row) => row.idempotencyKey)).not.toContain(offlineKey);
+      const saved = readItemInstance(db, parkedId);
+      expect(saved?.consumedAt).not.toBeNull();
+      expect(saved?.consumedByAttemptKey).toBe(offlineKey);
+      expect(openCount(), `round ${round} after reconnect`).toBeLessThanOrEqual(OUTSTANDING_UNANSWERED_CAP);
+    }
+
+    const blocked = createAttemptQueue(memoryQueueStore());
+    blocked.enqueue({
+      idempotencyKey: "still-retryable",
+      childId: child.id,
+      sessionId: session.sessionId,
+      itemId: session.item.id,
+      answer: "17/3",
+      shownAt: shown(),
+      submittedAt: WHEN,
+      itemInstanceId: "issued-instance-01",
+    });
+    let issuedWhileWaiting = false;
+    const waiting = await issueAfterQueueDrain(
+      () =>
+        blocked.reconcile(async () => {
+          const classified = classifyAttemptFailure(500, { error: "Something went wrong." });
+          if (!classified) throw new Error("expected a retryable server error");
+          return classified;
+        }),
+      async () => {
+        issuedWhileWaiting = true;
+        return null;
+      },
+    );
+    expect(waiting.issued).toBeNull();
+    expect(issuedWhileWaiting).toBe(false);
+    expect(waiting.snapshot.pending).toHaveLength(1);
   });
 
   it("drops unknown and already-used queued attempts through the route", async () => {
