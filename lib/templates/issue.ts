@@ -1035,6 +1035,21 @@ export function consumeItemInstance(
     )
     .run(consumedAt, attemptKey, instance.itemInstanceId);
   if (result.changes !== 1) {
-    throw new DomainError("That problem is already locked.", 409, undefined, undefined, "already_locked");
+    throw new DomainError(
+      "That problem is already locked.",
+      409,
+      undefined,
+      undefined,
+      "already_locked",
+      instanceHasSavedAttempt(db, instance.itemInstanceId),
+    );
   }
+}
+
+/** An attempts row, not a consumed flag. Abandoned prefetches are not saved answers. */
+export function instanceHasSavedAttempt(db: Database.Database, itemInstanceId: string): boolean {
+  const row = db
+    .prepare(`SELECT 1 AS ok FROM attempts WHERE item_instance_id = ? LIMIT 1`)
+    .get(itemInstanceId) as { ok: number } | undefined;
+  return row !== undefined;
 }

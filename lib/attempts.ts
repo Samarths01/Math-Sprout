@@ -53,6 +53,7 @@ import {
   consumeItemInstance,
   focusForStoredAnswer,
   gradeStoredAnswer,
+  instanceHasSavedAttempt,
   presentIssuedItem,
   readItemInstance,
 } from "@/lib/templates/issue";
@@ -563,6 +564,7 @@ export function submitAnswer(
           undefined,
           undefined,
           "already_locked",
+          instanceHasSavedAttempt(db, instance.itemInstanceId),
         );
       }
       const skillRow = db

@@ -52,7 +52,9 @@ export type SyncPost =
   | { ok: false; reason: "drop"; message: string }
   | { ok: false; reason: "format_rejected"; rejected: FormatRejected }
   | { ok: false; reason: "invalid_attempt" }
-  | { ok: false; reason: "error"; message: string };
+  | { ok: false; reason: "error"; message: string }
+  /** Keep the answer and stop blocking the rest of the queue. One later retry. */
+  | { ok: false; reason: "park"; message: string };
 
 export type QueueSnapshot = QueueData & {
   lastError?: string;
@@ -87,6 +89,41 @@ export const OFFLINE_QUEUE_CAP = 3;
 export const QUEUE_PARK_AFTER_FAILURES = 3;
 export const QUEUE_PARK_AFTER_MS = 15 * 60 * 1000;
 
+/**
+ * A parked retry posts once and must not hold session start open.
+ * A timeout is that one retry. The answer is dropped afterward, the same as
+ * any other failed retry. A network failure is not a timeout.
+ */
+export const QUEUE_RETRY_TIMEOUT_MS = 8_000;
+
+export function retryTimedOut(error: unknown): boolean {
+  if (!error || typeof error !== "object" || !("name" in error)) return false;
+  const name = String(error.name);
+  return name === "TimeoutError" || name === "AbortError";
+}
+
+/** Map a thrown parked-retry post. Timeout spends the retry. Anything else stays parked. */
+export function parkedRetryFailure(
+  error: unknown,
+): Extract<SyncPost, { ok: false; reason: "error" | "offline" }> {
+  if (retryTimedOut(error)) {
+    return { ok: false, reason: "error", message: "Could not save that try." };
+  }
+  return { ok: false, reason: "offline" };
+}
+
+/**
+ * A queued answer that syncs leaves this item. An answer scored while online
+ * stays on the feedback card until the kid chooses Next.
+ */
+export function advanceAfterQueuedSync(
+  queuedOffline: boolean,
+  synced: AttemptResult | undefined,
+): AttemptResult["nextItem"] | null {
+  if (!queuedOffline || !synced) return null;
+  return synced.nextItem;
+}
+
 export function emptyQueue(): QueueData {
   return { version: 1, pending: [], blocked: [], parked: [], dropped: [], synced: [] };
 }
@@ -105,27 +142,26 @@ export function consentQueueReason(
 
 /**
  * Missing or invalid instance ids are permanent when the body names that case.
- * An unknown instance is 404 with `code: unknown_instance`. An already-used
- * instance is 409 with `code: already_locked`. A session that has ended is
- * 409 with `code: session_ended` and `retryable: false`; that try is dropped.
- * Other 404s and 409s stay retryable, including a missing session, a missing
- * child, and a routing 404. 5xx stays retryable until the park limit. Other
- * statuses return null so the caller keeps its existing mapping.
+ * An unknown instance is 404 with `code: unknown_instance` and is dropped.
+ * A 409 is dropped only when `savedAttempt` is true: the server already stored
+ * an attempt for this item. Every other 409 is parked with the session-ended
+ * message, answer kept. A missing session, a missing child, and a routing 404
+ * stay retryable. 5xx stays retryable until the park limit. Other statuses
+ * return null so the caller keeps its existing mapping.
  */
 export function classifyAttemptFailure(
   status: number,
-  body: { error?: unknown; retryable?: unknown; code?: unknown } | null,
-): Extract<SyncPost, { ok: false; reason: "invalid_attempt" | "error" }> | null {
+  body: { error?: unknown; retryable?: unknown; code?: unknown; savedAttempt?: unknown } | null,
+): Extract<SyncPost, { ok: false; reason: "invalid_attempt" | "error" | "drop" | "park" }> | null {
   const unknownInstance = status === 404 && body?.code === "unknown_instance";
-  const alreadyUsed = status === 409 && body?.code === "already_locked";
-  const sessionEnded = status === 409 && body?.code === "session_ended";
-  if (
-    (status === 400 && body?.error === "invalid_attempt" && body.retryable === false) ||
-    unknownInstance ||
-    alreadyUsed ||
-    sessionEnded
-  ) {
+  if ((status === 400 && body?.error === "invalid_attempt" && body.retryable === false) || unknownInstance) {
     return { ok: false, reason: "invalid_attempt" };
+  }
+  if (status === 409 && body?.savedAttempt === true) {
+    return { ok: false, reason: "drop", message: "" };
+  }
+  if (status === 409) {
+    return { ok: false, reason: "park", message: interfaceCopy("offline.sessionEnded.kid") };
   }
   if (status >= 500) {
     return {
@@ -180,7 +216,10 @@ function readParked(value: unknown): ParkedAttempt[] {
       ...(typeof row.itemInstanceId === "string" ? { itemInstanceId: row.itemInstanceId } : {}),
       ...(typeof row.syncFailures === "number" ? { syncFailures: row.syncFailures } : {}),
       ...(typeof row.firstFailedAt === "string" ? { firstFailedAt: row.firstFailedAt } : {}),
-      message: interfaceCopy("offline.parked.kid"),
+      message:
+        row.message === interfaceCopy("offline.sessionEnded.kid")
+          ? interfaceCopy("offline.sessionEnded.kid")
+          : interfaceCopy("offline.parked.kid"),
     });
   }
   return parked;
@@ -272,6 +311,14 @@ export function createAttemptQueue(store: QueueStore) {
         return { ...store.load(), formatRejected: true };
       }
       const data = store.load();
+      // One live entry per issued item. A second Check while that entry is
+      // pending is ignored. The first answer stays. This guard is in the
+      // queue, not only on the disabled Check button.
+      const samePendingItem =
+        typeof attempt.itemInstanceId === "string" &&
+        attempt.itemInstanceId.length > 0 &&
+        data.pending.some((item) => item.itemInstanceId === attempt.itemInstanceId);
+      if (samePendingItem) return store.load();
       const known =
         data.pending.some((item) => item.idempotencyKey === attempt.idempotencyKey) ||
         data.synced.some((item) => item.idempotencyKey === attempt.idempotencyKey) ||
@@ -334,7 +381,7 @@ export function createAttemptQueue(store: QueueStore) {
             item.idempotencyKey === posted.result.idempotencyKey,
         );
         if (!already) data.synced.push(posted.result);
-        if (posted.result.resumePresentation === "quiet") quietCredits += 1;
+        if (posted.result.replayed || posted.result.resumePresentation === "quiet") quietCredits += 1;
       }
       data.parked = stillParked;
       store.save(remember(data));
@@ -384,6 +431,15 @@ export function createAttemptQueue(store: QueueStore) {
         }
         if (!posted.ok && posted.reason === "drop") {
           data.dropped.push(anonymize(attempt));
+          continue;
+        }
+        if (!posted.ok && posted.reason === "park") {
+          data.parked.push({
+            ...attempt,
+            syncFailures: attempt.syncFailures ?? 1,
+            firstFailedAt: attempt.firstFailedAt ?? now,
+            message: posted.message,
+          });
           continue;
         }
         if (!posted.ok && posted.reason === "format_rejected") {
