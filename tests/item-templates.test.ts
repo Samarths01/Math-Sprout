@@ -4237,7 +4237,7 @@ describe("item templates and issuance", () => {
     expect(db.prepare(`SELECT COUNT(*) AS count FROM attempts`).get()).toEqual({ count: 1 });
   });
 
-  it("saves a parked answer behind a newer attempt as a late replay", async () => {
+  it("saves a late replay with HonestAttempt and no concept tick or band transition", async () => {
     const db = tempDb();
     const { guardian, child, session } = granted(db, "late-replay@example.com");
     const token = createSession(db, guardian.id);
@@ -4339,6 +4339,14 @@ describe("item templates and issuance", () => {
       )
       .get(saved.attempts[0]?.id) as { qualifies: number };
     expect(honest.qualifies).toBe(1);
+    const kinds = (
+      db
+        .prepare(`SELECT kind FROM qualifying_events WHERE attempt_id = ? ORDER BY rowid`)
+        .all(saved.attempts[0]?.id) as Array<{ kind: string }>
+    ).map((row) => row.kind);
+    expect(kinds).toContain("HonestAttempt");
+    expect(kinds).not.toContain("ConceptProgressTick");
+    expect(kinds).not.toContain("MasteryBandTransition");
   });
 
   it("counts a parked answer normally when no newer attempt exists on that skill", async () => {
