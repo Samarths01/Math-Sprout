@@ -4159,7 +4159,61 @@ describe("item templates and issuance", () => {
     expect(capped.flags).not.toContain("too_fast");
     expect(readAttemptLog(db, capped.attemptId).latencyMs).toBe(ATTEMPT_LATENCY_CAP_MS);
     const summary = readParentSummary(db, guardian.id, child.id, longSubmitted);
-    expect(summary.minutes).toBe(PRACTICE_SESSION_LENGTH);
+    expect(summary.minutes).toBe(2);
+  });
+
+  it("clamps stored response time at 120 seconds and still counts the attempt", () => {
+    expect(ATTEMPT_LATENCY_CAP_MS).toBe(120_000);
+    const shown = "2026-06-15T18:00:00.000Z";
+    const at = (seconds: number) => new Date(Date.parse(shown) + seconds * 1_000).toISOString();
+    expect(responseLatencyMs(shown, at(119)) / 1_000).toBe(119);
+    expect(responseLatencyMs(shown, at(120)) / 1_000).toBe(120);
+    expect(responseLatencyMs(shown, at(121)) / 1_000).toBe(120);
+    expect(responseLatencyMs(shown, at(86_400)) / 1_000).toBe(120);
+
+    const db = tempDb();
+    const { guardian, child, session } = granted(db, "latency-bounds@example.com");
+    const spans = [119, 120, 121, 86_400] as const;
+    const storedSeconds: number[] = [];
+    let item = readItemInstance(db, session.item.itemInstanceId ?? "");
+    let sameDayAt = "";
+    for (const seconds of spans) {
+      if (!item) throw new Error("item was not issued");
+      const submittedAt = new Date(Date.parse(item.issuedAt) + seconds * 1_000).toISOString();
+      if (seconds === 121) sameDayAt = submittedAt;
+      const saved = submitAnswer(
+        db,
+        guardian.id,
+        child.id,
+        {
+          idempotencyKey: `latency-bound-${seconds}`,
+          sessionId: session.sessionId,
+          itemId: session.item.id,
+          itemInstanceId: item.itemInstanceId,
+          answer: item.canonicalAnswer,
+          shownAt: item.issuedAt,
+          submittedAt,
+        },
+        { now: submittedAt },
+      );
+      if (isFormatRejected(saved)) throw new Error("a readable answer was rejected");
+      const latencyMs = readAttemptLog(db, saved.attemptId).latencyMs;
+      storedSeconds.push(latencyMs / 1_000);
+      const row = db
+        .prepare(
+          `SELECT estimator_evidence AS evidence, evidence_reason AS reason
+           FROM attempts WHERE id = ?`,
+        )
+        .get(saved.attemptId) as { evidence: number; reason: string | null };
+      expect(row.evidence, `span ${seconds}`).toBe(1);
+      expect(row.reason).toBeNull();
+      expect(saved.flags).not.toContain("too_fast");
+      expect(saved.correct).toBe(true);
+      item = readItemInstance(db, saved.nextItem.itemInstanceId ?? "");
+    }
+    expect(storedSeconds).toEqual([119, 120, 120, 120]);
+    const summary = readParentSummary(db, guardian.id, child.id, sameDayAt);
+    expect(summary.minutes).toBe(Math.floor((119 + 120 + 120) / 60));
   });
 
   it("rejects a submitted time ahead of the server or before the item was issued", () => {

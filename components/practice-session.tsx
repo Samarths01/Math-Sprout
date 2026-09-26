@@ -223,9 +223,8 @@ function PracticeTurn({
   const [formatLocked, setFormatLocked] = useState(false);
   // shownAt is when this turn mounts, including after a reload. Check sends
   // that instant with submittedAt, and every retry sends the same pair.
+  // Counted response time is clamped to 120 seconds (ATTEMPT_LATENCY_CAP_MS).
   // SUBMITTED_AT_SKEW_MS (2 minutes) rejects a Check time ahead of the server.
-  // Counted response time is capped at the practice length, 15 minutes
-  // (ATTEMPT_LATENCY_CAP_MS), not at 2 minutes.
   const [shownAt] = useState(() => new Date().toISOString());
   const openedQuiet = useRef(initialQuiet);
   const answerLocked = savedOffline || heldNotice;

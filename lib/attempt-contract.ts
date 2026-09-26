@@ -1,4 +1,3 @@
-import { PRACTICE_SESSION_LENGTH } from "@/lib/session-plan";
 import type { WrongFormReason } from "@/lib/wrong-form-copy";
 
 export const FOUR_BEAT_KEYS = [
@@ -96,16 +95,17 @@ export const TOO_FAST_MS = 500;
 export const SPAM_WINDOW_MS = 10_000;
 
 /**
- * Counted response time for one try.
+ * Counted response time for one try, in milliseconds.
  * Latency is `submittedAt` minus `shownAt`. Both are captured on the device
  * when the child presses Check and are stored on the attempt. The server
  * does not use the time it receives the request.
- * There is no minutes-cap constant. One try counts at most
- * `PRACTICE_SESSION_LENGTH` minutes, so a skewed device clock cannot add
- * more than one session to the parent card. A negative or non-finite span
- * counts as 0, which the too-fast flag treats as too fast.
+ * One try counts at most 120 seconds. The parent-summary minutes rule uses
+ * this same constant, so the two cannot drift. A longer span is clamped.
+ * The attempt is still saved and can still count toward the band.
+ * A negative or non-finite span counts as 0, which the too-fast flag treats
+ * as too fast.
  */
-export const ATTEMPT_LATENCY_CAP_MS = PRACTICE_SESSION_LENGTH * 60_000;
+export const ATTEMPT_LATENCY_CAP_MS = 120_000;
 
 /**
  * A device Check time may lead the server clock by this much.
