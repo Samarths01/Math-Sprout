@@ -87,15 +87,20 @@ function holdCap(): Promise<void> {
 }
 
 let itemIndex = 0;
+let attemptPosts = 0;
 let root: Root | null = null;
 let container: HTMLDivElement | null = null;
 
-function installFetch(options?: { stallCap?: boolean }) {
+function installFetch(options?: { stallCap?: boolean; online?: boolean }) {
   itemIndex = 0;
+  attemptPosts = 0;
   capReleases.length = 0;
   window.localStorage.clear();
   window.sessionStorage.clear();
-  Object.defineProperty(window.navigator, "onLine", { value: true, configurable: true });
+  Object.defineProperty(window.navigator, "onLine", {
+    value: options?.online !== false,
+    configurable: true,
+  });
   window.fetch = async (input, init) => {
     const url = String(input);
     if (url.endsWith("/sessions") && init?.method === "POST") {
@@ -108,6 +113,7 @@ function installFetch(options?: { stallCap?: boolean }) {
       });
     }
     if (url.endsWith("/attempts") && init?.method === "POST") {
+      attemptPosts += 1;
       const body = JSON.parse(String(init.body)) as { idempotencyKey: string };
       const current = items[itemIndex] ?? items[items.length - 1];
       const next = items[itemIndex + 1] ?? followUpItem;
@@ -358,5 +364,71 @@ describe("practice answer state follows the item instance", () => {
     expect(check.disabled).toBe(false);
     expect(check.textContent).toContain("Check answer");
     expect(end.disabled).toBe(false);
+  });
+
+  async function renderPractice() {
+    container = document.createElement("div");
+    document.body.appendChild(container);
+    root = createRoot(container);
+    await act(async () => {
+      root?.render(
+        createElement(PracticeSession, { childId: "child-1", displayName: "Ada" }),
+      );
+    });
+    await waitFor(() => {
+      expect(document.querySelector('[data-testid="practice-answer"]')).not.toBeNull();
+    });
+  }
+
+  function pendingCount(): number {
+    const raw = window.localStorage.getItem("math-sprout-attempt-queue:child-1");
+    const data = raw ? (JSON.parse(raw) as { pending?: unknown[] }) : { pending: [] };
+    return data.pending?.length ?? 0;
+  }
+
+  async function clickCheck(times: number) {
+    const button = document.querySelector('[data-testid="practice-submit"]');
+    if (!(button instanceof HTMLButtonElement)) throw new Error("Check answer missing");
+    await act(async () => {
+      for (let click = 0; click < times; click += 1) button.click();
+    });
+  }
+
+  async function savedOfflineThenAdvance(clicks: number) {
+    installFetch({ online: false });
+    await renderPractice();
+    await typeAnswer("1");
+    await clickCheck(clicks);
+    await waitFor(() => {
+      expect(pendingCount()).toBe(1);
+    });
+    expect(attemptPosts).toBe(0);
+    await releaseOfflineCap();
+    await waitFor(() => {
+      expect(document.body.textContent).toContain("Saved on this device");
+    });
+    expect(attemptPosts).toBe(0);
+    expect(pendingCount()).toBe(1);
+
+    Object.defineProperty(window.navigator, "onLine", { value: true, configurable: true });
+    await act(async () => {
+      window.dispatchEvent(new Event("online"));
+    });
+    await waitFor(() => {
+      expect(document.querySelector('[data-testid="practice-prompt"]')?.textContent).toBe(
+        "What is 63 - 18?",
+      );
+    });
+    expect(attemptPosts).toBe(1);
+    expect(document.body.textContent).not.toContain("Saved on this device");
+    expect(pendingCount()).toBe(0);
+  }
+
+  it("advances a single offline check once the device reconnects", async () => {
+    await savedOfflineThenAdvance(1);
+  });
+
+  it("keeps one pending try when Check is tapped twice offline, then advances on reconnect", async () => {
+    await savedOfflineThenAdvance(2);
   });
 });

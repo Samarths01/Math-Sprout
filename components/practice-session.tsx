@@ -140,6 +140,17 @@ type MountedTurn = {
   apply: (command: TurnCommand) => void;
 };
 
+function armedAttemptKey(
+  snapshot: QueueSnapshot,
+  attemptedKey: string,
+  itemInstanceId: string | undefined,
+): string | null {
+  const open = [...snapshot.pending, ...snapshot.parked, ...snapshot.blocked];
+  if (open.some((entry) => entry.idempotencyKey === attemptedKey)) return attemptedKey;
+  const existing = open.find((entry) => entry.itemInstanceId === itemInstanceId);
+  return existing?.idempotencyKey ?? null;
+}
+
 function openItemQueue(snapshot: QueueSnapshot, itemInstanceId: string | undefined) {
   const parked = snapshot.parked.find((entry) => entry.itemInstanceId === itemInstanceId);
   const pending = snapshot.pending.find((entry) => entry.itemInstanceId === itemInstanceId);
@@ -227,6 +238,7 @@ function PracticeTurn({
   // SUBMITTED_AT_SKEW_MS (2 minutes) rejects a Check time ahead of the server.
   const [shownAt] = useState(() => new Date().toISOString());
   const openedQuiet = useRef(initialQuiet);
+  const submittingRef = useRef(false);
   const answerLocked = savedOffline || heldNotice;
 
   function markSavedOffline(value: boolean) {
@@ -288,7 +300,8 @@ function PracticeTurn({
 
   async function onSubmit(event: FormEvent) {
     event.preventDefault();
-    if (!shownAt || busy || formatLocked || savedOffline || heldNotice) return;
+    if (submittingRef.current || !shownAt || busy || formatLocked || savedOffline || heldNotice) return;
+    submittingRef.current = true;
     setBusy(true);
     setError(null);
     try {
@@ -323,7 +336,7 @@ function PracticeTurn({
         await onOfflineCap(OFFLINE_QUEUE_CAP);
         return;
       }
-      const idempotencyKey = crypto.randomUUID();
+      let idempotencyKey = crypto.randomUUID();
       const queued: QueuedAttempt = {
         idempotencyKey,
         childId,
@@ -334,8 +347,11 @@ function PracticeTurn({
         submittedAt: new Date().toISOString(), // Check time. Retries send this pair unchanged.
         ...(item.itemInstanceId ? { itemInstanceId: item.itemInstanceId } : {}),
       };
+      const saved = queue().enqueue(queued);
+      const armedKey = armedAttemptKey(saved, idempotencyKey, queued.itemInstanceId);
+      if (!armedKey) return;
+      idempotencyKey = armedKey;
       armWaiting(instanceId, idempotencyKey);
-      queue().enqueue(queued);
       const snapshot = await flush();
       const synced = snapshot.synced.find((result) => result.idempotencyKey === idempotencyKey);
       if (synced && showResumeCelebration(synced)) {
@@ -364,6 +380,7 @@ function PracticeTurn({
         setFeedback(null);
       }
     } finally {
+      submittingRef.current = false;
       setBusy(false);
     }
   }
