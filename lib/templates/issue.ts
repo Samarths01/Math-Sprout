@@ -848,6 +848,56 @@ function unansweredCount(db: Database.Database, sessionId: string): number {
   return row.count;
 }
 
+/**
+ * Cap count for a new batch. Unconsumed items issued before the current
+ * screen item are an abandoned prefetch. They do not keep the cap full
+ * after the session has moved on.
+ */
+function outstandingUnanswered(db: Database.Database, sessionId: string): number {
+  const session = db
+    .prepare(`SELECT slot_seq AS slotSeq FROM practice_sessions WHERE id = ?`)
+    .get(sessionId) as { slotSeq: number } | undefined;
+  if (!session) return unansweredCount(db, sessionId);
+  const screen = db
+    .prepare(
+      `SELECT rowid AS rowId FROM item_instances
+       WHERE session_id = ? AND issue_idempotency_key = ?`,
+    )
+    .get(sessionId, sessionSlotKey(sessionId, session.slotSeq)) as { rowId: number } | undefined;
+  if (!screen) return unansweredCount(db, sessionId);
+  const row = db
+    .prepare(
+      `SELECT COUNT(*) AS count FROM item_instances
+       WHERE session_id = ? AND consumed_at IS NULL AND rowid >= ?`,
+    )
+    .get(sessionId, screen.rowId) as { count: number };
+  return row.count;
+}
+
+/** A newer batch supersedes prefetches issued before the item now on screen. */
+function abandonSupersededPrefetch(
+  db: Database.Database,
+  sessionId: string,
+  consumedAt: string,
+): void {
+  const session = db
+    .prepare(`SELECT slot_seq AS slotSeq FROM practice_sessions WHERE id = ?`)
+    .get(sessionId) as { slotSeq: number } | undefined;
+  if (!session) return;
+  const screen = db
+    .prepare(
+      `SELECT rowid AS rowId FROM item_instances
+       WHERE session_id = ? AND issue_idempotency_key = ?`,
+    )
+    .get(sessionId, sessionSlotKey(sessionId, session.slotSeq)) as { rowId: number } | undefined;
+  if (!screen) return;
+  db.prepare(
+    `UPDATE item_instances
+     SET consumed_at = ?, consumed_by_attempt_key = ?
+     WHERE session_id = ? AND consumed_at IS NULL AND rowid < ?`,
+  ).run(consumedAt, "abandoned-prefetch", sessionId, screen.rowId);
+}
+
 function batchAlreadyIssued(
   db: Database.Database,
   sessionId: string,
@@ -881,7 +931,8 @@ export function issueItemBatch(
   }
   const prior = batchAlreadyIssued(db, input.sessionId, input.idempotencyKey, input.count);
   if (prior) return prior;
-  const room = OUTSTANDING_UNANSWERED_CAP - unansweredCount(db, input.sessionId);
+  abandonSupersededPrefetch(db, input.sessionId, input.now ?? new Date().toISOString());
+  const room = OUTSTANDING_UNANSWERED_CAP - outstandingUnanswered(db, input.sessionId);
   const toIssue = Math.min(input.count, Math.max(0, room));
   const issued: ItemInstance[] = [];
   for (let slot = 0; slot < toIssue; slot += 1) {
@@ -984,6 +1035,21 @@ export function consumeItemInstance(
     )
     .run(consumedAt, attemptKey, instance.itemInstanceId);
   if (result.changes !== 1) {
-    throw new DomainError("That problem is already locked.", 409);
+    throw new DomainError(
+      "That problem is already locked.",
+      409,
+      undefined,
+      undefined,
+      "already_locked",
+      instanceHasSavedAttempt(db, instance.itemInstanceId),
+    );
   }
+}
+
+/** An attempts row, not a consumed flag. Abandoned prefetches are not saved answers. */
+export function instanceHasSavedAttempt(db: Database.Database, itemInstanceId: string): boolean {
+  const row = db
+    .prepare(`SELECT 1 AS ok FROM attempts WHERE item_instance_id = ? LIMIT 1`)
+    .get(itemInstanceId) as { ok: number } | undefined;
+  return row !== undefined;
 }

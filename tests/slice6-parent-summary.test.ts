@@ -184,7 +184,7 @@ describe("parent one-breath summary", () => {
     );
     const summary = summaryOf(db, guardian.id, child.id);
     expect(summary.practiced).toBe(true);
-    expect(summary.minutes).toBe(13);
+    expect(summary.minutes).toBe(3);
     expect(summary.focusConcept).toBe("adding two-digit numbers");
     expect(summary.bandMovement).toEqual({
       from: null,
@@ -192,14 +192,14 @@ describe("parent one-breath summary", () => {
       moved: false,
     });
     expect(summary.story).toBe(
-      "Today · 13 min. Focus: adding two-digit numbers. Still learning.",
+      "Today · 3 min. Focus: adding two-digit numbers. Still learning.",
     );
     expect(summary.story).not.toContain("→");
     expect(summary.story).not.toContain("comparing unit fractions");
     expect(summary.story).not.toContain("Got it");
     assertDerivedOnly(summary, [short.attemptId, long.attemptId, short.idempotencyKey]);
     const html = renderToStaticMarkup(createElement(ParentOneBreathCard, { summary }));
-    expect(html).toContain("Today · 13 min");
+    expect(html).toContain("Today · 3 min");
     expect(html).toContain("Focus: adding two-digit numbers");
     expect(html).toContain("Still learning");
     expect(html).not.toContain("href");
@@ -261,7 +261,7 @@ describe("parent one-breath summary", () => {
       ),
     );
     const summary = summaryOf(db, guardian.id, child.id);
-    expect(summary.minutes).toBe(12);
+    expect(summary.minutes).toBe(4);
     expect(summary.focusConcept).toBe("adding two-digit numbers");
     expect(summary.bandMovement).toEqual({
       from: "Still learning",
@@ -269,9 +269,9 @@ describe("parent one-breath summary", () => {
       moved: true,
     });
     expect(summary.story).toBe(
-      "Today · 12 min. Focus: adding two-digit numbers. Still learning → Getting it.",
+      "Today · 4 min. Focus: adding two-digit numbers. Still learning → Getting it.",
     );
-    expect(glanceMinutes(summary)).toBe("Today · 12 min");
+    expect(glanceMinutes(summary)).toBe("Today · 4 min");
     expect(glanceFocus(summary.focusConcept)).toBe("Focus: adding two-digit numbers");
     expect(glanceBand(summary.bandMovement)).toBe("Still learning → Getting it");
     expect(summary.story).not.toContain("Got it");

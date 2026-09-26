@@ -1,5 +1,5 @@
 import type Database from "better-sqlite3";
-import type { BandLabel } from "@/lib/attempt-contract";
+import { ATTEMPT_LATENCY_CAP_MS, responseLatencyMs, type BandLabel } from "@/lib/attempt-contract";
 import { getChild } from "@/lib/domain";
 import { interfaceCopy } from "@/lib/interface-copy";
 import { catalogItem } from "@/lib/item-catalog";
@@ -59,12 +59,6 @@ function isBandLabel(value: unknown): value is BandLabel {
   );
 }
 
-function elapsedMs(shownAt: string, submittedAt: string): number {
-  const ms = Date.parse(submittedAt) - Date.parse(shownAt);
-  if (!Number.isFinite(ms) || ms < 0) return 0;
-  return ms;
-}
-
 export function glanceMinutes(summary: Pick<ParentSummary, "practiced" | "minutes">): string {
   if (!summary.practiced) return "Today · no practice yet";
   if (summary.minutes <= 0) return "Today · under a minute";
@@ -122,6 +116,11 @@ function heldBand(
   return isBandLabel(row?.band_label) ? row.band_label : null;
 }
 
+/** One item counts at most `ATTEMPT_LATENCY_CAP_MS` (120 seconds) toward minutes. */
+function countedResponseMs(shownAt: string, submittedAt: string): number {
+  return Math.min(responseLatencyMs(shownAt, submittedAt), ATTEMPT_LATENCY_CAP_MS);
+}
+
 /**
  * Focus is the skill with the most committed answering time today.
  * The same skill's latest band transition is the movement. Other skills
@@ -135,7 +134,7 @@ function focusConcept(
     const skill = catalogItem(span.item_id)?.skill;
     if (!skill) continue;
     const current = bySkill.get(skill) ?? { ms: 0, last: span.submitted_at };
-    current.ms += elapsedMs(span.shown_at, span.submitted_at);
+    current.ms += countedResponseMs(span.shown_at, span.submitted_at);
     if (span.submitted_at >= current.last) current.last = span.submitted_at;
     bySkill.set(skill, current);
   }
@@ -200,7 +199,7 @@ export function readParentSummary(
   );
   const practiced = today.length > 0;
   const minutes = Math.floor(
-    today.reduce((sum, span) => sum + elapsedMs(span.shown_at, span.submitted_at), 0) /
+    today.reduce((sum, span) => sum + countedResponseMs(span.shown_at, span.submitted_at), 0) /
       60_000,
   );
   const focus = practiced ? focusConcept(today) : null;

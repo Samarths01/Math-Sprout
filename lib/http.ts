@@ -88,7 +88,13 @@ export async function requireGuardian(): Promise<Guardian> {
 
 export function publicErrorBody(error: unknown): {
   status: number;
-  body: { error: string; retryable?: false; queueDisposition?: "hold" | "drop" };
+  body: {
+    error: string;
+    retryable?: false;
+    queueDisposition?: "hold" | "drop";
+    code?: string;
+    savedAttempt?: true;
+  };
 } {
   if (error instanceof DomainError && error.permanentCode === "invalid_attempt") {
     return { status: 400, body: { error: "invalid_attempt", retryable: false } };
@@ -98,6 +104,9 @@ export function publicErrorBody(error: unknown): {
       status: error.status,
       body: {
         error: error.message,
+        ...(error.code ? { code: error.code } : {}),
+        ...(error.code === "session_ended" ? { retryable: false as const } : {}),
+        ...(error.savedAttempt ? { savedAttempt: true as const } : {}),
         ...(error.queueDisposition ? { queueDisposition: error.queueDisposition } : {}),
       },
     };

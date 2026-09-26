@@ -1,8 +1,9 @@
 import type Database from "better-sqlite3";
-import type {
-  ClientView,
-  IntegrityFlag,
-  ReviewLane,
+import {
+  responseLatencyMs,
+  type ClientView,
+  type IntegrityFlag,
+  type ReviewLane,
 } from "@/lib/attempt-contract";
 import { DomainError } from "@/lib/domain";
 import { catalogItem } from "@/lib/item-catalog";
@@ -89,7 +90,7 @@ export function readAttemptLog(
     practiceLane: row.practice_lane,
     integrityLane: row.lane,
     correct: row.correct === 1,
-    latencyMs: Date.parse(row.submitted_at) - Date.parse(row.shown_at),
+    latencyMs: responseLatencyMs(row.shown_at, row.submitted_at),
     flags: JSON.parse(row.flags_json) as IntegrityFlag[],
     clientView,
   };

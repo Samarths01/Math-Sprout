@@ -153,6 +153,12 @@ export function migrateItemTemplates(db: Database.Database): void {
     "outcome",
     "outcome TEXT CHECK (outcome IS NULL OR outcome IN ('correct', 'incorrect', 'form_mismatch'))",
   );
+  addAttemptColumn(db, "evidence_reason", "evidence_reason TEXT");
+  addAttemptColumn(
+    db,
+    "submitted_at_clamped",
+    "submitted_at_clamped INTEGER NOT NULL DEFAULT 0 CHECK (submitted_at_clamped IN (0, 1))",
+  );
   if (addSessionColumn(db, "slot_seq", "slot_seq INTEGER NOT NULL DEFAULT 0")) {
     db.exec(`UPDATE practice_sessions SET slot_seq = item_index`);
   }

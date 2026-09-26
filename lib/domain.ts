@@ -19,6 +19,13 @@ export class DomainError extends Error {
     readonly queueDisposition?: "hold" | "drop",
     /** Permanent client code. The HTTP body uses this instead of the message. */
     readonly permanentCode?: "invalid_attempt",
+    /** Typed failure. The HTTP body keeps the message and adds this code. */
+    readonly code?: "unknown_instance" | "already_locked" | "session_ended" | "submitted_at_invalid",
+    /**
+     * True only when an attempts row already exists for this item.
+     * A consumed row with no attempt (an abandoned prefetch) leaves this unset.
+     */
+    readonly savedAttempt?: boolean,
   ) {
     super(message);
     this.name = "DomainError";

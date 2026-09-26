@@ -296,6 +296,9 @@ describe("child route ownership", () => {
     const issued = getDb()
       .prepare(`SELECT canonical_answer AS answer FROM item_instances WHERE item_instance_id = ?`)
       .get(itemInstanceId) as { answer: string };
+    getDb()
+      .prepare(`UPDATE item_instances SET issued_at = ? WHERE item_instance_id = ? AND issued_at > ?`)
+      .run("2026-04-01T00:00:00.000Z", itemInstanceId, "2026-04-01T00:00:02.000Z");
     const attempt = await call(
       submitAttemptRoute,
       `http://127.0.0.1/api/children/${childId}/attempts`,

@@ -93,6 +93,26 @@ export type AttemptResult = FourBeat & {
 
 export const TOO_FAST_MS = 500;
 export const SPAM_WINDOW_MS = 10_000;
+
+/**
+ * Counted response time for one try, in milliseconds.
+ * Latency is `submittedAt` minus `shownAt`. Both are captured on the device
+ * when the child presses Check and are stored on the attempt. The server
+ * does not use the time it receives the request.
+ * One try counts at most 120 seconds. The parent-summary minutes rule uses
+ * this same constant, so the two cannot drift. A longer span is clamped.
+ * The attempt is still saved and can still count toward the band.
+ * A negative or non-finite span counts as 0, which the too-fast flag treats
+ * as too fast.
+ */
+export const ATTEMPT_LATENCY_CAP_MS = 120_000;
+
+export function responseLatencyMs(shownAt: string, submittedAt: string): number {
+  const raw = Date.parse(submittedAt) - Date.parse(shownAt);
+  if (!Number.isFinite(raw) || raw < 0) return 0;
+  if (raw > ATTEMPT_LATENCY_CAP_MS) return ATTEMPT_LATENCY_CAP_MS;
+  return raw;
+}
 /** Earlier attempts allowed inside the window before the next one is spam. */
 export const SPAM_MAX_IN_WINDOW = 8;
 
@@ -102,6 +122,7 @@ export const XP_AMOUNT: Record<CelebrationTier, number> = {
   full: 5,
 };
 
+/** `elapsedMs` is `responseLatencyMs`: the capped device span, not receipt time. */
 export function integrityFlags(input: {
   answer: string;
   elapsedMs: number;

@@ -3,6 +3,7 @@ import type Database from "better-sqlite3";
 import {
   FOUR_BEAT_KEYS,
   integrityFlags,
+  responseLatencyMs,
   type AttemptResult,
   type FourBeat,
   type IntegrityFlag,
@@ -53,6 +54,7 @@ import {
   consumeItemInstance,
   focusForStoredAnswer,
   gradeStoredAnswer,
+  instanceHasSavedAttempt,
   presentIssuedItem,
   readItemInstance,
 } from "@/lib/templates/issue";
@@ -129,12 +131,51 @@ function requireText(value: unknown, label: string): string {
   return value.trim();
 }
 
+function requireInstant(value: unknown, label: string): string {
+  if (typeof value !== "string" || value.trim().length === 0) {
+    throw new DomainError(
+      `${label} must be a valid time.`,
+      400,
+      undefined,
+      undefined,
+      "submitted_at_invalid",
+    );
+  }
+  return parseInstant(value, label);
+}
+
 function parseInstant(value: string, label: string): string {
   const ms = Date.parse(value);
   if (!Number.isFinite(ms)) {
-    throw new DomainError(`${label} must be a valid time.`, 400);
+    throw new DomainError(
+      `${label} must be a valid time.`,
+      400,
+      undefined,
+      undefined,
+      "submitted_at_invalid",
+    );
   }
   return new Date(ms).toISOString();
+}
+
+/**
+ * Store the device Check time inside [issued_at, server receive time].
+ * A slow clock moves up to issue. A fast clock moves down to receive.
+ * Neither case is rejected. The flag is informational and gates nothing.
+ * Response time stays the raw device shown-to-Check span.
+ */
+function clampSubmittedAt(
+  deviceSubmittedAt: string,
+  receivedAtMs: number,
+  issuedAt?: string,
+): { stored: string; clamped: 0 | 1 } {
+  const deviceMs = Date.parse(deviceSubmittedAt);
+  const lower = issuedAt !== undefined ? Date.parse(issuedAt) : Number.NEGATIVE_INFINITY;
+  const storedMs = Math.min(Math.max(deviceMs, lower), receivedAtMs);
+  return {
+    stored: new Date(storedMs).toISOString(),
+    clamped: storedMs === deviceMs ? 0 : 1,
+  };
 }
 
 export function parseSubmitAttempt(
@@ -158,8 +199,8 @@ export function parseSubmitAttempt(
   if (body.answer.length > 80) {
     throw new DomainError("Answer is too long.", 400);
   }
-  const shownAt = requireText(body.shownAt, "Shown time");
-  const submittedAt = requireText(body.submittedAt, "Submitted time");
+  const shownAt = requireInstant(body.shownAt, "Shown time");
+  const submittedAt = requireInstant(body.submittedAt, "Submitted time");
   const itemInstanceId =
     typeof body.itemInstanceId === "string" && body.itemInstanceId.trim().length > 0
       ? body.itemInstanceId.trim()
@@ -450,6 +491,32 @@ export function startPracticeSession(
   return presentSession(db, childId, open.immediate());
 }
 
+/**
+ * A later item of this skill already has a saved attempt.
+ * Compared on server `issued_at` only. Device clocks are not read.
+ */
+function skillHasLaterIssuedAttempt(
+  db: Database.Database,
+  childId: string,
+  skillId: string,
+  issuedAt: string,
+): boolean {
+  const row = db
+    .prepare(
+      `SELECT 1 AS ok
+       FROM attempts a
+       JOIN item_instances later ON later.item_instance_id = a.item_instance_id
+       JOIN item_template_versions t
+         ON t.template_id = later.template_id AND t.template_version = later.template_version
+       WHERE a.child_id = ?
+         AND t.skill_id = ?
+         AND later.issued_at > ?
+       LIMIT 1`,
+    )
+    .get(childId, skillId, issuedAt) as { ok: number } | undefined;
+  return row !== undefined;
+}
+
 export function submitAnswer(
   db: Database.Database,
   guardianId: string,
@@ -468,7 +535,9 @@ export function submitAnswer(
     throw new DomainError("Answer must be a string up to 80 characters.", 400);
   }
   const shownAt = parseInstant(input.shownAt, "Shown time");
-  const submittedAt = parseInstant(input.submittedAt, "Submitted time");
+  const deviceSubmittedAt = parseInstant(input.submittedAt, "Submitted time");
+  const requestedNow = options?.now ? Date.parse(options.now) : Number.NaN;
+  const receivedAtMs = Number.isFinite(requestedNow) ? requestedNow : Date.parse(nowIso());
   const sessionId = input.sessionId.trim();
   const itemId = input.itemId.trim();
   getChild(db, guardianId, childId);
@@ -490,26 +559,34 @@ export function submitAnswer(
       throw new DomainError(
         "This session has ended. Choose a lane to start the next one.",
         409,
+        undefined,
+        undefined,
+        "session_ended",
       );
     }
     const item = catalogItem(itemId);
     if (!item) throw new DomainError("That problem is not in this practice pack.", 400);
 
-    const windowStart = new Date(
-      Date.parse(submittedAt) - SPAM_WINDOW_MS,
-    ).toISOString();
-    const prior = db
-      .prepare(
-        `SELECT COUNT(*) AS count FROM attempts
-         WHERE child_id = ? AND submitted_at > ? AND submitted_at <= ?`,
-      )
-      .get(childId, windowStart, submittedAt) as { count: number };
-    const elapsedMs = Date.parse(submittedAt) - Date.parse(shownAt);
-    const flags = integrityFlags({
-      answer: input.answer,
-      elapsedMs,
-      priorInWindow: prior.count,
-    });
+    let submittedAt = deviceSubmittedAt;
+    let submittedAtClamped: 0 | 1 = 0;
+    let flags: IntegrityFlag[] = [];
+    const bindClock = (issuedAt?: string) => {
+      const clock = clampSubmittedAt(deviceSubmittedAt, receivedAtMs, issuedAt);
+      submittedAt = clock.stored;
+      submittedAtClamped = clock.clamped;
+      const windowStart = new Date(Date.parse(submittedAt) - SPAM_WINDOW_MS).toISOString();
+      const prior = db
+        .prepare(
+          `SELECT COUNT(*) AS count FROM attempts
+           WHERE child_id = ? AND submitted_at > ? AND submitted_at <= ?`,
+        )
+        .get(childId, windowStart, submittedAt) as { count: number };
+      flags = integrityFlags({
+        answer: input.answer,
+        elapsedMs: responseLatencyMs(shownAt, deviceSubmittedAt),
+        priorInWindow: prior.count,
+      });
+    };
     let correct = false;
     let beats: FourBeat;
     let economy: {
@@ -523,6 +600,7 @@ export function submitAnswer(
     let templateId: string | null = null;
     let difficultyStep: number | null = null;
     let estimatorEvidence: number | null = null;
+    let evidenceReason: string | null = null;
     let attemptOutcome: "correct" | "incorrect" | "form_mismatch" = "incorrect";
     const skipEconomy = false;
 
@@ -535,13 +613,35 @@ export function submitAnswer(
 
     if (input.itemInstanceId) {
       const instance = readItemInstance(db, input.itemInstanceId);
-      if (!instance) throw new DomainError("That problem is not in this practice pack.", 404);
+      if (!instance) {
+        throw new DomainError(
+          "That problem is not in this practice pack.",
+          404,
+          undefined,
+          undefined,
+          "unknown_instance",
+        );
+      }
       if (instance.childId !== childId || instance.sessionId !== sessionId) {
-        throw new DomainError("That problem is already locked.", 409);
+        throw new DomainError(
+          "That problem is already locked.",
+          409,
+          undefined,
+          undefined,
+          "already_locked",
+        );
       }
       if (instance.consumedAt) {
-        throw new DomainError("That problem is already locked.", 409);
+        throw new DomainError(
+          "That problem is already locked.",
+          409,
+          undefined,
+          undefined,
+          "already_locked",
+          instanceHasSavedAttempt(db, instance.itemInstanceId),
+        );
       }
+      bindClock(instance.issuedAt);
       const skillRow = db
         .prepare(
           `SELECT skill_id FROM item_template_versions
@@ -612,7 +712,12 @@ export function submitAnswer(
       const formMiss = verdict === "form_mismatch";
       const valueMiss = verdict === "incorrect" || formMiss;
       attemptOutcome = formMiss ? "form_mismatch" : correct ? "correct" : "incorrect";
-      estimatorEvidence = instance.evidenceEligible ? 1 : 0;
+      const lateReplay =
+        skillRow !== undefined &&
+        skillHasLaterIssuedAttempt(db, childId, skillRow.skill_id, instance.issuedAt);
+      const countsAsEvidence = instance.evidenceEligible && !lateReplay;
+      estimatorEvidence = countsAsEvidence ? 1 : 0;
+      evidenceReason = lateReplay ? "late_replay" : null;
       if (formMiss && flags.length === 0 && instance.requireForm) {
         const copy = wrongFormCopy({
           typed: normalizedTypedAnswer(input.answer),
@@ -652,14 +757,15 @@ export function submitAnswer(
         practiceLane: session.practice_lane,
         history: evidenceForSkill(db, childId, skillItem.skill),
         previousBand: savedView?.bandLabel ?? null,
-        countsForBand: instance.evidenceEligible,
+        countsForBand: countsAsEvidence,
         savedClientView: savedView,
       });
-      if (instance.evidenceEligible) {
+      if (countsAsEvidence) {
         saveSkillState(db, childId, skillItem.skill, economy.clientView);
       }
       consumeItemInstance(db, instance, idempotencyKey, submittedAt);
     } else {
+      bindClock();
       correct = gradeAnswer(itemId, input.answer);
       economy = planAttemptEconomy(db, {
         childId,
@@ -691,12 +797,14 @@ export function submitAnswer(
          id, child_id, session_id, idempotency_key, item_id, answer, shown_at,
          submitted_at, correct, lane, celebration_tier, flags_json, beats_json,
          client_view_json, created_at, policy_version, build_sha, resume_presentation,
-         item_instance_id, template_id, difficulty_step, estimator_evidence, outcome
+         item_instance_id, template_id, difficulty_step, estimator_evidence, outcome,
+         evidence_reason, submitted_at_clamped
        ) VALUES (
          @id, @child_id, @session_id, @idempotency_key, @item_id, @answer, @shown_at,
          @submitted_at, @correct, @lane, @celebration_tier, @flags_json, @beats_json,
          @client_view_json, @created_at, @policy_version, @build_sha, @resume_presentation,
-         @item_instance_id, @template_id, @difficulty_step, @estimator_evidence, @outcome
+         @item_instance_id, @template_id, @difficulty_step, @estimator_evidence, @outcome,
+         @evidence_reason, @submitted_at_clamped
        )`,
     ).run({
       id: attemptId,
@@ -722,6 +830,8 @@ export function submitAnswer(
       difficulty_step: difficultyStep,
       estimator_evidence: estimatorEvidence,
       outcome: attemptOutcome,
+      evidence_reason: evidenceReason,
+      submitted_at_clamped: submittedAtClamped,
     });
     if (!skipEconomy) commitAttemptEconomy(db, {
       childId,

@@ -4,16 +4,27 @@ import path from "node:path";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { POST as submitAttemptRoute } from "@/app/api/children/[id]/attempts/route";
+import { POST as issueItemsRoute } from "@/app/api/children/[id]/sessions/[sessionId]/items/route";
 import Database from "better-sqlite3";
-import type { AttemptResult } from "@/lib/attempt-contract";
+import {
+  ATTEMPT_LATENCY_CAP_MS,
+  responseLatencyMs,
+  type AttemptResult,
+} from "@/lib/attempt-contract";
 import { currentAppBuildSha } from "@/lib/app-build";
 import { parseAnswer, rationalsEqual } from "@/lib/answer-parser";
 import { advancePracticeSlot, parseSubmitAttempt, startPracticeSession, submitAnswer, submitAttempt } from "@/lib/attempts";
+import { readAttemptLog } from "@/lib/attempt-log";
+import { choosePracticeLane, endPracticeSession } from "@/lib/boundary";
+import { interfaceCopy } from "@/lib/interface-copy";
+import { localDate } from "@/lib/local-time";
 import { AnswerBlank } from "@/components/answer-blank";
 import { PracticeProblem } from "@/components/practice-problem";
+import { ParkedAttemptNotice } from "@/components/practice-session";
 import { PracticeFeedback } from "@/components/practice-feedback";
 import { openDatabase } from "@/lib/db";
-import { DomainError, createChild, createGuardian, getChildHome, setConsent } from "@/lib/domain";
+import { DomainError, createChild, createGuardian, createSession, getChildHome, setConsent } from "@/lib/domain";
 import { publicErrorBody } from "@/lib/http";
 import { readParentSummary } from "@/lib/parent-summary";
 import { SKILLS, TEMPLATE_VERSIONS, generatedTemplates, newestTemplate } from "@/lib/templates/catalog";
@@ -88,10 +99,19 @@ import {
   startIndexForLane,
 } from "@/lib/learner-state";
 import {
+  QUEUE_PARK_AFTER_FAILURES,
+  QUEUE_PARK_AFTER_MS,
+  QUEUE_RETRY_TIMEOUT_MS,
+  advanceAfterQueuedSync,
   classifyAttemptFailure,
   createAttemptQueue,
+  issueAfterQueueDrain,
   memoryQueueStore,
+  parkedRetryFailure,
   reloadLiveSession,
+  runShownSession,
+  runSingleFlightFlush,
+  storageQueueStore,
   type QueuedAttempt,
 } from "@/lib/offline-queue";
 import { provisionalVerdict } from "@/lib/provisional-verdict";
@@ -111,6 +131,17 @@ import {
   type WrongFormRequired,
 } from "@/lib/wrong-form-copy";
 
+const cookieState = vi.hoisted(() => ({ token: undefined as string | undefined }));
+
+vi.mock("next/headers", () => ({
+  cookies: async () => ({
+    get(name: string) {
+      if (!cookieState.token || name !== "math_sprout_session") return undefined;
+      return { name, value: cookieState.token };
+    },
+  }),
+}));
+
 const cleanups: Array<() => void> = [];
 const WHEN = "2026-06-15T18:00:00.000Z";
 
@@ -125,8 +156,72 @@ function tempDb(): Database.Database {
 }
 
 afterEach(() => {
+  const globalForDb = globalThis as typeof globalThis & { __mathSproutDb?: Database.Database };
+  delete globalForDb.__mathSproutDb;
+  cookieState.token = undefined;
   while (cleanups.length > 0) cleanups.pop()?.();
 });
+
+async function postAttemptRoute(
+  db: Database.Database,
+  token: string,
+  childId: string,
+  payload: QueuedAttempt,
+): Promise<{
+  status: number;
+  body: {
+    error?: string;
+    code?: string;
+    retryable?: boolean;
+    attemptId?: string;
+    savedAttempt?: boolean;
+    replayed?: boolean;
+  };
+}> {
+  const globalForDb = globalThis as typeof globalThis & { __mathSproutDb?: Database.Database };
+  globalForDb.__mathSproutDb = db;
+  cookieState.token = token;
+  const response = await submitAttemptRoute(
+    new Request(`http://127.0.0.1/api/children/${childId}/attempts`, {
+      method: "POST",
+      headers: { "content-type": "application/json", host: "127.0.0.1" },
+      body: JSON.stringify(payload),
+    }),
+    { params: Promise.resolve({ id: childId }) },
+  );
+  const body = (await response.json()) as {
+    error?: string;
+    code?: string;
+    retryable?: boolean;
+    attemptId?: string;
+    savedAttempt?: boolean;
+    replayed?: boolean;
+  };
+  return { status: response.status, body };
+}
+
+async function postItemsRoute(
+  db: Database.Database,
+  token: string,
+  childId: string,
+  sessionId: string,
+  idempotencyKey: string,
+  count: number,
+): Promise<{ status: number; body: { error?: string; items?: Array<{ itemInstanceId?: string }> } }> {
+  const globalForDb = globalThis as typeof globalThis & { __mathSproutDb?: Database.Database };
+  globalForDb.__mathSproutDb = db;
+  cookieState.token = token;
+  const response = await issueItemsRoute(
+    new Request(`http://127.0.0.1/api/children/${childId}/sessions/${sessionId}/items`, {
+      method: "POST",
+      headers: { "content-type": "application/json", host: "127.0.0.1" },
+      body: JSON.stringify({ idempotencyKey, count }),
+    }),
+    { params: Promise.resolve({ id: childId, sessionId }) },
+  );
+  const body = (await response.json()) as { error?: string; items?: Array<{ itemInstanceId?: string }> };
+  return { status: response.status, body };
+}
 
 function granted(db: Database.Database, email = "parent@example.com") {
   const guardian = createGuardian(db, {
@@ -144,6 +239,14 @@ function shown(): string {
   return new Date(Date.parse(WHEN) - 2_000).toISOString();
 }
 
+/** A fixture clock can sit before the wall-clock issue time. Pull issued_at back so the device time is still on or after it. */
+function issueBeforeSubmit(db: Database.Database, itemInstanceId: string, submittedAt: string): void {
+  db.prepare(
+    `UPDATE item_instances SET issued_at = ?
+     WHERE item_instance_id = ? AND issued_at > ?`,
+  ).run(new Date(Date.parse(submittedAt) - 1_000).toISOString(), itemInstanceId, submittedAt);
+}
+
 function xpCount(db: Database.Database, attemptId?: string): number {
   const row = attemptId
     ? (db.prepare(`SELECT COUNT(*) AS count FROM xp_events WHERE attempt_id = ?`).get(attemptId) as {
@@ -151,6 +254,38 @@ function xpCount(db: Database.Database, attemptId?: string): number {
       })
     : (db.prepare(`SELECT COUNT(*) AS count FROM xp_events`).get() as { count: number });
   return row.count;
+}
+
+/** The first saved attempt is the evidence. A later sync must leave this row alone. */
+function savedItemEvidence(db: Database.Database, itemInstanceId: string) {
+  const attempts = db
+    .prepare(
+      `SELECT id, idempotency_key AS idempotencyKey, outcome, correct, flags_json AS flags
+       FROM attempts WHERE item_instance_id = ?
+       ORDER BY created_at, id`,
+    )
+    .all(itemInstanceId) as Array<{
+    id: string;
+    idempotencyKey: string;
+    outcome: string | null;
+    correct: number;
+    flags: string;
+  }>;
+  const xp = db
+    .prepare(
+      `SELECT xp.id, xp.attempt_id AS attemptId, xp.amount, xp.celebration_tier AS celebrationTier
+       FROM xp_events xp
+       JOIN attempts a ON a.id = xp.attempt_id
+       WHERE a.item_instance_id = ?
+       ORDER BY xp.minted_at, xp.id`,
+    )
+    .all(itemInstanceId) as Array<{
+    id: string;
+    attemptId: string;
+    amount: number;
+    celebrationTier: string;
+  }>;
+  return { attempts, xp };
 }
 
 const MAX_SKILL_SWITCH_RATE = 0.1;
@@ -1558,6 +1693,7 @@ describe("item templates and issuance", () => {
        WHERE template_id = ? AND template_version = ?`,
     ).run(issued.templateId, version);
     const before = evidenceForSkill(db, child.id, session.item.skill);
+    issueBeforeSubmit(db, issued.itemInstanceId, WHEN);
     const result = submitAttempt(
       db,
       guardian.id,
@@ -1632,6 +1768,7 @@ describe("item templates and issuance", () => {
     ).toThrow(DomainError);
     expect(xpCount(db)).toBe(0);
 
+    issueBeforeSubmit(db, issued.itemInstanceId, WHEN);
     const scored = submitAttempt(
       db,
       guardian.id,
@@ -1675,6 +1812,7 @@ describe("item templates and issuance", () => {
     const { guardian, child, session } = granted(db);
     const issued = readItemInstance(db, session.item.itemInstanceId ?? "");
     if (!issued) throw new Error("session did not issue");
+    issueBeforeSubmit(db, issued.itemInstanceId, WHEN);
     const first = submitAttempt(
       db,
       guardian.id,
@@ -1721,6 +1859,7 @@ describe("item templates and issuance", () => {
     const db = tempDb();
     const { guardian, child, session } = granted(db);
     const skill = session.item.skill;
+    issueBeforeSubmit(db, session.item.itemInstanceId ?? "", WHEN);
     const blank = submitAttempt(
       db,
       guardian.id,
@@ -2265,7 +2404,7 @@ describe("item templates and issuance", () => {
     expect(cleared).not.toContain("format-hint");
   });
 
-  it("does not queue an unreadable answer as an offline attempt", () => {
+  it("does not queue an unreadable answer as an offline attempt", async () => {
     const queue = createAttemptQueue(memoryQueueStore());
     const base = {
       idempotencyKey: "offline-format-01",
@@ -2275,10 +2414,10 @@ describe("item templates and issuance", () => {
       shownAt: shown(),
       submittedAt: WHEN,
     };
-    const rejected = queue.enqueue({ ...base, answer: "banana" });
+    const rejected = await queue.enqueue({ ...base, answer: "banana" });
     expect(rejected.pending).toEqual([]);
     expect(rejected.formatRejected).toBe(true);
-    const blank = queue.enqueue({ ...base, idempotencyKey: "offline-blank-01", answer: "   " });
+    const blank = await queue.enqueue({ ...base, idempotencyKey: "offline-blank-01", answer: "   " });
     expect(blank.pending).toHaveLength(1);
     expect(blank.pending[0]?.answer).toBe("   ");
   });
@@ -2595,6 +2734,7 @@ describe("item templates and issuance", () => {
       expect(seen.has(issued.itemInstanceId)).toBe(false);
       seen.add(issued.itemInstanceId);
       const when = new Date(Date.parse(WHEN) + index * 20_000).toISOString();
+      issueBeforeSubmit(db, issued.itemInstanceId, when);
       const scored = submitAttempt(
         db,
         guardian.id,
@@ -2915,56 +3055,466 @@ describe("item templates and issuance", () => {
     expect(current?.consumedAt).toBeNull();
   });
 
-  it("drops a queued attempt with no instance id after one 400 and keeps syncing", async () => {
-    const stale: QueuedAttempt = {
-      idempotencyKey: "queued-no-instance",
-      childId: "child-1",
-      sessionId: "session-1",
-      itemId: "ops-g2-add",
-      answer: "17",
+  it("lets a later batch issue after an abandoned prefetch", () => {
+    const db = tempDb();
+    const { guardian, child, session } = granted(db, "abandoned-batch@example.com");
+    const screen = readItemInstance(db, session.item.itemInstanceId ?? "");
+    if (!screen) throw new Error("session did not issue");
+    const index = db
+      .prepare(`SELECT item_index AS itemIndex, slot_seq AS slotSeq FROM practice_sessions WHERE id = ?`)
+      .get(session.sessionId) as { itemIndex: number; slotSeq: number };
+    const parked = issueItemBatch(db, {
+      childId: child.id,
+      sessionId: session.sessionId,
+      idempotencyKey: "abandoned-batch",
+      count: ISSUE_BATCH_CAP,
+      itemIndex: index.itemIndex,
+      now: WHEN,
+    });
+    expect(parked).toHaveLength(OUTSTANDING_UNANSWERED_CAP - 1);
+    const blocked = issueItemBatch(db, {
+      childId: child.id,
+      sessionId: session.sessionId,
+      idempotencyKey: "abandoned-blocked",
+      count: 1,
+      itemIndex: index.itemIndex,
+      now: WHEN,
+    });
+    expect(blocked).toEqual([]);
+    const answeredAt = new Date(Date.parse(screen.issuedAt) + 3_000).toISOString();
+    const scored = submitAnswer(
+      db,
+      guardian.id,
+      child.id,
+      {
+        idempotencyKey: "abandoned-screen-score",
+        sessionId: session.sessionId,
+        itemId: session.item.id,
+        itemInstanceId: screen.itemInstanceId,
+        answer: screen.canonicalAnswer,
+        shownAt: new Date(Date.parse(answeredAt) - 2_000).toISOString(),
+        submittedAt: answeredAt,
+      },
+      { now: answeredAt },
+    );
+    if (isFormatRejected(scored)) throw new Error("a readable answer was rejected");
+    const moved = db
+      .prepare(`SELECT slot_seq AS slotSeq FROM practice_sessions WHERE id = ?`)
+      .get(session.sessionId) as { slotSeq: number };
+    expect(moved.slotSeq).toBe(index.slotSeq + 1);
+    const next = issueItemBatch(db, {
+      childId: child.id,
+      sessionId: session.sessionId,
+      idempotencyKey: "abandoned-next",
+      count: 1,
+      itemIndex: index.itemIndex,
+      now: new Date(Date.parse(answeredAt) + 1_000).toISOString(),
+    });
+    expect(next).toHaveLength(1);
+    const parkedStillOpen = db
+      .prepare(
+        `SELECT COUNT(*) AS count FROM item_instances
+         WHERE item_instance_id IN (${parked.map(() => "?").join(", ")}) AND consumed_at IS NULL`,
+      )
+      .get(...parked.map((item) => item.itemInstanceId)) as { count: number };
+    expect(parkedStillOpen.count).toBe(0);
+  });
+
+  it("drops an unknown instance and parks every 409 that is not a saved attempt", () => {
+    expect(classifyAttemptFailure(404, { error: "Practice session not found." })).toBeNull();
+    expect(classifyAttemptFailure(404, { error: "Child profile not found." })).toBeNull();
+    expect(classifyAttemptFailure(404, { error: "That problem is not in this practice pack." })).toBeNull();
+    expect(
+      classifyAttemptFailure(404, {
+        error: "That problem is not in this practice pack.",
+        code: "unknown_instance",
+      }),
+    ).toEqual({ ok: false, reason: "invalid_attempt" });
+    const parked = { ok: false as const, reason: "park" as const, message: interfaceCopy("offline.sessionEnded.kid") };
+    expect(classifyAttemptFailure(409, { error: "That problem is already locked." })).toEqual(parked);
+    expect(classifyAttemptFailure(409, { error: "That session is already closed." })).toEqual(parked);
+    expect(
+      classifyAttemptFailure(409, {
+        error: "This session has ended. Choose a lane to start the next one.",
+        code: "session_ended",
+        retryable: false,
+      }),
+    ).toEqual(parked);
+    expect(
+      classifyAttemptFailure(409, {
+        error: "That problem is already locked.",
+        code: "already_locked",
+      }),
+    ).toEqual(parked);
+    expect(
+      classifyAttemptFailure(409, {
+        error: "That problem is already locked.",
+        code: "already_locked",
+        savedAttempt: true,
+      }),
+    ).toEqual({ ok: false, reason: "drop", message: "" });
+  });
+
+  it("keeps answerable items at the cap across prefetch rounds and drops an abandoned submit", async () => {
+    const db = tempDb();
+    const { guardian, child, session } = granted(db, "cap-rounds@example.com");
+    const token = createSession(db, guardian.id);
+    const openCount = () =>
+      (
+        db
+          .prepare(
+            `SELECT COUNT(*) AS count FROM item_instances
+             WHERE session_id = ? AND consumed_at IS NULL`,
+          )
+          .get(session.sessionId) as { count: number }
+      ).count;
+    let abandonedId = "";
+    let screenId = session.item.itemInstanceId ?? "";
+    for (let round = 0; round < 4; round += 1) {
+      const index = db
+        .prepare(`SELECT item_index AS itemIndex FROM practice_sessions WHERE id = ?`)
+        .get(session.sessionId) as { itemIndex: number };
+      const batch = issueItemBatch(db, {
+        childId: child.id,
+        sessionId: session.sessionId,
+        idempotencyKey: `round-${round}`,
+        count: ISSUE_BATCH_CAP,
+        itemIndex: index.itemIndex,
+        now: new Date(Date.parse(WHEN) + round * 10_000).toISOString(),
+      });
+      expect(openCount(), `round ${round} after prefetch`).toBeLessThanOrEqual(OUTSTANDING_UNANSWERED_CAP);
+      if (round === 0) {
+        const parked = batch.find((item) => item.itemInstanceId !== screenId);
+        if (!parked) throw new Error("prefetch did not park an item");
+        abandonedId = parked.itemInstanceId;
+      }
+      const screen = readItemInstance(db, screenId);
+      if (!screen || screen.consumedAt) throw new Error("screen is not answerable");
+      const answeredAt = new Date(Date.parse(WHEN) + round * 10_000 + 4_000).toISOString();
+      issueBeforeSubmit(db, screen.itemInstanceId, answeredAt);
+      const scored = submitAnswer(
+        db,
+        guardian.id,
+        child.id,
+        {
+          idempotencyKey: `round-score-${round}`,
+          sessionId: session.sessionId,
+          itemId: session.item.id,
+          itemInstanceId: screen.itemInstanceId,
+          answer: screen.canonicalAnswer,
+          shownAt: new Date(Date.parse(answeredAt) - 2_000).toISOString(),
+          submittedAt: answeredAt,
+        },
+        { now: answeredAt },
+      );
+      if (isFormatRejected(scored)) throw new Error("a readable answer was rejected");
+      const nextId = scored.nextItem.itemInstanceId;
+      if (!nextId) throw new Error("next screen was not issued");
+      screenId = nextId;
+      expect(openCount(), `round ${round} after answer`).toBeLessThanOrEqual(OUTSTANDING_UNANSWERED_CAP);
+    }
+    const abandoned = readItemInstance(db, abandonedId);
+    expect(abandoned?.consumedAt).not.toBeNull();
+    const late: QueuedAttempt = {
+      idempotencyKey: "late-abandoned",
+      childId: child.id,
+      sessionId: session.sessionId,
+      itemId: session.item.id,
+      itemInstanceId: abandonedId,
+      answer: "17/3",
       shownAt: shown(),
       submittedAt: WHEN,
     };
-    const later: QueuedAttempt = {
-      ...stale,
-      idempotencyKey: "queued-with-instance",
+    const queue = createAttemptQueue(memoryQueueStore());
+    await queue.enqueue(late);
+    const snapshot = await queue.reconcile(async (attempt) => {
+      const posted = await postAttemptRoute(db, token, child.id, attempt);
+      expect(posted.status).toBe(409);
+      expect(posted.body.code).toBe("already_locked");
+      expect(posted.body.error).toBe("That problem is already locked.");
+      expect(posted.body.savedAttempt).toBeUndefined();
+      const classified = classifyAttemptFailure(posted.status, posted.body);
+      if (!classified || classified.reason !== "park") throw new Error("abandoned submit was dropped");
+      return classified;
+    });
+    expect(snapshot.pending).toEqual([]);
+    expect(snapshot.dropped).toEqual([]);
+    expect(snapshot.parked.map((row) => row.idempotencyKey)).toEqual([late.idempotencyKey]);
+    expect(snapshot.parked[0]?.answer).toBe(late.answer);
+    expect(snapshot.parked[0]?.message).toBe(interfaceCopy("offline.sessionEnded.kid"));
+  });
+
+  it("flushes offline answers before resuming the session slot", async () => {
+    const db = tempDb();
+    const { guardian, child, session } = granted(db, "flush-first@example.com");
+    const token = createSession(db, guardian.id);
+    const openCount = () =>
+      (
+        db
+          .prepare(
+            `SELECT COUNT(*) AS count FROM item_instances
+             WHERE session_id = ? AND consumed_at IS NULL`,
+          )
+          .get(session.sessionId) as { count: number }
+      ).count;
+    const screenNow = () => {
+      const slot = db
+        .prepare(`SELECT slot_seq AS slotSeq FROM practice_sessions WHERE id = ?`)
+        .get(session.sessionId) as { slotSeq: number };
+      const row = db
+        .prepare(
+          `SELECT item_instance_id AS itemInstanceId FROM item_instances
+           WHERE session_id = ? AND issue_idempotency_key = ?`,
+        )
+        .get(session.sessionId, sessionSlotKey(session.sessionId, slot.slotSeq)) as
+        | { itemInstanceId: string }
+        | undefined;
+      if (!row) throw new Error("screen item is missing");
+      const instance = readItemInstance(db, row.itemInstanceId);
+      if (!instance) throw new Error("screen item is missing");
+      return instance;
+    };
+
+    const instanceCount = () =>
+      (
+        db.prepare(`SELECT COUNT(*) AS count FROM item_instances WHERE session_id = ?`).get(session.sessionId) as {
+          count: number;
+        }
+      ).count;
+
+    for (let round = 0; round < 4; round += 1) {
+      const screen = screenNow();
+      const issuedAt = screen.issuedAt;
+      const rowsBefore = instanceCount();
+      const resumed = await postItemsRoute(
+        db,
+        token,
+        child.id,
+        session.sessionId,
+        `resume-round-${round}x`,
+        1,
+      );
+      expect(resumed.status, `round ${round} resume`).toBe(200);
+      expect(resumed.body.items?.map((item) => item.itemInstanceId)).toEqual([screen.itemInstanceId]);
+      expect(instanceCount(), `round ${round} resume writes`).toBe(rowsBefore);
+      expect(readItemInstance(db, screen.itemInstanceId)?.issuedAt).toBe(issuedAt);
+      expect(openCount(), `round ${round} after resume`).toBeLessThanOrEqual(OUTSTANDING_UNANSWERED_CAP);
+
+      const queue = createAttemptQueue(memoryQueueStore());
+      const offlineKey = `offline-round-${round}x`;
+      const submittedAt = new Date(Date.parse(WHEN) + round * 60_000 + 4_000).toISOString();
+      issueBeforeSubmit(db, screen.itemInstanceId, submittedAt);
+      if (round === 0) {
+        await queue.enqueue({
+          idempotencyKey: "unknown-round-00",
+          childId: child.id,
+          sessionId: session.sessionId,
+          itemId: session.item.id,
+          itemInstanceId: "not-a-real-instance",
+          answer: "17/3",
+          shownAt: new Date(Date.parse(submittedAt) - 2_000).toISOString(),
+          submittedAt,
+        });
+      }
+      await queue.enqueue({
+        idempotencyKey: offlineKey,
+        childId: child.id,
+        sessionId: session.sessionId,
+        itemId: session.item.id,
+        itemInstanceId: screen.itemInstanceId,
+        answer: screen.canonicalAnswer,
+        shownAt: new Date(Date.parse(submittedAt) - 2_000).toISOString(),
+        submittedAt,
+      });
+      const steps: string[] = [];
+      const outcome = await issueAfterQueueDrain(
+        () =>
+          queue.reconcile(async (attempt) => {
+            steps.push(`flush:${attempt.idempotencyKey}`);
+            const posted = await postAttemptRoute(db, token, child.id, attempt);
+            if (attempt.idempotencyKey === "unknown-round-00") {
+              expect(posted.status).toBe(404);
+              expect(posted.body.code).toBe("unknown_instance");
+              const classified = classifyAttemptFailure(posted.status, posted.body);
+              if (!classified) throw new Error("unknown instance stayed retryable");
+              return classified;
+            }
+            expect(posted.status, `round ${round} offline answer`).toBe(200);
+            expect(posted.body.code).toBeUndefined();
+            if (!posted.body.attemptId) throw new Error("offline answer was not scored");
+            return { ok: true as const, result: posted.body as AttemptResult };
+          }),
+        async () => {
+          steps.push("prefetch");
+          const next = await postItemsRoute(
+            db,
+            token,
+            child.id,
+            session.sessionId,
+            `reconnect-round-${round}x`,
+            1,
+          );
+          expect(next.status, `round ${round} prefetch`).toBe(200);
+          expect(next.body.items?.length ?? 0).toBeGreaterThan(0);
+          return next;
+        },
+      );
+      expect(steps.at(-1)).toBe("prefetch");
+      expect(steps.indexOf("prefetch")).toBe(steps.length - 1);
+      expect(steps.some((step) => step === `flush:${offlineKey}`)).toBe(true);
+      const resumedNext = outcome.issued?.body.items?.[0]?.itemInstanceId;
+      expect(resumedNext).toBeTruthy();
+      expect(resumedNext).not.toBe(screen.itemInstanceId);
+      expect(outcome.snapshot.pending).toEqual([]);
+      expect(outcome.snapshot.dropped.map((row) => row.idempotencyKey)).not.toContain(offlineKey);
+      const saved = readItemInstance(db, screen.itemInstanceId);
+      expect(saved?.consumedAt).not.toBeNull();
+      expect(saved?.consumedByAttemptKey).toBe(offlineKey);
+      expect(openCount(), `round ${round} after reconnect`).toBeLessThanOrEqual(OUTSTANDING_UNANSWERED_CAP);
+    }
+
+    const blocked = createAttemptQueue(memoryQueueStore());
+    await blocked.enqueue({
+      idempotencyKey: "still-retryable",
+      childId: child.id,
+      sessionId: session.sessionId,
+      itemId: session.item.id,
+      answer: "17/3",
+      shownAt: shown(),
+      submittedAt: WHEN,
       itemInstanceId: "issued-instance-01",
-      answer: "42",
+    });
+    let issuedWhileWaiting = false;
+    const waiting = await issueAfterQueueDrain(
+      () =>
+        blocked.reconcile(async () => {
+          const classified = classifyAttemptFailure(500, { error: "Something went wrong." });
+          if (!classified) throw new Error("expected a retryable server error");
+          return classified;
+        }, { now: WHEN }),
+      async () => {
+        issuedWhileWaiting = true;
+        return null;
+      },
+    );
+    expect(waiting.issued).toBeNull();
+    expect(issuedWhileWaiting).toBe(false);
+    expect(waiting.snapshot.pending).toHaveLength(1);
+  });
+
+  it("drops unknown and already-used queued attempts through the route", async () => {
+    const db = tempDb();
+    const { guardian, child, session } = granted(db, "queue-route@example.com");
+    const token = createSession(db, guardian.id);
+    const screen = readItemInstance(db, session.item.itemInstanceId ?? "");
+    if (!screen) throw new Error("session did not issue");
+    const fresh = issueForProgression(db, {
+      childId: child.id,
+      sessionId: session.sessionId,
+      skillId: SKILLS.add,
+      idempotencyKey: "queue-fresh-issue",
+      now: new Date(Date.parse(screen.issuedAt) + 1_000).toISOString(),
+    });
+    const usedAt = new Date(Date.parse(screen.issuedAt) + 3_000).toISOString();
+    const used = submitAnswer(
+      db,
+      guardian.id,
+      child.id,
+      {
+        idempotencyKey: "queue-screen-used",
+        sessionId: session.sessionId,
+        itemId: session.item.id,
+        itemInstanceId: screen.itemInstanceId,
+        answer: screen.canonicalAnswer,
+        shownAt: new Date(Date.parse(usedAt) - 2_000).toISOString(),
+        submittedAt: usedAt,
+      },
+      { now: usedAt },
+    );
+    if (isFormatRejected(used)) throw new Error("a readable answer was rejected");
+    const base = {
+      childId: child.id,
+      sessionId: session.sessionId,
+      itemId: session.item.id,
+      shownAt: shown(),
+      submittedAt: WHEN,
+    };
+    const missing: QueuedAttempt = {
+      ...base,
+      idempotencyKey: "queue-missing-id",
+      answer: "17/3",
+    };
+    const unknown: QueuedAttempt = {
+      ...base,
+      idempotencyKey: "queue-unknown-id",
+      itemInstanceId: "not-a-real-instance",
+      answer: "17/3",
+    };
+    const alreadyUsed: QueuedAttempt = {
+      ...base,
+      idempotencyKey: "queue-already-used",
+      itemInstanceId: screen.itemInstanceId,
+      answer: screen.canonicalAnswer,
+    };
+    const scoredAt = new Date(Date.parse(fresh.issuedAt) + 3_000).toISOString();
+    const kept: QueuedAttempt = {
+      ...base,
+      idempotencyKey: "queue-fresh-score",
+      itemInstanceId: fresh.itemInstanceId,
+      answer: fresh.canonicalAnswer,
+      shownAt: new Date(Date.parse(scoredAt) - 2_000).toISOString(),
+      submittedAt: scoredAt,
     };
     const queue = createAttemptQueue(memoryQueueStore());
-    queue.enqueue(stale);
-    queue.enqueue(later);
+    await queue.enqueue(missing);
+    await queue.enqueue(unknown);
+    await queue.enqueue(alreadyUsed);
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
-    let posts = 0;
-    const snapshot = await queue.reconcile(async (attempt) => {
-      posts += 1;
-      if (!attempt.itemInstanceId) {
-        const classified = classifyAttemptFailure(400, { error: "invalid_attempt", retryable: false });
-        if (!classified) throw new Error("expected a permanent invalid_attempt");
-        return classified;
+    const post = async (attempt: QueuedAttempt) => {
+      const posted = await postAttemptRoute(db, token, child.id, attempt);
+      const classified = classifyAttemptFailure(posted.status, posted.body);
+      if (classified) return classified;
+      if (posted.status === 200 && posted.body.attemptId) {
+        return { ok: true as const, result: posted.body as AttemptResult };
       }
-      return { ok: true as const, result: syncedAttempt(attempt.idempotencyKey) };
-    });
-    expect(posts).toBe(2);
+      throw new Error(`unexpected queue response ${posted.status} ${JSON.stringify(posted.body)}`);
+    };
+    const snapshot = await queue.reconcile(post);
     expect(snapshot.pending).toEqual([]);
-    expect(snapshot.dropped).toEqual([
-      { idempotencyKey: stale.idempotencyKey, childId: stale.childId, sessionId: stale.sessionId },
+    expect(snapshot.dropped.map((row) => row.idempotencyKey)).toEqual([
+      missing.idempotencyKey,
+      unknown.idempotencyKey,
+      alreadyUsed.idempotencyKey,
     ]);
-    expect(JSON.stringify(snapshot.dropped)).not.toContain(stale.answer);
-    expect(snapshot.synced.map((result) => result.idempotencyKey)).toEqual([later.idempotencyKey]);
-    expect(snapshot.invalidAttemptKeys).toEqual([stale.idempotencyKey]);
-    expect(warn).toHaveBeenCalledWith(`Dropped queued attempt ${stale.idempotencyKey}`);
-    expect(warn.mock.calls.flat().join(" ")).not.toContain(stale.answer);
+    expect(JSON.stringify(snapshot.dropped)).not.toContain(missing.answer);
+    expect(snapshot.invalidAttemptKeys).toEqual([
+      missing.idempotencyKey,
+      unknown.idempotencyKey,
+    ]);
+    expect(warn).toHaveBeenCalledWith(`Dropped queued attempt ${missing.idempotencyKey}`);
+    expect(warn.mock.calls.flat().join(" ")).not.toContain(missing.answer);
     warn.mockRestore();
+    const reload = vi.fn();
+    expect(reloadLiveSession(missing.idempotencyKey, snapshot, reload)).toBe(true);
+    expect(reload).toHaveBeenCalledOnce();
+    expect(reloadLiveSession(null, snapshot, reload)).toBe(false);
+    expect(reloadLiveSession("other-key", snapshot, reload)).toBe(false);
+    expect(reload).toHaveBeenCalledOnce();
+
+    await queue.enqueue(kept);
+    const synced = await queue.reconcile(post);
+    expect(synced.pending).toEqual([]);
+    expect(synced.synced.map((result) => result.idempotencyKey)).toEqual([kept.idempotencyKey]);
+    expect(synced.dropped).toHaveLength(3);
 
     let replayed = 0;
     const again = await queue.reconcile(async () => {
       replayed += 1;
-      return { ok: true as const, result: syncedAttempt(later.idempotencyKey) };
+      return { ok: true as const, result: syncedAttempt(kept.idempotencyKey) };
     });
     expect(replayed).toBe(0);
     expect(again.pending).toEqual([]);
-    expect(again.dropped).toHaveLength(1);
+    expect(again.dropped).toHaveLength(3);
   });
 
   it("retries a 5xx from the offline queue", async () => {
@@ -2979,14 +3529,14 @@ describe("item templates and issuance", () => {
       itemInstanceId: "issued-instance-01",
     };
     const queue = createAttemptQueue(memoryQueueStore());
-    queue.enqueue(attempt);
+    await queue.enqueue(attempt);
     let posts = 0;
     const waiting = await queue.reconcile(async () => {
       posts += 1;
       const classified = classifyAttemptFailure(500, { error: "Something went wrong." });
       if (!classified) throw new Error("expected a retryable server error");
       return classified;
-    });
+    }, { now: WHEN });
     expect(posts).toBe(1);
     expect(waiting.pending).toHaveLength(1);
     expect(waiting.dropped).toEqual([]);
@@ -3004,12 +3554,1521 @@ describe("item templates and issuance", () => {
     expect(synced.synced.map((result) => result.idempotencyKey)).toEqual([attempt.idempotencyKey]);
   });
 
+  it("parks a session_ended answer and still flushes the next one", async () => {
+    const db = tempDb();
+    const { guardian, child, session } = granted(db, "session-ended@example.com");
+    const screen = readItemInstance(db, session.item.itemInstanceId ?? "");
+    if (!screen) throw new Error("session did not issue");
+    const answeredAt = new Date(Date.parse(screen.issuedAt) + 3_000).toISOString();
+    const scored = submitAnswer(
+      db,
+      guardian.id,
+      child.id,
+      {
+        idempotencyKey: "ended-screen-score",
+        sessionId: session.sessionId,
+        itemId: session.item.id,
+        itemInstanceId: screen.itemInstanceId,
+        answer: screen.canonicalAnswer,
+        shownAt: new Date(Date.parse(answeredAt) - 2_000).toISOString(),
+        submittedAt: answeredAt,
+      },
+      { now: answeredAt },
+    );
+    if (isFormatRejected(scored)) throw new Error("a readable answer was rejected");
+    const firstSave = savedItemEvidence(db, screen.itemInstanceId);
+    expect(firstSave.attempts).toHaveLength(1);
+    expect(firstSave.xp).toHaveLength(1);
+    endPracticeSession(db, guardian.id, child.id, session.sessionId);
+    choosePracticeLane(db, guardian.id, child.id, session.sessionId, "recommended");
+    const next = startPracticeSession(db, guardian.id, child.id);
+    const nextItem = readItemInstance(db, next.item.itemInstanceId ?? "");
+    if (!nextItem) throw new Error("new session did not issue");
+    const token = createSession(db, guardian.id);
+    const ended: QueuedAttempt = {
+      idempotencyKey: "ended-session-try",
+      childId: child.id,
+      sessionId: session.sessionId,
+      itemId: session.item.id,
+      itemInstanceId: screen.itemInstanceId,
+      answer: screen.canonicalAnswer,
+      shownAt: shown(),
+      submittedAt: WHEN,
+    };
+    const laterSubmittedAt = new Date(Date.parse(WHEN) + 1_000).toISOString();
+    issueBeforeSubmit(db, nextItem.itemInstanceId, laterSubmittedAt);
+    const later: QueuedAttempt = {
+      idempotencyKey: "next-session-try",
+      childId: child.id,
+      sessionId: next.sessionId,
+      itemId: next.item.id,
+      itemInstanceId: nextItem.itemInstanceId,
+      answer: nextItem.canonicalAnswer,
+      shownAt: shown(),
+      submittedAt: laterSubmittedAt,
+    };
+    const queue = createAttemptQueue(memoryQueueStore());
+    await queue.enqueue(ended);
+    await queue.enqueue(later);
+    const snapshot = await queue.reconcile(async (attempt) => {
+      const posted = await postAttemptRoute(db, token, child.id, attempt);
+      if (attempt.idempotencyKey === ended.idempotencyKey) {
+        expect(posted.status).toBe(409);
+        expect(posted.body.code).toBe("session_ended");
+        expect(posted.body.retryable).toBe(false);
+        expect(posted.body.savedAttempt).toBeUndefined();
+      }
+      const classified = classifyAttemptFailure(posted.status, posted.body);
+      if (classified) return classified;
+      if (posted.status === 200 && posted.body.attemptId) {
+        return { ok: true as const, result: posted.body as AttemptResult };
+      }
+      throw new Error(`unexpected queue response ${posted.status}`);
+    });
+    expect(snapshot.pending).toEqual([]);
+    expect(snapshot.dropped).toEqual([]);
+    expect(snapshot.parked).toEqual([
+      {
+        ...ended,
+        syncFailures: 1,
+        firstFailedAt: expect.any(String),
+        message: interfaceCopy("offline.sessionEnded.kid"),
+      },
+    ]);
+    expect(snapshot.parked[0]?.answer).toBe(ended.answer);
+    expect(snapshot.synced.map((result) => result.idempotencyKey)).toEqual([later.idempotencyKey]);
+    const afterPark = savedItemEvidence(db, screen.itemInstanceId);
+    expect(afterPark.attempts).toHaveLength(1);
+    expect(afterPark.xp).toHaveLength(1);
+    expect(afterPark).toEqual(firstSave);
+  });
+
+  it("ignores a second Check for the same item while an entry is pending", async () => {
+    const first: QueuedAttempt = {
+      idempotencyKey: "first-check",
+      childId: "child-1",
+      sessionId: "session-1",
+      itemId: "ops-g2-add",
+      answer: "42",
+      shownAt: shown(),
+      submittedAt: WHEN,
+      itemInstanceId: "issued-instance-01",
+    };
+    const queue = createAttemptQueue(memoryQueueStore());
+    const queued = await queue.enqueue(first);
+    expect(queued.pending).toEqual([first]);
+    const second = await queue.enqueue({
+      ...first,
+      idempotencyKey: "second-check",
+      answer: "7",
+      submittedAt: new Date(Date.parse(WHEN) + 1_000).toISOString(),
+    });
+    expect(second.pending).toEqual([first]);
+    expect(second.pending).toHaveLength(1);
+    expect(JSON.stringify(second)).not.toContain("second-check");
+    expect(JSON.stringify(second)).not.toContain('"7"');
+
+    const db = tempDb();
+    const { guardian, child, session } = granted(db, "one-entry@example.com");
+    const token = createSession(db, guardian.id);
+    const screen = readItemInstance(db, session.item.itemInstanceId ?? "");
+    if (!screen) throw new Error("session did not issue");
+    const live: QueuedAttempt = {
+      idempotencyKey: "one-entry-first",
+      childId: child.id,
+      sessionId: session.sessionId,
+      itemId: session.item.id,
+      itemInstanceId: screen.itemInstanceId,
+      answer: screen.canonicalAnswer,
+      shownAt: new Date(Date.parse(screen.issuedAt) + 1_000).toISOString(),
+      submittedAt: new Date(Date.parse(screen.issuedAt) + 3_000).toISOString(),
+    };
+    const liveQueue = createAttemptQueue(memoryQueueStore());
+    await liveQueue.enqueue(live);
+    const ignored = await liveQueue.enqueue({
+      ...live,
+      idempotencyKey: "one-entry-second",
+      answer: "0",
+    });
+    expect(ignored.pending).toHaveLength(1);
+    expect(ignored.pending[0]?.idempotencyKey).toBe(live.idempotencyKey);
+    const synced = await liveQueue.reconcile(async (attempt) => {
+      const posted = await postAttemptRoute(db, token, child.id, attempt);
+      expect(posted.status).toBe(200);
+      if (!posted.body.attemptId) throw new Error("the one queued answer was not scored");
+      return { ok: true as const, result: posted.body as AttemptResult };
+    });
+    expect(synced.pending).toEqual([]);
+    const saved = savedItemEvidence(db, screen.itemInstanceId);
+    expect(saved.attempts).toHaveLength(1);
+    expect(saved.attempts[0]?.idempotencyKey).toBe(live.idempotencyKey);
+    expect(saved.xp).toHaveLength(1);
+    const attemptRows = db.prepare(`SELECT COUNT(*) AS count FROM attempts`).get() as { count: number };
+    expect(attemptRows.count).toBe(1);
+  });
+
+  it("ignores a second Check while that item is parked or blocked", async () => {
+    const parkedAttempt: QueuedAttempt = {
+      idempotencyKey: "parked-first-check",
+      childId: "child-1",
+      sessionId: "session-1",
+      itemId: "ops-g2-add",
+      answer: "42",
+      shownAt: shown(),
+      submittedAt: WHEN,
+      itemInstanceId: "issued-instance-parked",
+    };
+    const parkedQueue = createAttemptQueue(
+      memoryQueueStore({
+        version: 1,
+        pending: [],
+        blocked: [],
+        parked: [{ ...parkedAttempt, message: interfaceCopy("offline.parked.kid") }],
+        dropped: [],
+        synced: [],
+      }),
+    );
+    const secondParked = await parkedQueue.enqueue({
+      ...parkedAttempt,
+      idempotencyKey: "parked-second-check",
+      answer: "7",
+    });
+    expect(secondParked.pending).toEqual([]);
+    expect(secondParked.parked).toHaveLength(1);
+    expect(secondParked.parked[0]?.answer).toBe("42");
+    expect(JSON.stringify(secondParked)).not.toContain("parked-second-check");
+
+    const blockedAttempt: QueuedAttempt = {
+      ...parkedAttempt,
+      idempotencyKey: "blocked-first-check",
+      itemInstanceId: "issued-instance-blocked",
+    };
+    const blockedQueue = createAttemptQueue(
+      memoryQueueStore({
+        version: 1,
+        pending: [],
+        blocked: [{ ...blockedAttempt, message: "Practice is blocked." }],
+        parked: [],
+        dropped: [],
+        synced: [],
+      }),
+    );
+    const secondBlocked = await blockedQueue.enqueue({
+      ...blockedAttempt,
+      idempotencyKey: "blocked-second-check",
+      answer: "9",
+    });
+    expect(secondBlocked.pending).toEqual([]);
+    expect(secondBlocked.blocked).toHaveLength(1);
+    expect(secondBlocked.blocked[0]?.answer).toBe("42");
+
+    const client = readFileSync(path.join(process.cwd(), "components/practice-session.tsx"), "utf8");
+    expect(client).toContain("snapshot.parked.some((entry) => entry.idempotencyKey === waitingKey.current)");
+    expect(client).toContain("snapshot.parked.some((entry) => entry.idempotencyKey === idempotencyKey)");
+    expect(client).not.toMatch(
+      /snapshot\.parked\.some\(\(entry\) => entry\.idempotencyKey === (?:waitingKey\.current|idempotencyKey)\)[\s\S]{0,180}markSavedOffline\(false\)/,
+    );
+  });
+
+  it("moves to the next item after a queued offline answer syncs", async () => {
+    const db = tempDb();
+    const { guardian, child, session } = granted(db, "offline-advance@example.com");
+    const token = createSession(db, guardian.id);
+    const screen = readItemInstance(db, session.item.itemInstanceId ?? "");
+    if (!screen) throw new Error("session did not issue");
+    const queued: QueuedAttempt = {
+      idempotencyKey: "offline-advance-key",
+      childId: child.id,
+      sessionId: session.sessionId,
+      itemId: session.item.id,
+      itemInstanceId: screen.itemInstanceId,
+      answer: screen.canonicalAnswer,
+      shownAt: new Date(Date.parse(screen.issuedAt) + 1_000).toISOString(),
+      submittedAt: new Date(Date.parse(screen.issuedAt) + 3_000).toISOString(),
+    };
+    const queue = createAttemptQueue(memoryQueueStore());
+    await queue.enqueue(queued);
+    const duplicate = await queue.enqueue({
+      ...queued,
+      idempotencyKey: "offline-advance-second",
+      answer: "0",
+    });
+    expect(duplicate.pending).toHaveLength(1);
+    expect(duplicate.pending[0]?.idempotencyKey).toBe(queued.idempotencyKey);
+    const offline = await queue.reconcile(async () => ({ ok: false as const, reason: "offline" as const }));
+    expect(offline.pending).toHaveLength(1);
+    expect(offline.synced).toEqual([]);
+    const synced = await queue.reconcile(async (attempt) => {
+      const posted = await postAttemptRoute(db, token, child.id, attempt);
+      expect(posted.status).toBe(200);
+      if (!posted.body.attemptId) throw new Error("offline answer was not scored");
+      return { ok: true as const, result: posted.body as AttemptResult };
+    });
+    expect(synced.pending).toEqual([]);
+    const result = synced.synced.find((row) => row.idempotencyKey === queued.idempotencyKey);
+    if (!result?.nextItem.itemInstanceId) throw new Error("synced answer did not name the next item");
+    expect(result.nextItem.itemInstanceId).not.toBe(screen.itemInstanceId);
+    expect(advanceAfterQueuedSync(true, result)).toEqual(result.nextItem);
+    expect(advanceAfterQueuedSync(false, result)).toBeNull();
+    const shownNext = startPracticeSession(db, guardian.id, child.id);
+    expect(shownNext.sessionId).toBe(session.sessionId);
+    expect(shownNext.item.itemInstanceId).toBe(result.nextItem.itemInstanceId);
+    const attempts = db
+      .prepare(`SELECT COUNT(*) AS count FROM attempts WHERE item_instance_id = ?`)
+      .get(screen.itemInstanceId) as { count: number };
+    expect(attempts.count).toBe(1);
+    expect(xpCount(db)).toBe(1);
+  });
+
+  it("drops a 409 when the server already saved the attempt", async () => {
+    const db = tempDb();
+    const { guardian, child, session } = granted(db, "saved-409@example.com");
+    const token = createSession(db, guardian.id);
+    const screen = readItemInstance(db, session.item.itemInstanceId ?? "");
+    if (!screen) throw new Error("session did not issue");
+    const scoredAt = new Date(Date.parse(screen.issuedAt) + 3_000).toISOString();
+    const scored = submitAnswer(
+      db,
+      guardian.id,
+      child.id,
+      {
+        idempotencyKey: "saved-first-key",
+        sessionId: session.sessionId,
+        itemId: session.item.id,
+        itemInstanceId: screen.itemInstanceId,
+        answer: screen.canonicalAnswer,
+        shownAt: new Date(Date.parse(scoredAt) - 2_000).toISOString(),
+        submittedAt: scoredAt,
+      },
+      { now: scoredAt },
+    );
+    if (isFormatRejected(scored)) throw new Error("a readable answer was rejected");
+    const firstSave = savedItemEvidence(db, screen.itemInstanceId);
+    expect(firstSave.attempts).toHaveLength(1);
+    expect(firstSave.xp).toHaveLength(1);
+    const duplicate: QueuedAttempt = {
+      idempotencyKey: "saved-second-key",
+      childId: child.id,
+      sessionId: session.sessionId,
+      itemId: session.item.id,
+      itemInstanceId: screen.itemInstanceId,
+      answer: screen.canonicalAnswer,
+      shownAt: shown(),
+      submittedAt: WHEN,
+    };
+    const queue = createAttemptQueue(memoryQueueStore());
+    await queue.enqueue(duplicate);
+    const snapshot = await queue.reconcile(async (attempt) => {
+      const posted = await postAttemptRoute(db, token, child.id, attempt);
+      expect(posted.status).toBe(409);
+      expect(posted.body.code).toBe("already_locked");
+      expect(posted.body.savedAttempt).toBe(true);
+      const classified = classifyAttemptFailure(posted.status, posted.body);
+      if (!classified || classified.reason !== "drop") throw new Error("a saved attempt was kept");
+      return classified;
+    });
+    expect(snapshot.pending).toEqual([]);
+    expect(snapshot.parked).toEqual([]);
+    expect(snapshot.dropped).toEqual([
+      {
+        idempotencyKey: duplicate.idempotencyKey,
+        childId: duplicate.childId,
+        sessionId: duplicate.sessionId,
+      },
+    ]);
+    expect(snapshot.dropped[0]).not.toHaveProperty("answer");
+    expect(snapshot.invalidAttemptKeys).toBeUndefined();
+    expect(snapshot.lastError).toBeUndefined();
+    const afterDrop = savedItemEvidence(db, screen.itemInstanceId);
+    expect(afterDrop.attempts).toHaveLength(1);
+    expect(afterDrop.xp).toHaveLength(1);
+    expect(afterDrop).toEqual(firstSave);
+  });
+
+  it("keeps a pending entry after the queue is reloaded", async () => {
+    const storage = new Map<string, string>();
+    const memory = {
+      getItem: (key: string) => storage.get(key) ?? null,
+      setItem: (key: string, value: string) => {
+        storage.set(key, value);
+      },
+    };
+    const pending: QueuedAttempt = {
+      idempotencyKey: "survives-reload",
+      childId: "child-1",
+      sessionId: "session-1",
+      itemId: "ops-g2-add",
+      answer: "42",
+      shownAt: shown(),
+      submittedAt: WHEN,
+      itemInstanceId: "issued-instance-01",
+    };
+    const queue = createAttemptQueue(storageQueueStore(memory, "math-sprout-queue"));
+    await queue.enqueue(pending);
+    const reloaded = createAttemptQueue(storageQueueStore(memory, "math-sprout-queue"));
+    expect(reloaded.snapshot().pending).toEqual([pending]);
+    const ignored = await reloaded.enqueue({
+      ...pending,
+      idempotencyKey: "after-reload-second",
+      answer: "9",
+    });
+    expect(ignored.pending).toEqual([pending]);
+  });
+
+  it("credits a parked retry the server already saved without minting again", async () => {
+    const db = tempDb();
+    const { guardian, child, session } = granted(db, "replayed-retry@example.com");
+    const token = createSession(db, guardian.id);
+    const screen = readItemInstance(db, session.item.itemInstanceId ?? "");
+    if (!screen) throw new Error("session did not issue");
+    const saved: QueuedAttempt = {
+      idempotencyKey: "already-saved-retry",
+      childId: child.id,
+      sessionId: session.sessionId,
+      itemId: session.item.id,
+      itemInstanceId: screen.itemInstanceId,
+      answer: screen.canonicalAnswer,
+      shownAt: new Date(Date.parse(screen.issuedAt) + 1_000).toISOString(),
+      submittedAt: new Date(Date.parse(screen.issuedAt) + 3_000).toISOString(),
+    };
+    const first = await postAttemptRoute(db, token, child.id, saved);
+    expect(first.status).toBe(200);
+    expect(first.body.replayed).toBe(false);
+    const firstSave = savedItemEvidence(db, screen.itemInstanceId);
+    expect(firstSave.attempts).toHaveLength(1);
+    expect(firstSave.xp).toHaveLength(1);
+    const queue = createAttemptQueue(
+      memoryQueueStore({
+        version: 1,
+        pending: [],
+        blocked: [],
+        parked: [{ ...saved, message: interfaceCopy("offline.parked.kid") }],
+        dropped: [],
+        synced: [],
+      }),
+    );
+    const retried = await queue.retryParkedOnce(async (attempt) => {
+      const posted = await postAttemptRoute(db, token, child.id, attempt);
+      expect(posted.status).toBe(200);
+      expect(posted.body.replayed).toBe(true);
+      if (!posted.body.attemptId) throw new Error("replayed retry was not the saved attempt");
+      return { ok: true as const, result: posted.body as AttemptResult };
+    });
+    expect(retried.parked).toEqual([]);
+    expect(retried.dropped).toEqual([]);
+    expect(retried.synced.map((result) => result.idempotencyKey)).toEqual([saved.idempotencyKey]);
+    expect(retried.quietCredits).toBe(1);
+    const afterRetry = savedItemEvidence(db, screen.itemInstanceId);
+    expect(afterRetry.attempts).toHaveLength(1);
+    expect(afterRetry.xp).toHaveLength(1);
+    expect(afterRetry).toEqual(firstSave);
+  });
+
+  it("keeps a parked retry that times out, the same as a network failure", async () => {
+    expect(QUEUE_RETRY_TIMEOUT_MS).toBe(8_000);
+    const timedOut = parkedRetryFailure(new DOMException("The operation was aborted due to timeout", "TimeoutError"));
+    expect(timedOut).toEqual({ ok: false, reason: "offline" });
+    expect(parkedRetryFailure(new DOMException("The operation was aborted.", "AbortError"))).toEqual({
+      ok: false,
+      reason: "offline",
+    });
+    expect(parkedRetryFailure(new TypeError("Failed to fetch"))).toEqual({ ok: false, reason: "offline" });
+    const parked = {
+      idempotencyKey: "parked-timeout",
+      childId: "child-1",
+      sessionId: "session-1",
+      itemId: "ops-g2-add",
+      answer: "42",
+      shownAt: shown(),
+      submittedAt: WHEN,
+      itemInstanceId: "issued-instance-01",
+      message: interfaceCopy("offline.parked.kid"),
+    };
+    const timingOut = createAttemptQueue(
+      memoryQueueStore({
+        version: 1,
+        pending: [],
+        blocked: [],
+        parked: [parked],
+        dropped: [],
+        synced: [],
+      }),
+    );
+    const keptTimeout = await timingOut.retryParkedOnce(async () => timedOut);
+    expect(keptTimeout.dropped).toEqual([]);
+    expect(keptTimeout.parked.map((entry) => entry.idempotencyKey)).toEqual([parked.idempotencyKey]);
+    expect(keptTimeout.parked[0]?.answer).toBe(parked.answer);
+    const offline = createAttemptQueue(
+      memoryQueueStore({
+        version: 1,
+        pending: [],
+        blocked: [],
+        parked: [{ ...parked, idempotencyKey: "parked-offline" }],
+        dropped: [],
+        synced: [],
+      }),
+    );
+    const kept = await offline.retryParkedOnce(async () => {
+      throw new TypeError("Failed to fetch");
+    });
+    expect(kept.parked.map((entry) => entry.idempotencyKey)).toEqual(["parked-offline"]);
+    expect(kept.parked[0]?.answer).toBe("42");
+    expect(kept.dropped).toEqual([]);
+    const client = readFileSync(path.join(process.cwd(), "components/practice-session.tsx"), "utf8");
+    expect(client).toContain("postAttempt(childId, attempt, QUEUE_RETRY_TIMEOUT_MS)");
+    expect(client).toContain("if (snapshot.quietCredits) noteQuietResume()");
+    expect(client).toContain("setQuietResume(true)");
+  });
+
+  it("credits one attempt when a timed-out parked retry is replayed", async () => {
+    const db = tempDb();
+    const { guardian, child, session } = granted(db, "timeout-replay@example.com");
+    const token = createSession(db, guardian.id);
+    const screen = readItemInstance(db, session.item.itemInstanceId ?? "");
+    if (!screen) throw new Error("session did not issue");
+    const saved: QueuedAttempt = {
+      idempotencyKey: "timeout-then-replay",
+      childId: child.id,
+      sessionId: session.sessionId,
+      itemId: session.item.id,
+      itemInstanceId: screen.itemInstanceId,
+      answer: screen.canonicalAnswer,
+      shownAt: new Date(Date.parse(screen.issuedAt) - 2_000).toISOString(),
+      submittedAt: screen.issuedAt,
+    };
+    const queue = createAttemptQueue(
+      memoryQueueStore({
+        version: 1,
+        pending: [],
+        blocked: [],
+        parked: [{ ...saved, message: interfaceCopy("offline.parked.kid") }],
+        dropped: [],
+        synced: [],
+      }),
+    );
+    const timedOut = await queue.retryParkedOnce(async (attempt) => {
+      const posted = await postAttemptRoute(db, token, child.id, attempt);
+      expect(posted.status).toBe(200);
+      expect(posted.body.replayed).toBe(false);
+      return parkedRetryFailure(new DOMException("The operation was aborted due to timeout", "TimeoutError"));
+    });
+    expect(timedOut.dropped).toEqual([]);
+    expect(timedOut.parked.map((entry) => entry.idempotencyKey)).toEqual([saved.idempotencyKey]);
+    expect(timedOut.parked[0]?.answer).toBe(saved.answer);
+    const firstSave = savedItemEvidence(db, screen.itemInstanceId);
+    expect(firstSave.attempts).toHaveLength(1);
+    expect(firstSave.xp).toHaveLength(1);
+    const storedTimes = db
+      .prepare(
+        `SELECT shown_at AS shownAt, submitted_at AS submittedAt
+         FROM attempts WHERE id = ?`,
+      )
+      .get(firstSave.attempts[0]?.id) as { shownAt: string; submittedAt: string };
+    expect(storedTimes.shownAt).toBe(saved.shownAt);
+    expect(storedTimes.submittedAt).toBe(saved.submittedAt);
+    const queuedLatency = Date.parse(saved.submittedAt) - Date.parse(saved.shownAt);
+    expect(Date.parse(storedTimes.submittedAt) - Date.parse(storedTimes.shownAt)).toBe(queuedLatency);
+    expect(queuedLatency).toBeLessThanOrEqual(ATTEMPT_LATENCY_CAP_MS);
+    expect(readAttemptLog(db, firstSave.attempts[0]?.id ?? "").latencyMs).toBe(
+      Math.min(queuedLatency, ATTEMPT_LATENCY_CAP_MS),
+    );
+    expect(Date.parse(storedTimes.submittedAt)).toBeGreaterThanOrEqual(Date.parse(screen.issuedAt));
+    expect(Date.parse(storedTimes.submittedAt)).toBeLessThanOrEqual(Date.now());
+    expect(timedOut.parked[0]?.shownAt).toBe(saved.shownAt);
+    expect(timedOut.parked[0]?.submittedAt).toBe(saved.submittedAt);
+    const replayed = await queue.retryParkedOnce(async (attempt) => {
+      expect(attempt.shownAt).toBe(saved.shownAt);
+      expect(attempt.submittedAt).toBe(saved.submittedAt);
+      const posted = await postAttemptRoute(db, token, child.id, attempt);
+      expect(posted.status).toBe(200);
+      expect(posted.body.replayed).toBe(true);
+      if (!posted.body.attemptId) throw new Error("replayed retry was not the saved attempt");
+      return { ok: true as const, result: posted.body as AttemptResult };
+    });
+    expect(replayed.parked).toEqual([]);
+    expect(replayed.dropped).toEqual([]);
+    expect(replayed.quietCredits).toBe(1);
+    expect(replayed.synced.map((result) => result.idempotencyKey)).toEqual([saved.idempotencyKey]);
+    const afterReplay = savedItemEvidence(db, screen.itemInstanceId);
+    expect(afterReplay.attempts).toHaveLength(1);
+    expect(afterReplay.xp).toHaveLength(1);
+    expect(afterReplay).toEqual(firstSave);
+    const stillStored = db
+      .prepare(
+        `SELECT shown_at AS shownAt, submitted_at AS submittedAt
+         FROM attempts WHERE id = ?`,
+      )
+      .get(firstSave.attempts[0]?.id) as { shownAt: string; submittedAt: string };
+    expect(stillStored).toEqual(storedTimes);
+  });
+
+  it("counts device latency for the too-fast flag and caps parent minutes", () => {
+    expect(responseLatencyMs("2026-06-15T18:00:02.000Z", "2026-06-15T18:00:01.000Z")).toBe(0);
+    expect(responseLatencyMs("not-a-time", "also-not")).toBe(0);
+    const shown = "2026-06-15T16:00:00.000Z";
+    const over = new Date(Date.parse(shown) + ATTEMPT_LATENCY_CAP_MS + 60_000).toISOString();
+    expect(responseLatencyMs(shown, over)).toBe(ATTEMPT_LATENCY_CAP_MS);
+    const db = tempDb();
+    const { guardian, child, session } = granted(db, "latency-cap@example.com");
+    const screen = readItemInstance(db, session.item.itemInstanceId ?? "");
+    if (!screen) throw new Error("session did not issue");
+    const fast = submitAnswer(
+      db,
+      guardian.id,
+      child.id,
+      {
+        idempotencyKey: "latency-too-fast",
+        sessionId: session.sessionId,
+        itemId: session.item.id,
+        itemInstanceId: screen.itemInstanceId,
+        answer: screen.canonicalAnswer,
+        shownAt: screen.issuedAt,
+        submittedAt: screen.issuedAt,
+      },
+      { now: screen.issuedAt },
+    );
+    if (isFormatRejected(fast)) throw new Error("a readable answer was rejected");
+    expect(fast.flags).toContain("too_fast");
+    const fastRow = db
+      .prepare(`SELECT shown_at AS shownAt, submitted_at AS submittedAt FROM attempts WHERE id = ?`)
+      .get(fast.attemptId) as { shownAt: string; submittedAt: string };
+    expect(readAttemptLog(db, fast.attemptId).latencyMs).toBe(0);
+    expect(fastRow.shownAt).toBe(screen.issuedAt);
+    expect(fastRow.submittedAt).toBe(screen.issuedAt);
+    const next = readItemInstance(db, fast.nextItem.itemInstanceId ?? "");
+    if (!next) throw new Error("next item was not issued");
+    const longSubmitted = new Date(
+      Date.parse(next.issuedAt) + ATTEMPT_LATENCY_CAP_MS + 30 * 60_000,
+    ).toISOString();
+    const capped = submitAnswer(
+      db,
+      guardian.id,
+      child.id,
+      {
+        idempotencyKey: "latency-capped",
+        sessionId: session.sessionId,
+        itemId: session.item.id,
+        itemInstanceId: next.itemInstanceId,
+        answer: next.canonicalAnswer,
+        shownAt: next.issuedAt,
+        submittedAt: longSubmitted,
+      },
+      { now: longSubmitted },
+    );
+    if (isFormatRejected(capped)) throw new Error("a readable answer was rejected");
+    expect(capped.flags).not.toContain("too_fast");
+    expect(readAttemptLog(db, capped.attemptId).latencyMs).toBe(ATTEMPT_LATENCY_CAP_MS);
+    const summary = readParentSummary(db, guardian.id, child.id, longSubmitted);
+    expect(summary.minutes).toBe(2);
+  });
+
+  it("clamps stored response time at 120 seconds and still counts the attempt", () => {
+    expect(ATTEMPT_LATENCY_CAP_MS).toBe(120_000);
+    const shown = "2026-06-15T18:00:00.000Z";
+    const at = (seconds: number) => new Date(Date.parse(shown) + seconds * 1_000).toISOString();
+    expect(responseLatencyMs(shown, at(119)) / 1_000).toBe(119);
+    expect(responseLatencyMs(shown, at(120)) / 1_000).toBe(120);
+    expect(responseLatencyMs(shown, at(121)) / 1_000).toBe(120);
+    expect(responseLatencyMs(shown, at(86_400)) / 1_000).toBe(120);
+
+    const db = tempDb();
+    const { guardian, child, session } = granted(db, "latency-bounds@example.com");
+    const spans = [119, 120, 121, 86_400] as const;
+    const storedSeconds: number[] = [];
+    let item = readItemInstance(db, session.item.itemInstanceId ?? "");
+    let sameDayAt = "";
+    for (const seconds of spans) {
+      if (!item) throw new Error("item was not issued");
+      const submittedAt = new Date(Date.parse(item.issuedAt) + seconds * 1_000).toISOString();
+      if (seconds === 121) sameDayAt = submittedAt;
+      const saved = submitAnswer(
+        db,
+        guardian.id,
+        child.id,
+        {
+          idempotencyKey: `latency-bound-${seconds}`,
+          sessionId: session.sessionId,
+          itemId: session.item.id,
+          itemInstanceId: item.itemInstanceId,
+          answer: item.canonicalAnswer,
+          shownAt: item.issuedAt,
+          submittedAt,
+        },
+        { now: submittedAt },
+      );
+      if (isFormatRejected(saved)) throw new Error("a readable answer was rejected");
+      const latencyMs = readAttemptLog(db, saved.attemptId).latencyMs;
+      storedSeconds.push(latencyMs / 1_000);
+      const row = db
+        .prepare(
+          `SELECT estimator_evidence AS evidence, evidence_reason AS reason
+           FROM attempts WHERE id = ?`,
+        )
+        .get(saved.attemptId) as { evidence: number; reason: string | null };
+      expect(row.evidence, `span ${seconds}`).toBe(1);
+      expect(row.reason).toBeNull();
+      expect(saved.flags).not.toContain("too_fast");
+      expect(saved.correct).toBe(true);
+      item = readItemInstance(db, saved.nextItem.itemInstanceId ?? "");
+    }
+    expect(storedSeconds).toEqual([119, 120, 120, 120]);
+    const summary = readParentSummary(db, guardian.id, child.id, sameDayAt);
+    expect(summary.minutes).toBe(Math.floor((119 + 120 + 120) / 60));
+  });
+
+  it("clamps a slow or fast device clock onto the server window and stores that day", () => {
+    const clocks = [
+      {
+        label: "20s slow",
+        key: "clock-20s-slow",
+        email: "clock-20s@example.com",
+        issuedAt: "2026-09-26T18:00:00.000Z",
+        receivedAt: "2026-09-26T18:01:00.000Z",
+        submittedAt: "2026-09-26T18:00:40.000Z",
+        storedAt: "2026-09-26T18:00:40.000Z",
+        clamped: 0,
+        day: "2026-09-26",
+      },
+      {
+        label: "10 minutes slow",
+        key: "clock-10m-slow",
+        email: "clock-10m@example.com",
+        issuedAt: "2026-09-26T07:00:30.000Z",
+        receivedAt: "2026-09-26T07:01:00.000Z",
+        submittedAt: "2026-09-26T06:51:00.000Z",
+        storedAt: "2026-09-26T07:00:30.000Z",
+        clamped: 1,
+        day: "2026-09-26",
+      },
+      {
+        label: "3 minutes fast",
+        key: "clock-3m-fast",
+        email: "clock-3m@example.com",
+        issuedAt: "2026-09-27T06:58:00.000Z",
+        receivedAt: "2026-09-27T06:59:00.000Z",
+        submittedAt: "2026-09-27T07:02:00.000Z",
+        storedAt: "2026-09-27T06:59:00.000Z",
+        clamped: 1,
+        day: "2026-09-26",
+      },
+    ];
+    for (const clock of clocks) {
+      const db = tempDb();
+      const { guardian, child, session } = granted(db, clock.email);
+      const screen = readItemInstance(db, session.item.itemInstanceId ?? "");
+      if (!screen) throw new Error("session did not issue");
+      db.prepare(`UPDATE item_instances SET issued_at = ? WHERE item_instance_id = ?`).run(
+        clock.issuedAt,
+        screen.itemInstanceId,
+      );
+      const saved = submitAnswer(
+        db,
+        guardian.id,
+        child.id,
+        {
+          idempotencyKey: clock.key,
+          sessionId: session.sessionId,
+          itemId: session.item.id,
+          itemInstanceId: screen.itemInstanceId,
+          answer: screen.canonicalAnswer,
+          shownAt: new Date(Date.parse(clock.submittedAt) - 8_000).toISOString(),
+          submittedAt: clock.submittedAt,
+        },
+        { now: clock.receivedAt },
+      );
+      if (isFormatRejected(saved)) throw new Error(`${clock.label} was rejected`);
+      const row = db
+        .prepare(
+          `SELECT submitted_at AS submittedAt, submitted_at_clamped AS clamped,
+                  estimator_evidence AS evidence, evidence_reason AS reason
+           FROM attempts WHERE id = ?`,
+        )
+        .get(saved.attemptId) as {
+        submittedAt: string;
+        clamped: number;
+        evidence: number;
+        reason: string | null;
+      };
+      expect(row.submittedAt, clock.label).toBe(clock.storedAt);
+      expect(row.clamped, clock.label).toBe(clock.clamped);
+      expect(row.evidence, clock.label).toBe(1);
+      expect(row.reason, clock.label).toBeNull();
+      expect(saved.flags, clock.label).not.toContain("too_fast");
+      const storedDay = localDate(row.submittedAt, child.timezone);
+      expect(storedDay, clock.label).toBe(clock.day);
+      const practiceDay = db
+        .prepare(
+          `SELECT local_day AS localDay FROM qualifying_events
+           WHERE child_id = ? AND kind = 'QualifyingPracticeDay'`,
+        )
+        .get(child.id) as { localDay: string };
+      expect(practiceDay.localDay, clock.label).toBe(storedDay);
+    }
+  });
+
+  it("parks a malformed submitted time instead of retrying it", async () => {
+    const db = tempDb();
+    const { guardian, child, session } = granted(db, "submitted-invalid@example.com");
+    const screen = readItemInstance(db, session.item.itemInstanceId ?? "");
+    if (!screen) throw new Error("session did not issue");
+    let missing: unknown;
+    try {
+      parseSubmitAttempt({
+        idempotencyKey: "submitted-missing",
+        sessionId: session.sessionId,
+        itemId: session.item.id,
+        itemInstanceId: screen.itemInstanceId,
+        answer: screen.canonicalAnswer,
+        shownAt: screen.issuedAt,
+      });
+    } catch (error) {
+      missing = error;
+    }
+    expect((missing as DomainError).code).toBe("submitted_at_invalid");
+    let unparseable: unknown;
+    try {
+      submitAnswer(db, guardian.id, child.id, {
+        idempotencyKey: "submitted-unparseable",
+        sessionId: session.sessionId,
+        itemId: session.item.id,
+        itemInstanceId: screen.itemInstanceId,
+        answer: screen.canonicalAnswer,
+        shownAt: screen.issuedAt,
+        submittedAt: "not-a-time",
+      });
+    } catch (error) {
+      unparseable = error;
+    }
+    const body = publicErrorBody(unparseable).body;
+    expect(body.code).toBe("submitted_at_invalid");
+    const classified = classifyAttemptFailure(400, body);
+    expect(classified).toEqual({
+      ok: false,
+      reason: "park",
+      message: interfaceCopy("offline.time.kid"),
+    });
+    if (!classified || classified.reason !== "park") throw new Error("invalid time was not parked");
+    expect(classified.message).not.toBe(body.error);
+    const attempt: QueuedAttempt = {
+      idempotencyKey: "submitted-unparseable-queue",
+      childId: child.id,
+      sessionId: session.sessionId,
+      itemId: session.item.id,
+      itemInstanceId: screen.itemInstanceId,
+      answer: screen.canonicalAnswer,
+      shownAt: screen.issuedAt,
+      submittedAt: "not-a-time",
+    };
+    const queue = createAttemptQueue(memoryQueueStore());
+    await queue.enqueue(attempt);
+    let posts = 0;
+    const post = async () => {
+      posts += 1;
+      return classified;
+    };
+    const parked = await queue.reconcile(post);
+    expect(posts).toBe(1);
+    expect(parked.pending).toEqual([]);
+    expect(parked.lastError).toBeUndefined();
+    expect(parked.parked[0]?.message).toBe(interfaceCopy("offline.time.kid"));
+    await queue.reconcile(post);
+    expect(posts).toBe(1);
+    const retried = await queue.retryParkedOnce(post);
+    expect(posts).toBe(2);
+    expect(retried.pending).toEqual([]);
+    expect(retried.parked).toEqual([]);
+    await queue.reconcile(post);
+    await queue.retryParkedOnce(post);
+    expect(posts).toBe(2);
+    const client = readFileSync(path.join(process.cwd(), "components/practice-session.tsx"), "utf8");
+    expect(client).toContain('body?.code === "submitted_at_invalid"');
+    expect(client).toContain('interfaceCopy("offline.time.kid")');
+    expect(client).not.toContain("must be a valid time");
+  });
+
+  it("saves a late replay with HonestAttempt and no concept tick or band transition", async () => {
+    const db = tempDb();
+    const { guardian, child, session } = granted(db, "late-replay@example.com");
+    const token = createSession(db, guardian.id);
+    const older = readItemInstance(db, session.item.itemInstanceId ?? "");
+    if (!older) throw new Error("session did not issue");
+    expect(older.evidenceEligible).toBe(true);
+    const skillOf = (templateId: string, templateVersion: number) =>
+      (
+        db
+          .prepare(
+            `SELECT skill_id AS skillId FROM item_template_versions
+             WHERE template_id = ? AND template_version = ?`,
+          )
+          .get(templateId, templateVersion) as { skillId: string }
+      ).skillId;
+    const skillId = skillOf(older.templateId, older.templateVersion);
+    const newer = issueForProgression(db, {
+      childId: child.id,
+      sessionId: session.sessionId,
+      skillId,
+      idempotencyKey: "late-replay-newer-issue",
+      now: new Date(Date.parse(older.issuedAt) + 5_000).toISOString(),
+      allowSoleTemplateBackToBack: true,
+    });
+    expect(skillOf(newer.templateId, newer.templateVersion)).toBe(skillId);
+    expect(Date.parse(newer.issuedAt)).toBeGreaterThan(Date.parse(older.issuedAt));
+    const newerAt = new Date(Date.parse(newer.issuedAt) + 3_000).toISOString();
+    const scoredNewer = submitAnswer(
+      db,
+      guardian.id,
+      child.id,
+      {
+        idempotencyKey: "late-replay-newer-score",
+        sessionId: session.sessionId,
+        itemId: session.item.id,
+        itemInstanceId: newer.itemInstanceId,
+        answer: newer.canonicalAnswer,
+        shownAt: new Date(Date.parse(newerAt) - 2_000).toISOString(),
+        submittedAt: newerAt,
+      },
+      { now: newerAt },
+    );
+    if (isFormatRejected(scoredNewer)) throw new Error("a readable answer was rejected");
+    const bandAfterNewer = db
+      .prepare(
+        `SELECT skill, band_label AS bandLabel, show_concept_chip AS chip, celebration_tier AS tier
+         FROM learner_skill_state WHERE child_id = ? ORDER BY skill`,
+      )
+      .all(child.id);
+    const parked: QueuedAttempt = {
+      idempotencyKey: "late-replay-older",
+      childId: child.id,
+      sessionId: session.sessionId,
+      itemId: session.item.id,
+      itemInstanceId: older.itemInstanceId,
+      answer: older.canonicalAnswer,
+      shownAt: new Date(Date.parse(older.issuedAt) + 1_000).toISOString(),
+      submittedAt: new Date(Date.parse(older.issuedAt) + 3_000).toISOString(),
+    };
+    const queue = createAttemptQueue(
+      memoryQueueStore({
+        version: 1,
+        pending: [],
+        blocked: [],
+        parked: [{ ...parked, message: interfaceCopy("offline.parked.kid") }],
+        dropped: [],
+        synced: [],
+      }),
+    );
+    const synced = await queue.retryParkedOnce(async (attempt) => {
+      const posted = await postAttemptRoute(db, token, child.id, attempt);
+      expect(posted.status).toBe(200);
+      if (!posted.body.attemptId) throw new Error("late replay was not saved");
+      return { ok: true as const, result: posted.body as AttemptResult };
+    });
+    expect(synced.parked).toEqual([]);
+    const saved = savedItemEvidence(db, older.itemInstanceId);
+    expect(saved.attempts).toHaveLength(1);
+    expect(saved.xp).toHaveLength(1);
+    const row = db
+      .prepare(
+        `SELECT estimator_evidence AS evidence, evidence_reason AS reason
+         FROM attempts WHERE id = ?`,
+      )
+      .get(saved.attempts[0]?.id) as { evidence: number; reason: string | null };
+    expect(row).toEqual({ evidence: 0, reason: "late_replay" });
+    expect(
+      db
+        .prepare(
+          `SELECT skill, band_label AS bandLabel, show_concept_chip AS chip, celebration_tier AS tier
+           FROM learner_skill_state WHERE child_id = ? ORDER BY skill`,
+        )
+        .all(child.id),
+    ).toEqual(bandAfterNewer);
+    const honest = db
+      .prepare(
+        `SELECT qualifies FROM qualifying_events
+         WHERE attempt_id = ? AND kind = 'HonestAttempt'`,
+      )
+      .get(saved.attempts[0]?.id) as { qualifies: number };
+    expect(honest.qualifies).toBe(1);
+    const kinds = (
+      db
+        .prepare(`SELECT kind FROM qualifying_events WHERE attempt_id = ? ORDER BY rowid`)
+        .all(saved.attempts[0]?.id) as Array<{ kind: string }>
+    ).map((row) => row.kind);
+    expect(kinds).toContain("HonestAttempt");
+    expect(kinds).not.toContain("ConceptProgressTick");
+    expect(kinds).not.toContain("MasteryBandTransition");
+    const storedReplay = db
+      .prepare(`SELECT submitted_at AS submittedAt FROM attempts WHERE id = ?`)
+      .get(saved.attempts[0]?.id) as { submittedAt: string };
+    const replayDay = localDate(storedReplay.submittedAt, child.timezone);
+    const practiceDay = db
+      .prepare(
+        `SELECT COUNT(*) AS count FROM qualifying_events
+         WHERE child_id = ? AND kind = 'QualifyingPracticeDay' AND local_day = ?`,
+      )
+      .get(child.id, replayDay) as { count: number };
+    expect(practiceDay.count).toBe(1);
+  });
+
+  it("counts a parked answer normally when no newer attempt exists on that skill", async () => {
+    const db = tempDb();
+    const { guardian, child, session } = granted(db, "on-time-replay@example.com");
+    const token = createSession(db, guardian.id);
+    const screen = readItemInstance(db, session.item.itemInstanceId ?? "");
+    if (!screen) throw new Error("session did not issue");
+    expect(screen.evidenceEligible).toBe(true);
+    const parked: QueuedAttempt = {
+      idempotencyKey: "on-time-parked",
+      childId: child.id,
+      sessionId: session.sessionId,
+      itemId: session.item.id,
+      itemInstanceId: screen.itemInstanceId,
+      answer: screen.canonicalAnswer,
+      shownAt: new Date(Date.parse(screen.issuedAt) + 1_000).toISOString(),
+      submittedAt: new Date(Date.parse(screen.issuedAt) + 3_000).toISOString(),
+    };
+    const queue = createAttemptQueue(
+      memoryQueueStore({
+        version: 1,
+        pending: [],
+        blocked: [],
+        parked: [{ ...parked, message: interfaceCopy("offline.parked.kid") }],
+        dropped: [],
+        synced: [],
+      }),
+    );
+    await queue.retryParkedOnce(async (attempt) => {
+      const posted = await postAttemptRoute(db, token, child.id, attempt);
+      expect(posted.status).toBe(200);
+      if (!posted.body.attemptId) throw new Error("parked answer was not saved");
+      return { ok: true as const, result: posted.body as AttemptResult };
+    });
+    const saved = savedItemEvidence(db, screen.itemInstanceId);
+    expect(saved.attempts).toHaveLength(1);
+    expect(saved.xp).toHaveLength(1);
+    const row = db
+      .prepare(
+        `SELECT estimator_evidence AS evidence, evidence_reason AS reason, correct
+         FROM attempts WHERE id = ?`,
+      )
+      .get(saved.attempts[0]?.id) as { evidence: number; reason: string | null; correct: number };
+    expect(row).toEqual({ evidence: 1, reason: null, correct: 1 });
+    const band = db
+      .prepare(`SELECT band_label AS bandLabel FROM learner_skill_state WHERE child_id = ?`)
+      .get(child.id) as { bandLabel: string };
+    expect(band.bandLabel).toBeTruthy();
+    const honest = db
+      .prepare(
+        `SELECT qualifies FROM qualifying_events
+         WHERE attempt_id = ? AND kind = 'HonestAttempt'`,
+      )
+      .get(saved.attempts[0]?.id) as { qualifies: number };
+    expect(honest.qualifies).toBe(1);
+    const day = db
+      .prepare(
+        `SELECT COUNT(*) AS count FROM qualifying_events
+         WHERE child_id = ? AND kind = 'QualifyingPracticeDay'`,
+      )
+      .get(child.id) as { count: number };
+    expect(day.count).toBe(1);
+  });
+
+  it("posts each queued key once when two flushes start together", async () => {
+    const queue = createAttemptQueue(memoryQueueStore());
+    const first: QueuedAttempt = {
+      idempotencyKey: "flush-together-a",
+      childId: "child-1",
+      sessionId: "session-1",
+      itemId: "ops-g2-add",
+      answer: "42",
+      shownAt: shown(),
+      submittedAt: WHEN,
+      itemInstanceId: "issued-instance-01",
+    };
+    const second: QueuedAttempt = {
+      ...first,
+      idempotencyKey: "flush-together-b",
+      answer: "7",
+      itemInstanceId: "issued-instance-02",
+    };
+    await queue.enqueue(first);
+    await queue.enqueue(second);
+    const posts: string[] = [];
+    const flush = () =>
+      queue.reconcile(async (attempt) => {
+        posts.push(attempt.idempotencyKey);
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        return { ok: true as const, result: syncedAttempt(attempt.idempotencyKey) };
+      });
+    await Promise.all([runSingleFlightFlush(flush), runSingleFlightFlush(flush)]);
+    expect(posts).toEqual([first.idempotencyKey, second.idempotencyKey]);
+    const client = readFileSync(path.join(process.cwd(), "components/practice-session.tsx"), "utf8");
+    expect(client).toContain("runSingleFlightFlush(() => flushOnce())");
+  });
+
+  it("runs one follow-up flush when another trigger arrives mid-flush", async () => {
+    const queue = createAttemptQueue(memoryQueueStore());
+    const first: QueuedAttempt = {
+      idempotencyKey: "flush-follow-a",
+      childId: "child-1",
+      sessionId: "session-1",
+      itemId: "ops-g2-add",
+      answer: "42",
+      shownAt: shown(),
+      submittedAt: WHEN,
+      itemInstanceId: "issued-instance-01",
+    };
+    const second: QueuedAttempt = {
+      ...first,
+      idempotencyKey: "flush-follow-b",
+      answer: "7",
+      itemInstanceId: "issued-instance-02",
+    };
+    await queue.enqueue(first);
+    await queue.enqueue(second);
+    const posts: string[] = [];
+    let passes = 0;
+    const flush = () => {
+      passes += 1;
+      return queue.reconcile(async (attempt) => {
+        posts.push(attempt.idempotencyKey);
+        if (passes === 1 && attempt.idempotencyKey === first.idempotencyKey) {
+          void runSingleFlightFlush(flush);
+          void runSingleFlightFlush(flush);
+        }
+        return { ok: true as const, result: syncedAttempt(attempt.idempotencyKey) };
+      });
+    };
+    const snapshot = await runSingleFlightFlush(flush);
+    expect(passes).toBe(2);
+    expect(posts).toEqual([first.idempotencyKey, second.idempotencyKey]);
+    expect(snapshot.pending).toEqual([]);
+  });
+
+  it("keeps a parked entry when a parked retry and a flush interleave", async () => {
+    const parkedAttempt: QueuedAttempt = {
+      idempotencyKey: "interleave-parked",
+      childId: "child-1",
+      sessionId: "session-1",
+      itemId: "ops-g2-add",
+      answer: "42",
+      shownAt: shown(),
+      submittedAt: WHEN,
+      itemInstanceId: "issued-instance-parked",
+    };
+    const pendingAttempt: QueuedAttempt = {
+      ...parkedAttempt,
+      idempotencyKey: "interleave-pending",
+      answer: "7",
+      itemInstanceId: "issued-instance-pending",
+    };
+    const queue = createAttemptQueue(
+      memoryQueueStore({
+        version: 1,
+        pending: [pendingAttempt],
+        blocked: [],
+        parked: [{ ...parkedAttempt, message: interfaceCopy("offline.parked.kid") }],
+        dropped: [],
+        synced: [],
+      }),
+    );
+    let releaseParked!: () => void;
+    const parkedGate = new Promise<void>((resolve) => {
+      releaseParked = resolve;
+    });
+    const posts: string[] = [];
+    const retry = queue.retryParkedOnce(async (attempt) => {
+      posts.push(attempt.idempotencyKey);
+      await parkedGate;
+      return { ok: true as const, result: syncedAttempt(attempt.idempotencyKey) };
+    });
+    const flush = queue.reconcile(async (attempt) => {
+      posts.push(attempt.idempotencyKey);
+      return { ok: true as const, result: syncedAttempt(attempt.idempotencyKey) };
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    releaseParked();
+    await Promise.all([retry, flush]);
+    expect(posts).toEqual([parkedAttempt.idempotencyKey, pendingAttempt.idempotencyKey]);
+    const snapshot = queue.snapshot();
+    expect(snapshot.parked).toEqual([]);
+    expect(snapshot.pending).toEqual([]);
+    expect(snapshot.synced.map((result) => result.idempotencyKey)).toEqual([
+      parkedAttempt.idempotencyKey,
+      pendingAttempt.idempotencyKey,
+    ]);
+  });
+
+  it("keeps an enqueue that arrives while reconcile is posting", async () => {
+    const queue = createAttemptQueue(memoryQueueStore());
+    const first: QueuedAttempt = {
+      idempotencyKey: "enqueue-mid-a",
+      childId: "child-1",
+      sessionId: "session-1",
+      itemId: "ops-g2-add",
+      answer: "42",
+      shownAt: shown(),
+      submittedAt: WHEN,
+      itemInstanceId: "issued-instance-a",
+    };
+    const second: QueuedAttempt = {
+      ...first,
+      idempotencyKey: "enqueue-mid-b",
+      answer: "7",
+      itemInstanceId: "issued-instance-b",
+    };
+    await queue.enqueue(first);
+    let releasePost: () => void = () => {};
+    const gate = new Promise<void>((resolve) => {
+      releasePost = resolve;
+    });
+    let entered: () => void = () => {};
+    const posting = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const reconciling = queue.reconcile(async () => {
+      entered();
+      await gate;
+      return { ok: false as const, reason: "offline" as const };
+    });
+    await posting;
+    const enqueued = queue.enqueue(second);
+    releasePost();
+    await reconciling;
+    await enqueued;
+    expect(queue.snapshot().pending.map((entry) => entry.idempotencyKey)).toEqual([
+      first.idempotencyKey,
+      second.idempotencyKey,
+    ]);
+  });
+
+  it("parks a try after repeated server errors or after it ages out", async () => {
+    const head: QueuedAttempt = {
+      idempotencyKey: "stuck-head",
+      childId: "child-1",
+      sessionId: "session-1",
+      itemId: "ops-g2-add",
+      answer: "42",
+      shownAt: shown(),
+      submittedAt: WHEN,
+      itemInstanceId: "issued-instance-01",
+    };
+    const later: QueuedAttempt = {
+      idempotencyKey: "later-answer",
+      childId: "child-1",
+      sessionId: "session-1",
+      itemId: "ops-g2-add",
+      answer: "7",
+      shownAt: shown(),
+      submittedAt: WHEN,
+      itemInstanceId: "issued-instance-02",
+    };
+    const queue = createAttemptQueue(memoryQueueStore());
+    await queue.enqueue(head);
+    await queue.enqueue(later);
+    let laterPosts = 0;
+    const serverError = () => {
+      const classified = classifyAttemptFailure(500, { error: "Something went wrong." });
+      if (!classified) throw new Error("expected a retryable server error");
+      return classified;
+    };
+    for (let attempt = 1; attempt < QUEUE_PARK_AFTER_FAILURES; attempt += 1) {
+      const waiting = await queue.reconcile(async (entry) => {
+        expect(entry.idempotencyKey).toBe(head.idempotencyKey);
+        return serverError();
+      }, { now: WHEN });
+      expect(waiting.pending.map((entry) => entry.idempotencyKey)).toEqual([
+        head.idempotencyKey,
+        later.idempotencyKey,
+      ]);
+      expect(waiting.parked).toEqual([]);
+      expect(laterPosts).toBe(0);
+    }
+    let issuedAfterPark = false;
+    const parked = await issueAfterQueueDrain(
+      () =>
+        queue.reconcile(
+          async (entry) => {
+            if (entry.idempotencyKey === later.idempotencyKey) laterPosts += 1;
+            if (entry.idempotencyKey === head.idempotencyKey) return serverError();
+            return { ok: true as const, result: syncedAttempt(entry.idempotencyKey) };
+          },
+          { now: WHEN },
+        ),
+      async () => {
+        issuedAfterPark = true;
+        return "shown";
+      },
+    );
+    expect(laterPosts).toBe(1);
+    expect(parked.snapshot.pending).toEqual([]);
+    expect(parked.snapshot.parked).toEqual([
+      {
+        ...head,
+        syncFailures: QUEUE_PARK_AFTER_FAILURES,
+        firstFailedAt: WHEN,
+        message: interfaceCopy("offline.parked.kid"),
+      },
+    ]);
+    expect(parked.snapshot.parked[0]?.answer).toBe(head.answer);
+    expect(parked.snapshot.synced.map((result) => result.idempotencyKey)).toEqual([later.idempotencyKey]);
+    expect(issuedAfterPark).toBe(true);
+    expect(parked.issued).toBe("shown");
+    const notice = renderToStaticMarkup(createElement(ParkedAttemptNotice));
+    expect(notice).toContain('data-testid="parked-attempt"');
+    expect(notice).toContain(interfaceCopy("offline.parked.kid"));
+    expect(notice.toLowerCase()).not.toMatch(/5xx|session_ended|error code/);
+
+    const agedHead: QueuedAttempt = {
+      ...head,
+      idempotencyKey: "aged-head",
+      answer: "99",
+      submittedAt: new Date(Date.parse(WHEN) - QUEUE_PARK_AFTER_MS).toISOString(),
+    };
+    const agedLater: QueuedAttempt = { ...later, idempotencyKey: "aged-later", answer: "3" };
+    const aged = createAttemptQueue(memoryQueueStore());
+    await aged.enqueue(agedHead);
+    await aged.enqueue(agedLater);
+    const stillWaiting = await aged.reconcile(
+      async (entry) => {
+        expect(entry.idempotencyKey).toBe(agedHead.idempotencyKey);
+        return serverError();
+      },
+      { now: WHEN },
+    );
+    expect(stillWaiting.parked).toEqual([]);
+    expect(stillWaiting.pending.map((entry) => entry.idempotencyKey)).toEqual([
+      agedHead.idempotencyKey,
+      agedLater.idempotencyKey,
+    ]);
+    expect(stillWaiting.pending[0]).toMatchObject({
+      answer: agedHead.answer,
+      syncFailures: 1,
+      firstFailedAt: WHEN,
+    });
+    expect(stillWaiting.synced).toEqual([]);
+    const agedOut = await aged.reconcile(
+      async (entry) => {
+        if (entry.idempotencyKey === agedHead.idempotencyKey) return serverError();
+        return { ok: true as const, result: syncedAttempt(entry.idempotencyKey) };
+      },
+      { now: new Date(Date.parse(WHEN) + QUEUE_PARK_AFTER_MS).toISOString() },
+    );
+    expect(agedOut.pending).toEqual([]);
+    expect(agedOut.parked).toEqual([
+      {
+        ...agedHead,
+        syncFailures: 2,
+        firstFailedAt: WHEN,
+        message: interfaceCopy("offline.parked.kid"),
+      },
+    ]);
+    expect(agedOut.parked[0]?.answer).toBe(agedHead.answer);
+    expect(agedOut.synced.map((result) => result.idempotencyKey)).toEqual([agedLater.idempotencyKey]);
+  });
+
+  it("retries a parked answer once on the next session start, then drops it", async () => {
+    const parkedAttempt: QueuedAttempt = {
+      idempotencyKey: "parked-answer",
+      childId: "child-1",
+      sessionId: "session-1",
+      itemId: "ops-g2-add",
+      answer: "42",
+      shownAt: shown(),
+      submittedAt: WHEN,
+      itemInstanceId: "issued-instance-01",
+      syncFailures: QUEUE_PARK_AFTER_FAILURES,
+      firstFailedAt: WHEN,
+    };
+    const storage = new Map<string, string>();
+    const memory = {
+      getItem: (key: string) => storage.get(key) ?? null,
+      setItem: (key: string, value: string) => {
+        storage.set(key, value);
+      },
+    };
+    const queue = createAttemptQueue(storageQueueStore(memory, "math-sprout-queue"));
+    await queue.enqueue({
+      idempotencyKey: parkedAttempt.idempotencyKey,
+      childId: parkedAttempt.childId,
+      sessionId: parkedAttempt.sessionId,
+      itemId: parkedAttempt.itemId,
+      answer: parkedAttempt.answer,
+      shownAt: parkedAttempt.shownAt,
+      submittedAt: parkedAttempt.submittedAt,
+      itemInstanceId: parkedAttempt.itemInstanceId,
+    });
+    await queue.reconcile(async () => {
+      const classified = classifyAttemptFailure(500, { error: "Something went wrong." });
+      if (!classified) throw new Error("expected a retryable server error");
+      return classified;
+    }, { now: WHEN });
+    await queue.reconcile(async () => {
+      const classified = classifyAttemptFailure(500, { error: "Something went wrong." });
+      if (!classified) throw new Error("expected a retryable server error");
+      return classified;
+    }, { now: WHEN });
+    const parked = await queue.reconcile(async () => {
+      const classified = classifyAttemptFailure(500, { error: "Something went wrong." });
+      if (!classified) throw new Error("expected a retryable server error");
+      return classified;
+    }, { now: WHEN });
+    expect(parked.parked[0]?.answer).toBe("42");
+    const restored = createAttemptQueue(storageQueueStore(memory, "math-sprout-queue"));
+    expect(restored.snapshot().parked[0]?.answer).toBe("42");
+    let posts = 0;
+    const failOnce = () =>
+      restored.retryParkedOnce(async (entry) => {
+        posts += 1;
+        expect(entry.answer).toBe("42");
+        const classified = classifyAttemptFailure(500, { error: "Something went wrong." });
+        if (!classified) throw new Error("expected a retryable server error");
+        return classified;
+      });
+    const started = await runShownSession("start", {
+      retryParked: failOnce,
+      flush: async () => restored.snapshot(),
+      openSession: async () => "shown",
+    });
+    expect(posts).toBe(1);
+    expect(started.shown).toBe("shown");
+    expect(started.snapshot.parked).toEqual([]);
+    expect(started.snapshot.dropped).toEqual([
+      {
+        idempotencyKey: parkedAttempt.idempotencyKey,
+        childId: parkedAttempt.childId,
+        sessionId: parkedAttempt.sessionId,
+      },
+    ]);
+    expect(JSON.stringify(started.snapshot.dropped)).not.toContain(`"answer"`);
+    const again = await runShownSession("start", {
+      retryParked: failOnce,
+      flush: async () => restored.snapshot(),
+      openSession: async () => "shown-again",
+    });
+    expect(posts).toBe(1);
+    expect(again.shown).toBe("shown-again");
+
+    const saved = createAttemptQueue(
+      memoryQueueStore({
+        version: 1,
+        pending: [],
+        blocked: [],
+        parked: [{ ...parkedAttempt, idempotencyKey: "parked-saved", message: interfaceCopy("offline.parked.kid") }],
+        dropped: [],
+        synced: [],
+      }),
+    );
+    let savedPosts = 0;
+    const reconnected = await runShownSession("reconnect", {
+      retryParked: () =>
+        saved.retryParkedOnce(async () => {
+          savedPosts += 1;
+          return { ok: true as const, result: syncedAttempt("parked-saved") };
+        }),
+      flush: async () => saved.snapshot(),
+    });
+    expect(savedPosts).toBe(0);
+    expect(reconnected.snapshot.parked).toHaveLength(1);
+    const accepted = await runShownSession("new-session", {
+      retryParked: () =>
+        saved.retryParkedOnce(async (entry) => {
+          savedPosts += 1;
+          expect(entry.answer).toBe("42");
+          return { ok: true as const, result: syncedAttempt(entry.idempotencyKey) };
+        }),
+      flush: async () => saved.snapshot(),
+      openSession: async () => "next",
+    });
+    expect(savedPosts).toBe(1);
+    expect(accepted.shown).toBe("next");
+    expect(accepted.snapshot.parked).toEqual([]);
+    expect(accepted.snapshot.synced.map((result) => result.idempotencyKey)).toEqual(["parked-saved"]);
+    expect(accepted.snapshot.dropped).toEqual([]);
+  });
+
+  it("issues no hidden items on session start, reconnect, or a new session", async () => {
+    const db = tempDb();
+    const guardian = createGuardian(db, {
+      email: "shown-only@example.com",
+      password: "correct-horse",
+      timezone: "America/Los_Angeles",
+    });
+    const child = createChild(db, guardian.id, { displayName: "Ava" });
+    setConsent(db, guardian.id, child.id, "grant");
+    const issuedIds = () =>
+      (
+        db.prepare(`SELECT item_instance_id AS id FROM item_instances WHERE child_id = ? ORDER BY issued_at, rowid`).all(
+          child.id,
+        ) as Array<{ id: string }>
+      ).map((row) => row.id);
+    const flush = async () => createAttemptQueue(memoryQueueStore()).snapshot();
+    const started = await runShownSession("start", {
+      flush,
+      openSession: () => Promise.resolve(startPracticeSession(db, guardian.id, child.id)),
+    });
+    const shownId = started.shown?.item.itemInstanceId;
+    if (!shownId) throw new Error("start did not show an item");
+    expect(issuedIds()).toEqual([shownId]);
+
+    await runShownSession("reconnect", {
+      flush,
+      openSession: () => Promise.reject(new Error("reconnect must not issue")),
+    });
+    expect(issuedIds()).toEqual([shownId]);
+
+    const screen = readItemInstance(db, shownId);
+    if (!screen || !started.shown) throw new Error("shown item is missing");
+    const answeredAt = new Date(Date.parse(screen.issuedAt) + 3_000).toISOString();
+    const scored = submitAnswer(
+      db,
+      guardian.id,
+      child.id,
+      {
+        idempotencyKey: "shown-screen-score",
+        sessionId: started.shown.sessionId,
+        itemId: started.shown.item.id,
+        itemInstanceId: shownId,
+        answer: screen.canonicalAnswer,
+        shownAt: new Date(Date.parse(answeredAt) - 2_000).toISOString(),
+        submittedAt: answeredAt,
+      },
+      { now: answeredAt },
+    );
+    if (isFormatRejected(scored)) throw new Error("a readable answer was rejected");
+    const beforeNewSession = issuedIds();
+    endPracticeSession(db, guardian.id, child.id, started.shown.sessionId);
+    choosePracticeLane(db, guardian.id, child.id, started.shown?.sessionId ?? "", "recommended");
+    const next = await runShownSession("new-session", {
+      flush,
+      openSession: () => Promise.resolve(startPracticeSession(db, guardian.id, child.id)),
+    });
+    const nextId = next.shown?.item.itemInstanceId;
+    if (!nextId || !next.shown) throw new Error("new session did not show an item");
+    expect(next.shown.sessionId).not.toBe(started.shown?.sessionId);
+    const nextRows = db
+      .prepare(`SELECT item_instance_id AS id FROM item_instances WHERE session_id = ?`)
+      .all(next.shown.sessionId) as Array<{ id: string }>;
+    expect(nextRows.map((row) => row.id)).toEqual([nextId]);
+    expect(beforeNewSession).toContain(shownId);
+    expect(beforeNewSession).not.toContain(nextId);
+    expect(issuedIds()).toEqual([...beforeNewSession, nextId]);
+
+    const client = readFileSync(path.join(process.cwd(), "components/practice-session.tsx"), "utf8");
+    expect(client).toContain('runShownSession("start"');
+    expect(client).toContain('runShownSession("reconnect"');
+    expect(client).toContain('runShownSession("new-session"');
+    expect(client).toContain("retryParkedOnce");
+    expect(client).not.toMatch(/\/items/);
+    expect(client).not.toContain("prefetchBatch");
+  });
+
   it("reloads the live session when a queued try is permanently invalid", () => {
     const reload = vi.fn();
     const snapshot = {
       version: 1 as const,
       pending: [],
       blocked: [],
+      parked: [],
       dropped: [],
       synced: [],
       invalidAttemptKeys: ["live-waiting-key"],
@@ -3503,7 +5562,7 @@ describe("item templates and issuance", () => {
       submittedAt: WHEN,
     };
     const queue = createAttemptQueue(memoryQueueStore());
-    expect(queue.enqueue(queued).pending).toHaveLength(1);
+    expect((await queue.enqueue(queued)).pending).toHaveLength(1);
     const synced = await queue.reconcile(async (attempt) => {
       const result = submitAnswer(
         db,

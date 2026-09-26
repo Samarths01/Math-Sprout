@@ -61,6 +61,11 @@ function attemptInput(db: Database.Database, sessionId: string) {
        ORDER BY issued_at DESC LIMIT 1`,
     )
     .get(sessionId) as { item_instance_id: string; canonical_answer: string } | undefined;
+  if (issued) {
+    db.prepare(
+      `UPDATE item_instances SET issued_at = ? WHERE item_instance_id = ? AND issued_at > ?`,
+    ).run(new Date(Date.parse(WHEN) - 1_000).toISOString(), issued.item_instance_id, WHEN);
+  }
   return {
     idempotencyKey: "build-tag-0001",
     sessionId,
@@ -668,6 +673,11 @@ describe("app build tag", () => {
 
     const nextId = result.nextItem.itemInstanceId;
     if (!nextId) throw new Error("missing next issued item");
+    db.prepare(`UPDATE item_instances SET issued_at = ? WHERE item_instance_id = ? AND issued_at > ?`).run(
+      new Date(Date.parse(WHEN) - 1_000).toISOString(),
+      nextId,
+      WHEN,
+    );
     db.prepare(
       `UPDATE item_instances
        SET canonical_answer = '1/2', answer_line = '1/2', require_form = 'lowest_terms', compare_mode = 'rational'

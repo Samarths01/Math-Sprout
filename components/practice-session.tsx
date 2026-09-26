@@ -7,11 +7,16 @@ import type { BoundaryOptions, PracticeLane } from "@/lib/mastery";
 import { interfaceCopy } from "@/lib/interface-copy";
 import { PracticeFeedback } from "@/components/practice-feedback";
 import {
+  advanceAfterQueuedSync,
   classifyAttemptFailure,
   consentQueueReason,
   createAttemptQueue,
   OFFLINE_QUEUE_CAP,
+  parkedRetryFailure,
+  QUEUE_RETRY_TIMEOUT_MS,
   reloadLiveSession,
+  runShownSession,
+  runSingleFlightFlush,
   storageQueueStore,
   type QueueSnapshot,
   type QueuedAttempt,
@@ -43,6 +48,14 @@ import { Label } from "@/components/ui/label";
 /** A stalled parent receipt is the same as being offline. */
 export const OFFLINE_CAP_TIMEOUT_MS = 8_000;
 
+export function ParkedAttemptNotice({ message }: { message?: string }) {
+  return (
+    <p data-testid="parked-attempt" role="status" className="text-sm leading-6">
+      {message && message.length > 0 ? message : interfaceCopy("offline.parked.kid")}
+    </p>
+  );
+}
+
 function answerKindOf(item: PublicItem): AnswerKind {
   return item.answerKind === "fraction" ? "fraction" : "whole";
 }
@@ -67,7 +80,11 @@ type SessionStart = {
   error?: string;
 };
 
-async function postAttempt(childId: string, attempt: QueuedAttempt): Promise<SyncPost> {
+async function postAttempt(
+  childId: string,
+  attempt: QueuedAttempt,
+  timeoutMs?: number,
+): Promise<SyncPost> {
   if (typeof navigator !== "undefined" && navigator.onLine === false) {
     return { ok: false, reason: "offline" };
   }
@@ -76,9 +93,10 @@ async function postAttempt(childId: string, attempt: QueuedAttempt): Promise<Syn
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(attempt),
+      ...(timeoutMs ? { signal: AbortSignal.timeout(timeoutMs) } : {}),
     });
     const body = (await response.json().catch(() => null)) as
-      | (AttemptResult & { error?: string; queueDisposition?: unknown })
+      | (AttemptResult & { error?: string; queueDisposition?: unknown; code?: unknown })
       | null;
     if (isFormatRejected(body)) {
       return { ok: false, reason: "format_rejected", rejected: body };
@@ -96,6 +114,13 @@ async function postAttempt(childId: string, attempt: QueuedAttempt): Promise<Syn
         message: body?.error ?? "Practice is blocked.",
       };
     }
+    if (body?.code === "submitted_at_invalid") {
+      return {
+        ok: false,
+        reason: "park",
+        message: interfaceCopy("offline.time.kid"),
+      };
+    }
     if (!response.ok || !body || typeof body.attemptId !== "string") {
       return {
         ok: false,
@@ -104,24 +129,60 @@ async function postAttempt(childId: string, attempt: QueuedAttempt): Promise<Syn
       };
     }
     return { ok: true, result: body };
-  } catch {
+  } catch (error) {
+    if (timeoutMs) return parkedRetryFailure(error);
     return { ok: false, reason: "offline" };
   }
 }
 
 type TurnCommand =
   | { type: "result"; result: AttemptResult }
-  | { type: "quiet" };
+  | { type: "quiet" }
+  | { type: "quietCredit" }
+  | { type: "held" }
+  | { type: "parked"; message?: string };
 
 type MountedTurn = {
   instanceId: string;
   apply: (command: TurnCommand) => void;
 };
 
+function armedAttemptKey(
+  snapshot: QueueSnapshot,
+  attemptedKey: string,
+  itemInstanceId: string | undefined,
+): string | null {
+  const open = [...snapshot.pending, ...snapshot.parked, ...snapshot.blocked];
+  if (open.some((entry) => entry.idempotencyKey === attemptedKey)) return attemptedKey;
+  const existing = open.find((entry) => entry.itemInstanceId === itemInstanceId);
+  return existing?.idempotencyKey ?? null;
+}
+
+function openItemQueue(snapshot: QueueSnapshot, itemInstanceId: string | undefined) {
+  const parked = snapshot.parked.find((entry) => entry.itemInstanceId === itemInstanceId);
+  const pending = snapshot.pending.find((entry) => entry.itemInstanceId === itemInstanceId);
+  const blocked = snapshot.blocked.find((entry) => entry.itemInstanceId === itemInstanceId);
+  if (parked) return { savedOffline: true, held: false, parkedMessage: parked.message };
+  if (blocked) return { savedOffline: false, held: true, parkedMessage: null as string | null };
+  if (pending) return { savedOffline: true, held: false, parkedMessage: null as string | null };
+  return { savedOffline: false, held: false, parkedMessage: null as string | null };
+}
+
+function rememberFuel(childId: string, synced: AttemptResult) {
+  markFuelPulse(window.sessionStorage, childId, {
+    tier: synced.clientView.celebrationTier,
+    credit: synced.fuel.credit,
+    eventCount: synced.eventIds.length,
+    replayed: synced.replayed,
+    resumeQuiet: false,
+    eventId: synced.eventIds[0] ?? null,
+  });
+}
+
 /**
- * One problem's answer and result. PracticeSession mounts a fresh turn for
- * each item instance, so a Check answer that resolves after Next cannot
- * leave the previous Correct/Not yet card on the next stem.
+ * One problem's answer, result, and offline notices. PracticeSession mounts a
+ * fresh turn for each item instance, so a queued lock, parked notice, hold, or
+ * quiet resume cannot stay painted on the next stem.
  */
 function PracticeTurn({
   childId,
@@ -131,14 +192,15 @@ function PracticeTurn({
   error,
   persistedView,
   busy,
+  initialQuiet,
   armWaiting,
   registerTurn,
   releaseTurn,
   setBusy,
   setError,
   setPersistedView,
-  setQuietResume,
-  setHeldNotice,
+  onSavedOffline,
+  onArrivalConsumed,
   onAdvance,
   onEndSession,
   onOfflineCap,
@@ -152,14 +214,15 @@ function PracticeTurn({
   error: string | null;
   persistedView: ClientView | null;
   busy: boolean;
+  initialQuiet: boolean;
   armWaiting: (instanceId: string, idempotencyKey: string) => void;
   registerTurn: (turn: MountedTurn) => void;
   releaseTurn: (turn: MountedTurn) => void;
   setBusy: (busy: boolean) => void;
   setError: (error: string | null) => void;
   setPersistedView: (view: ClientView) => void;
-  setQuietResume: (quiet: boolean) => void;
-  setHeldNotice: (held: boolean) => void;
+  onSavedOffline: (saved: boolean) => void;
+  onArrivalConsumed: () => void;
   onAdvance: (next: PublicItem) => void;
   onEndSession: () => void;
   onOfflineCap: (waiting: number) => Promise<void>;
@@ -167,14 +230,37 @@ function PracticeTurn({
   flush: () => Promise<QueueSnapshot>;
 }) {
   const instanceId = item.itemInstanceId ?? item.id;
+  const opened = openItemQueue(queue().snapshot(), item.itemInstanceId);
   const [answer, setAnswer] = useState("");
   const [feedback, setFeedback] = useState<AttemptResult | null>(null);
-  const [savedOffline, setSavedOffline] = useState(false);
+  const [savedOffline, setSavedOffline] = useState(opened.savedOffline);
+  const [heldNotice, setHeldNotice] = useState(opened.held);
+  const [parkedMessage, setParkedMessage] = useState<string | null>(opened.parkedMessage);
+  const [quietResume, setQuietResume] = useState(initialQuiet);
   const [formatHint, setFormatHint] = useState<string | null>(null);
   const [formatLocked, setFormatLocked] = useState(false);
-  // After a reload the response-time clock starts when the item is shown again.
-  // The 2-minute cap covers edge cases.
+  // shownAt is when this turn mounts, including after a reload. Check sends
+  // that instant with submittedAt, and every retry sends the same pair.
+  // Counted response time is the device shown-to-Check span, clamped to
+  // 120 seconds (ATTEMPT_LATENCY_CAP_MS). The stored Check time is clamped
+  // to the server issue time and the server receive time.
   const [shownAt] = useState(() => new Date().toISOString());
+  const openedQuiet = useRef(initialQuiet);
+  const submittingRef = useRef(false);
+  const answerLocked = savedOffline || heldNotice;
+
+  function markSavedOffline(value: boolean) {
+    onSavedOffline(value);
+    setSavedOffline(value);
+  }
+
+  useLayoutEffect(() => {
+    onSavedOffline(opened.savedOffline);
+    if (openedQuiet.current) onArrivalConsumed();
+    // The first paint owns the lock. A later queue write must not flip it
+    // while Check is still in flight, or an online score would auto-advance.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   useLayoutEffect(() => {
     const turn: MountedTurn = {
@@ -182,17 +268,37 @@ function PracticeTurn({
       apply(command) {
         if (command.type === "result") {
           setFeedback(command.result);
-          setSavedOffline(false);
+          markSavedOffline(false);
+          setHeldNotice(false);
+          return;
+        }
+        if (command.type === "parked") {
+          markSavedOffline(true);
+          setParkedMessage(command.message ?? "");
+          setFeedback(null);
+          return;
+        }
+        if (command.type === "held") {
+          setHeldNotice(true);
+          setFeedback(null);
+          return;
+        }
+        if (command.type === "quietCredit") {
+          setQuietResume(true);
           return;
         }
         setFeedback(null);
-        setSavedOffline(false);
+        setQuietResume(true);
+        markSavedOffline(false);
+        setHeldNotice(false);
       },
     };
     registerTurn(turn);
     return () => {
       releaseTurn(turn);
     };
+    // markSavedOffline updates the shared ref and this turn only.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [instanceId, registerTurn, releaseTurn]);
 
   function editAnswer(next: string) {
@@ -202,7 +308,8 @@ function PracticeTurn({
 
   async function onSubmit(event: FormEvent) {
     event.preventDefault();
-    if (!shownAt || busy || formatLocked) return;
+    if (submittingRef.current || !shownAt || busy || formatLocked || savedOffline || heldNotice) return;
+    submittingRef.current = true;
     setBusy(true);
     setError(null);
     try {
@@ -223,13 +330,13 @@ function PracticeTurn({
             setFormatHint(posted.rejected.hint);
             setFormatLocked(posted.rejected.behavior === "lock");
             setFeedback(null);
-            setSavedOffline(false);
+            markSavedOffline(false);
             return;
           }
         }
         setFormatHint(offlineFormatHint(item));
         setFeedback(null);
-        setSavedOffline(false);
+        markSavedOffline(false);
         return;
       }
       setFormatHint(null);
@@ -237,7 +344,7 @@ function PracticeTurn({
         await onOfflineCap(OFFLINE_QUEUE_CAP);
         return;
       }
-      const idempotencyKey = crypto.randomUUID();
+      let idempotencyKey = crypto.randomUUID();
       const queued: QueuedAttempt = {
         idempotencyKey,
         childId,
@@ -245,38 +352,43 @@ function PracticeTurn({
         itemId: item.id,
         answer,
         shownAt,
-        submittedAt: new Date().toISOString(),
+        submittedAt: new Date().toISOString(), // Check time. Retries send this pair unchanged.
         ...(item.itemInstanceId ? { itemInstanceId: item.itemInstanceId } : {}),
       };
+      const saved = await queue().enqueue(queued);
+      const armedKey = armedAttemptKey(saved, idempotencyKey, queued.itemInstanceId);
+      if (!armedKey) return;
+      idempotencyKey = armedKey;
       armWaiting(instanceId, idempotencyKey);
-      queue().enqueue(queued);
       const snapshot = await flush();
       const synced = snapshot.synced.find((result) => result.idempotencyKey === idempotencyKey);
       if (synced && showResumeCelebration(synced)) {
-        markFuelPulse(window.sessionStorage, childId, {
-          tier: synced.clientView.celebrationTier,
-          credit: synced.fuel.credit,
-          eventCount: synced.eventIds.length,
-          replayed: synced.replayed,
-          resumeQuiet: false,
-          eventId: synced.eventIds[0] ?? null,
-        });
+        rememberFuel(childId, synced);
         setFeedback(synced);
         setPersistedView(synced.clientView);
-        setSavedOffline(false);
+        markSavedOffline(false);
         setHeldNotice(false);
       } else if (synced) {
         setFeedback(null);
         setPersistedView(synced.clientView);
         setQuietResume(true);
-        setSavedOffline(false);
+        markSavedOffline(false);
         setHeldNotice(false);
+      } else if (snapshot.parked.some((entry) => entry.idempotencyKey === idempotencyKey)) {
+        const parked = snapshot.parked.find((entry) => entry.idempotencyKey === idempotencyKey);
+        markSavedOffline(true);
+        setParkedMessage(parked?.message ?? "");
+        setFeedback(null);
+      } else if (snapshot.blocked.some((entry) => entry.idempotencyKey === idempotencyKey)) {
+        setHeldNotice(true);
+        setFeedback(null);
       } else if (snapshot.pending.some((entry) => entry.idempotencyKey === idempotencyKey)) {
-        setSavedOffline(!snapshot.held);
+        markSavedOffline(!snapshot.held);
         setHeldNotice(Boolean(snapshot.held));
         setFeedback(null);
       }
     } finally {
+      submittingRef.current = false;
       setBusy(false);
     }
   }
@@ -286,6 +398,22 @@ function PracticeTurn({
 
   return (
     <>
+      {quietResume ? (
+        <p
+          data-testid="quiet-resume"
+          data-presentation="quiet"
+          role="status"
+          className="text-sm leading-6"
+        >
+          {interfaceCopy("pause.resume.quiet")}
+        </p>
+      ) : null}
+      {heldNotice && !quietResume ? (
+        <p data-testid="pause-hold-kid" role="status" className="text-sm leading-6">
+          {interfaceCopy("pause.hold.kid")}
+        </p>
+      ) : null}
+      {parkedMessage !== null ? <ParkedAttemptNotice message={parkedMessage} /> : null}
       {persistedView && !feedback ? (
         <p data-testid="persisted-band" data-band-label={persistedView.bandLabel}>
           {persistedView.bandLabel}
@@ -303,7 +431,7 @@ function PracticeTurn({
                   hint={formatHint}
                   answerKind={answerKindOf(item)}
                   locked={formatLocked}
-                  disabled={formatLocked}
+                  disabled={formatLocked || answerLocked}
                   onValueChange={editAnswer}
                   form="practice-form"
                   className="h-12 w-24 text-center font-heading text-2xl tabular-nums"
@@ -351,7 +479,7 @@ function PracticeTurn({
                     hint={formatHint}
                     answerKind={answerKindOf(item)}
                     locked={formatLocked}
-                    disabled={formatLocked}
+                    disabled={formatLocked || answerLocked}
                     onValueChange={editAnswer}
                     className="h-12 text-lg"
                   />
@@ -362,7 +490,7 @@ function PracticeTurn({
                 type="submit"
                 size="primary"
                 data-testid="practice-submit"
-                disabled={busy || offlineCapped || formatLocked}
+                disabled={busy || offlineCapped || formatLocked || answerLocked}
               >
                 {busy ? "Checking…" : "Check answer"}
               </Button>
@@ -407,10 +535,13 @@ export function PracticeSession({
   const waitingKey = useRef<string | null>(null);
   const waitingInstanceId = useRef<string | null>(null);
   const turnRef = useRef<MountedTurn | null>(null);
+  const savedOfflineRef = useRef(false);
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [item, setItem] = useState<PublicItem | null>(null);
-  const [heldNotice, setHeldNotice] = useState(false);
-  const [quietResume, setQuietResume] = useState(false);
+  const [arrivalQuiet, setArrivalQuiet] = useState(false);
+  const [closedHeld, setClosedHeld] = useState(false);
+  const [closedQuiet, setClosedQuiet] = useState(false);
+  const [closedParked, setClosedParked] = useState<string | null>(null);
   const [pending, setPending] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -427,45 +558,78 @@ export function PracticeSession({
     return queueRef.current;
   }
 
+  function currentTurn(): MountedTurn | null {
+    const turn = turnRef.current;
+    if (!turn || turn.instanceId !== waitingInstanceId.current) return null;
+    return turn;
+  }
+
+  function noteQuietResume() {
+    setClosedQuiet(true);
+    setArrivalQuiet(true);
+    turnRef.current?.apply({ type: "quietCredit" });
+  }
+
+  function noteHeld() {
+    setClosedHeld(true);
+    currentTurn()?.apply({ type: "held" });
+  }
+
+  function noteParked(snapshot: { parked: Array<{ message: string }> }) {
+    if (snapshot.parked.length === 0) return;
+    setClosedParked(snapshot.parked[0]?.message ?? "");
+  }
+
+  async function retryParked() {
+    const snapshot = await queue().retryParkedOnce((attempt) =>
+      postAttempt(childId, attempt, QUEUE_RETRY_TIMEOUT_MS),
+    );
+    if (snapshot.quietCredits) noteQuietResume();
+    noteParked(snapshot);
+    return snapshot;
+  }
+
   async function flush() {
+    return runSingleFlightFlush(() => flushOnce());
+  }
+
+  async function flushOnce() {
+    const publishCap = waitingKey.current !== null || queue().snapshot().pending.length > 0;
     const snapshot = await queue().reconcile((attempt) => postAttempt(childId, attempt));
     setPending(snapshot.pending.length);
+    noteParked(snapshot);
+    if (
+      waitingKey.current &&
+      snapshot.parked.some((entry) => entry.idempotencyKey === waitingKey.current)
+    ) {
+      const parked = snapshot.parked.find((entry) => entry.idempotencyKey === waitingKey.current);
+      currentTurn()?.apply({ type: "parked", message: parked?.message });
+    }
     if (reloadLiveSession(waitingKey.current, snapshot, () => window.location.reload())) {
       return snapshot;
     }
-    if (snapshot.quietCredits) setQuietResume(true);
-    if (snapshot.held) setHeldNotice(true);
+    if (snapshot.quietCredits) noteQuietResume();
+    if (snapshot.held) noteHeld();
     if (waitingKey.current) {
-      const synced = snapshot.synced.find(
-        (result) => result.idempotencyKey === waitingKey.current,
-      );
-      const turn =
-        turnRef.current && turnRef.current.instanceId === waitingInstanceId.current
-          ? turnRef.current
-          : null;
-      if (synced && showResumeCelebration(synced)) {
-        markFuelPulse(window.sessionStorage, childId, {
-          tier: synced.clientView.celebrationTier,
-          credit: synced.fuel.credit,
-          eventCount: synced.eventIds.length,
-          replayed: synced.replayed,
-          resumeQuiet: false,
-          eventId: synced.eventIds[0] ?? null,
-        });
-        turn?.apply({ type: "result", result: synced });
-        setHeldNotice(false);
+      const synced = snapshot.synced.find((result) => result.idempotencyKey === waitingKey.current);
+      const next = advanceAfterQueuedSync(savedOfflineRef.current, synced);
+      if (next) {
+        const quiet =
+          Boolean(snapshot.quietCredits) || Boolean(synced && !showResumeCelebration(synced));
+        showNext(next, { quiet });
+      } else if (synced && showResumeCelebration(synced)) {
+        rememberFuel(childId, synced);
+        currentTurn()?.apply({ type: "result", result: synced });
         waitingKey.current = null;
         waitingInstanceId.current = null;
       } else if (synced) {
-        turn?.apply({ type: "quiet" });
-        setQuietResume(true);
-        setHeldNotice(false);
+        currentTurn()?.apply({ type: "quiet" });
         waitingKey.current = null;
         waitingInstanceId.current = null;
       }
     }
     if (snapshot.lastError) setError(snapshot.lastError);
-    await publishOfflineCap(snapshot.pending.length);
+    if (publishCap) await publishOfflineCap(snapshot.pending.length);
     return snapshot;
   }
 
@@ -489,20 +653,29 @@ export function PracticeSession({
 
   useEffect(() => {
     let cancelled = false;
+    async function openSession(): Promise<SessionStart> {
+      const response = await fetch(`/api/children/${childId}/sessions`, {
+        method: "POST",
+      });
+      const body = (await response.json().catch(() => null)) as SessionStart | null;
+      if (!response.ok || !body?.sessionId || !body.item) {
+        throw new Error(body?.error ?? "Practice could not start.");
+      }
+      return body;
+    }
     async function start() {
       try {
-        const response = await fetch(`/api/children/${childId}/sessions`, {
-          method: "POST",
+        const opened = await runShownSession("start", {
+          flush: () => flush(),
+          retryParked,
+          openSession,
         });
-        const body = (await response.json().catch(() => null)) as SessionStart | null;
-        if (!response.ok || !body?.sessionId || !body.item) {
-          if (!cancelled) {
-            await flush();
-            setError(body?.error ?? "Practice could not start.");
-          }
+        if (cancelled) return;
+        const body = opened.shown;
+        if (!body?.sessionId || !body.item) {
+          setError(opened.snapshot.lastError ?? "Practice could not start.");
           return;
         }
-        if (cancelled) return;
         setSessionId(body.sessionId);
         setItem(body.item);
         setPersistedView(body.clientView ?? null);
@@ -518,16 +691,13 @@ export function PracticeSession({
         } else if (!cancelled) {
           setBoundary(null);
         }
-        const snapshot = queue().snapshot();
-        setPending(snapshot.pending.length);
-        if (snapshot.pending.length > 0) await flush();
       } catch {
         if (!cancelled) setError("Practice could not start.");
       }
     }
     void start();
     const onOnline = () => {
-      void flush();
+      void runShownSession("reconnect", { flush: () => flush() });
     };
     window.addEventListener("online", onOnline);
     return () => {
@@ -537,6 +707,14 @@ export function PracticeSession({
     // flush closes over the latest waiting key via a ref.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [childId]);
+
+  const onSavedOffline = useCallback((saved: boolean) => {
+    savedOfflineRef.current = saved;
+  }, []);
+
+  const onArrivalConsumed = useCallback(() => {
+    setArrivalQuiet(false);
+  }, []);
 
   const armWaiting = useCallback((instanceId: string, idempotencyKey: string) => {
     waitingInstanceId.current = instanceId;
@@ -551,9 +729,11 @@ export function PracticeSession({
     if (turnRef.current === turn) turnRef.current = null;
   }, []);
 
-  function showNext(next: PublicItem) {
+  function showNext(next: PublicItem, options?: { quiet?: boolean }) {
     waitingKey.current = null;
     waitingInstanceId.current = null;
+    savedOfflineRef.current = false;
+    if (options && options.quiet !== undefined) setArrivalQuiet(options.quiet);
     setItem(next);
     setError(null);
   }
@@ -604,21 +784,33 @@ export function PracticeSession({
         setBusy(false);
         return;
       }
-      const response = await fetch(`/api/children/${childId}/sessions`, { method: "POST" });
-      const body = (await response.json().catch(() => null)) as SessionStart | null;
-      if (!response.ok || !body?.sessionId || !body.item) {
-        setError(body?.error ?? "Practice could not start.");
+      const opened = await runShownSession("new-session", {
+        flush: () => flush(),
+        retryParked,
+        openSession: async () => {
+          const response = await fetch(`/api/children/${childId}/sessions`, { method: "POST" });
+          const body = (await response.json().catch(() => null)) as SessionStart | null;
+          if (!response.ok || !body?.sessionId || !body.item) {
+            throw new Error(body?.error ?? "Practice could not start.");
+          }
+          return body;
+        },
+      });
+      const shown = opened.shown;
+      if (!shown?.sessionId || !shown.item) {
+        setError(opened.snapshot.lastError ?? "Practice could not start.");
         setBusy(false);
         return;
       }
       waitingKey.current = null;
       waitingInstanceId.current = null;
-      setSessionId(body.sessionId);
-      setItem(body.item);
-      setPersistedView(body.clientView ?? null);
+      savedOfflineRef.current = false;
+      setSessionId(shown.sessionId);
+      setItem(shown.item);
+      setPersistedView(shown.clientView ?? null);
       setBoundary(null);
-    } catch {
-      setError("That lane is not available.");
+    } catch (laneError) {
+      setError(laneError instanceof Error ? laneError.message : "That lane is not available.");
     }
     setBusy(false);
   }
@@ -631,12 +823,13 @@ export function PracticeSession({
         </CardHeader>
         <CardContent className="grid gap-3">
           <p className="text-sm leading-6">{error}</p>
-          {heldNotice ? (
+          {closedHeld ? (
             <p data-testid="pause-hold-kid" role="status" className="text-sm leading-6">
               {interfaceCopy("pause.hold.kid")}
             </p>
           ) : null}
-          {quietResume ? (
+          {closedParked !== null ? <ParkedAttemptNotice message={closedParked} /> : null}
+          {closedQuiet ? (
             <p
               data-testid="quiet-resume"
               data-presentation="quiet"
@@ -679,21 +872,6 @@ export function PracticeSession({
           ? `${pending} ${pending === 1 ? "answer is" : "answers are"} waiting to sync.`
           : "Saved answers sync with the practice record."}
       </p>
-      {quietResume ? (
-        <p
-          data-testid="quiet-resume"
-          data-presentation="quiet"
-          role="status"
-          className="text-sm leading-6"
-        >
-          {interfaceCopy("pause.resume.quiet")}
-        </p>
-      ) : null}
-      {heldNotice && !quietResume ? (
-        <p data-testid="pause-hold-kid" role="status" className="text-sm leading-6">
-          {interfaceCopy("pause.hold.kid")}
-        </p>
-      ) : null}
       {offlineCapped ? (
         <p
           data-testid="offline-queue-cap"
@@ -755,15 +933,16 @@ export function PracticeSession({
           error={error}
           persistedView={persistedView}
           busy={busy}
+          initialQuiet={arrivalQuiet}
           armWaiting={armWaiting}
           registerTurn={registerTurn}
           releaseTurn={releaseTurn}
           setBusy={setBusy}
           setError={setError}
           setPersistedView={setPersistedView}
-          setQuietResume={setQuietResume}
-          setHeldNotice={setHeldNotice}
-          onAdvance={showNext}
+          onSavedOffline={onSavedOffline}
+          onArrivalConsumed={onArrivalConsumed}
+          onAdvance={(next) => showNext(next, { quiet: false })}
           onEndSession={() => void onEndSession()}
           onOfflineCap={noteOfflineCap}
           queue={queue}
