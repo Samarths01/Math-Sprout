@@ -3244,7 +3244,7 @@ describe("item templates and issuance", () => {
     expect(snapshot.parked[0]?.message).toBe(interfaceCopy("offline.sessionEnded.kid"));
   });
 
-  it("flushes offline answers before a reconnect prefetch", async () => {
+  it("flushes offline answers before resuming the session slot", async () => {
     const db = tempDb();
     const { guardian, child, session } = granted(db, "flush-first@example.com");
     const token = createSession(db, guardian.id);
@@ -3275,46 +3275,35 @@ describe("item templates and issuance", () => {
       return instance;
     };
 
+    const instanceCount = () =>
+      (
+        db.prepare(`SELECT COUNT(*) AS count FROM item_instances WHERE session_id = ?`).get(session.sessionId) as {
+          count: number;
+        }
+      ).count;
+
     for (let round = 0; round < 4; round += 1) {
       const screen = screenNow();
-      const parked = await postItemsRoute(
+      const issuedAt = screen.issuedAt;
+      const rowsBefore = instanceCount();
+      const resumed = await postItemsRoute(
         db,
         token,
         child.id,
         session.sessionId,
-        `park-round-${round}x`,
+        `resume-round-${round}x`,
         1,
       );
-      expect(parked.status, `round ${round} park`).toBe(200);
-      const parkedId = parked.body.items?.[0]?.itemInstanceId;
-      if (!parkedId) throw new Error("prefetch did not park an item");
-      expect(openCount(), `round ${round} after park`).toBeLessThanOrEqual(OUTSTANDING_UNANSWERED_CAP);
-      const answeredAt = new Date(Date.parse(WHEN) + round * 60_000 + 4_000).toISOString();
-      issueBeforeSubmit(db, screen.itemInstanceId, answeredAt);
-      const moved = submitAnswer(
-        db,
-        guardian.id,
-        child.id,
-        {
-          idempotencyKey: `screen-round-${round}x`,
-          sessionId: session.sessionId,
-          itemId: session.item.id,
-          itemInstanceId: screen.itemInstanceId,
-          answer: screen.canonicalAnswer,
-          shownAt: new Date(Date.parse(answeredAt) - 2_000).toISOString(),
-          submittedAt: answeredAt,
-        },
-        { now: answeredAt },
-      );
-      if (isFormatRejected(moved)) throw new Error("a readable answer was rejected");
-      const older = readItemInstance(db, parkedId);
-      if (!older || older.consumedAt) throw new Error("parked item was already used");
-      issueBeforeSubmit(db, parkedId, new Date(Date.parse(answeredAt) + 4_000).toISOString());
-      expect(openCount(), `round ${round} after screen`).toBeLessThanOrEqual(OUTSTANDING_UNANSWERED_CAP);
+      expect(resumed.status, `round ${round} resume`).toBe(200);
+      expect(resumed.body.items?.map((item) => item.itemInstanceId)).toEqual([screen.itemInstanceId]);
+      expect(instanceCount(), `round ${round} resume writes`).toBe(rowsBefore);
+      expect(readItemInstance(db, screen.itemInstanceId)?.issuedAt).toBe(issuedAt);
+      expect(openCount(), `round ${round} after resume`).toBeLessThanOrEqual(OUTSTANDING_UNANSWERED_CAP);
 
       const queue = createAttemptQueue(memoryQueueStore());
       const offlineKey = `offline-round-${round}x`;
-      const submittedAt = new Date(Date.parse(answeredAt) + 4_000).toISOString();
+      const submittedAt = new Date(Date.parse(WHEN) + round * 60_000 + 4_000).toISOString();
+      issueBeforeSubmit(db, screen.itemInstanceId, submittedAt);
       if (round === 0) {
         queue.enqueue({
           idempotencyKey: "unknown-round-00",
@@ -3332,8 +3321,8 @@ describe("item templates and issuance", () => {
         childId: child.id,
         sessionId: session.sessionId,
         itemId: session.item.id,
-        itemInstanceId: parkedId,
-        answer: older.canonicalAnswer,
+        itemInstanceId: screen.itemInstanceId,
+        answer: screen.canonicalAnswer,
         shownAt: new Date(Date.parse(submittedAt) - 2_000).toISOString(),
         submittedAt,
       });
@@ -3373,10 +3362,12 @@ describe("item templates and issuance", () => {
       expect(steps.at(-1)).toBe("prefetch");
       expect(steps.indexOf("prefetch")).toBe(steps.length - 1);
       expect(steps.some((step) => step === `flush:${offlineKey}`)).toBe(true);
-      expect(outcome.issued?.body.items?.length ?? 0).toBeGreaterThan(0);
+      const resumedNext = outcome.issued?.body.items?.[0]?.itemInstanceId;
+      expect(resumedNext).toBeTruthy();
+      expect(resumedNext).not.toBe(screen.itemInstanceId);
       expect(outcome.snapshot.pending).toEqual([]);
       expect(outcome.snapshot.dropped.map((row) => row.idempotencyKey)).not.toContain(offlineKey);
-      const saved = readItemInstance(db, parkedId);
+      const saved = readItemInstance(db, screen.itemInstanceId);
       expect(saved?.consumedAt).not.toBeNull();
       expect(saved?.consumedByAttemptKey).toBe(offlineKey);
       expect(openCount(), `round ${round} after reconnect`).toBeLessThanOrEqual(OUTSTANDING_UNANSWERED_CAP);
@@ -4025,7 +4016,8 @@ describe("item templates and issuance", () => {
     expect(kept.dropped).toEqual([]);
     const client = readFileSync(path.join(process.cwd(), "components/practice-session.tsx"), "utf8");
     expect(client).toContain("postAttempt(childId, attempt, QUEUE_RETRY_TIMEOUT_MS)");
-    expect(client).toContain("if (snapshot.quietCredits) setQuietResume(true)");
+    expect(client).toContain("if (snapshot.quietCredits) noteQuietResume()");
+    expect(client).toContain("setQuietResume(true)");
   });
 
   it("credits one attempt when a timed-out parked retry is replayed", async () => {
