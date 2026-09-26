@@ -304,7 +304,8 @@ function remember(data: QueueData): QueueData {
 
 export function createAttemptQueue(store: QueueStore) {
   // reconcile and retryParkedOnce each load the queue, await the network, then
-  // save the whole queue. One lock so the last save cannot drop the other's entry.
+  // save the whole queue. enqueue uses the same lock so a try added while a
+  // post is in flight is saved after that write.
   let queueLock: Promise<void> = Promise.resolve();
   function exclusive<T>(run: () => Promise<T>): Promise<T> {
     const result = queueLock.then(run, run);
@@ -321,7 +322,11 @@ export function createAttemptQueue(store: QueueStore) {
     rewards() {
       return foldRewards(store.load().synced);
     },
-    enqueue(attempt: QueuedAttempt): QueueSnapshot {
+    enqueue(attempt: QueuedAttempt): Promise<QueueSnapshot> {
+      // reconcile and retryParkedOnce save the queue they loaded before the
+      // post returns. Enqueue takes the same lock so a try added mid-flight
+      // is written after that save, not erased by it.
+      return exclusive(async () => {
       if (parseAnswer(attempt.answer).kind === "unparseable") {
         return { ...store.load(), formatRejected: true };
       }
@@ -349,6 +354,7 @@ export function createAttemptQueue(store: QueueStore) {
       }
       store.save(remember(data));
       return store.load();
+      });
     },
     retryParkedOnce(
       post: (attempt: QueuedAttempt) => Promise<SyncPost>,

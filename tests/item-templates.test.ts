@@ -2405,7 +2405,7 @@ describe("item templates and issuance", () => {
     expect(cleared).not.toContain("format-hint");
   });
 
-  it("does not queue an unreadable answer as an offline attempt", () => {
+  it("does not queue an unreadable answer as an offline attempt", async () => {
     const queue = createAttemptQueue(memoryQueueStore());
     const base = {
       idempotencyKey: "offline-format-01",
@@ -2415,10 +2415,10 @@ describe("item templates and issuance", () => {
       shownAt: shown(),
       submittedAt: WHEN,
     };
-    const rejected = queue.enqueue({ ...base, answer: "banana" });
+    const rejected = await queue.enqueue({ ...base, answer: "banana" });
     expect(rejected.pending).toEqual([]);
     expect(rejected.formatRejected).toBe(true);
-    const blank = queue.enqueue({ ...base, idempotencyKey: "offline-blank-01", answer: "   " });
+    const blank = await queue.enqueue({ ...base, idempotencyKey: "offline-blank-01", answer: "   " });
     expect(blank.pending).toHaveLength(1);
     expect(blank.pending[0]?.answer).toBe("   ");
   });
@@ -3227,7 +3227,7 @@ describe("item templates and issuance", () => {
       submittedAt: WHEN,
     };
     const queue = createAttemptQueue(memoryQueueStore());
-    queue.enqueue(late);
+    await queue.enqueue(late);
     const snapshot = await queue.reconcile(async (attempt) => {
       const posted = await postAttemptRoute(db, token, child.id, attempt);
       expect(posted.status).toBe(409);
@@ -3306,7 +3306,7 @@ describe("item templates and issuance", () => {
       const submittedAt = new Date(Date.parse(WHEN) + round * 60_000 + 4_000).toISOString();
       issueBeforeSubmit(db, screen.itemInstanceId, submittedAt);
       if (round === 0) {
-        queue.enqueue({
+        await queue.enqueue({
           idempotencyKey: "unknown-round-00",
           childId: child.id,
           sessionId: session.sessionId,
@@ -3317,7 +3317,7 @@ describe("item templates and issuance", () => {
           submittedAt,
         });
       }
-      queue.enqueue({
+      await queue.enqueue({
         idempotencyKey: offlineKey,
         childId: child.id,
         sessionId: session.sessionId,
@@ -3375,7 +3375,7 @@ describe("item templates and issuance", () => {
     }
 
     const blocked = createAttemptQueue(memoryQueueStore());
-    blocked.enqueue({
+    await blocked.enqueue({
       idempotencyKey: "still-retryable",
       childId: child.id,
       sessionId: session.sessionId,
@@ -3467,9 +3467,9 @@ describe("item templates and issuance", () => {
       submittedAt: scoredAt,
     };
     const queue = createAttemptQueue(memoryQueueStore());
-    queue.enqueue(missing);
-    queue.enqueue(unknown);
-    queue.enqueue(alreadyUsed);
+    await queue.enqueue(missing);
+    await queue.enqueue(unknown);
+    await queue.enqueue(alreadyUsed);
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     const post = async (attempt: QueuedAttempt) => {
       const posted = await postAttemptRoute(db, token, child.id, attempt);
@@ -3502,7 +3502,7 @@ describe("item templates and issuance", () => {
     expect(reloadLiveSession("other-key", snapshot, reload)).toBe(false);
     expect(reload).toHaveBeenCalledOnce();
 
-    queue.enqueue(kept);
+    await queue.enqueue(kept);
     const synced = await queue.reconcile(post);
     expect(synced.pending).toEqual([]);
     expect(synced.synced.map((result) => result.idempotencyKey)).toEqual([kept.idempotencyKey]);
@@ -3530,7 +3530,7 @@ describe("item templates and issuance", () => {
       itemInstanceId: "issued-instance-01",
     };
     const queue = createAttemptQueue(memoryQueueStore());
-    queue.enqueue(attempt);
+    await queue.enqueue(attempt);
     let posts = 0;
     const waiting = await queue.reconcile(async () => {
       posts += 1;
@@ -3609,8 +3609,8 @@ describe("item templates and issuance", () => {
       submittedAt: laterSubmittedAt,
     };
     const queue = createAttemptQueue(memoryQueueStore());
-    queue.enqueue(ended);
-    queue.enqueue(later);
+    await queue.enqueue(ended);
+    await queue.enqueue(later);
     const snapshot = await queue.reconcile(async (attempt) => {
       const posted = await postAttemptRoute(db, token, child.id, attempt);
       if (attempt.idempotencyKey === ended.idempotencyKey) {
@@ -3656,9 +3656,9 @@ describe("item templates and issuance", () => {
       itemInstanceId: "issued-instance-01",
     };
     const queue = createAttemptQueue(memoryQueueStore());
-    const queued = queue.enqueue(first);
+    const queued = await queue.enqueue(first);
     expect(queued.pending).toEqual([first]);
-    const second = queue.enqueue({
+    const second = await queue.enqueue({
       ...first,
       idempotencyKey: "second-check",
       answer: "7",
@@ -3685,8 +3685,8 @@ describe("item templates and issuance", () => {
       submittedAt: new Date(Date.parse(screen.issuedAt) + 3_000).toISOString(),
     };
     const liveQueue = createAttemptQueue(memoryQueueStore());
-    liveQueue.enqueue(live);
-    const ignored = liveQueue.enqueue({
+    await liveQueue.enqueue(live);
+    const ignored = await liveQueue.enqueue({
       ...live,
       idempotencyKey: "one-entry-second",
       answer: "0",
@@ -3708,7 +3708,7 @@ describe("item templates and issuance", () => {
     expect(attemptRows.count).toBe(1);
   });
 
-  it("ignores a second Check while that item is parked or blocked", () => {
+  it("ignores a second Check while that item is parked or blocked", async () => {
     const parkedAttempt: QueuedAttempt = {
       idempotencyKey: "parked-first-check",
       childId: "child-1",
@@ -3729,7 +3729,7 @@ describe("item templates and issuance", () => {
         synced: [],
       }),
     );
-    const secondParked = parkedQueue.enqueue({
+    const secondParked = await parkedQueue.enqueue({
       ...parkedAttempt,
       idempotencyKey: "parked-second-check",
       answer: "7",
@@ -3754,7 +3754,7 @@ describe("item templates and issuance", () => {
         synced: [],
       }),
     );
-    const secondBlocked = blockedQueue.enqueue({
+    const secondBlocked = await blockedQueue.enqueue({
       ...blockedAttempt,
       idempotencyKey: "blocked-second-check",
       answer: "9",
@@ -3788,8 +3788,8 @@ describe("item templates and issuance", () => {
       submittedAt: new Date(Date.parse(screen.issuedAt) + 3_000).toISOString(),
     };
     const queue = createAttemptQueue(memoryQueueStore());
-    queue.enqueue(queued);
-    const duplicate = queue.enqueue({
+    await queue.enqueue(queued);
+    const duplicate = await queue.enqueue({
       ...queued,
       idempotencyKey: "offline-advance-second",
       answer: "0",
@@ -3858,7 +3858,7 @@ describe("item templates and issuance", () => {
       submittedAt: WHEN,
     };
     const queue = createAttemptQueue(memoryQueueStore());
-    queue.enqueue(duplicate);
+    await queue.enqueue(duplicate);
     const snapshot = await queue.reconcile(async (attempt) => {
       const posted = await postAttemptRoute(db, token, child.id, attempt);
       expect(posted.status).toBe(409);
@@ -3886,7 +3886,7 @@ describe("item templates and issuance", () => {
     expect(afterDrop).toEqual(firstSave);
   });
 
-  it("keeps a pending entry after the queue is reloaded", () => {
+  it("keeps a pending entry after the queue is reloaded", async () => {
     const storage = new Map<string, string>();
     const memory = {
       getItem: (key: string) => storage.get(key) ?? null,
@@ -3905,10 +3905,10 @@ describe("item templates and issuance", () => {
       itemInstanceId: "issued-instance-01",
     };
     const queue = createAttemptQueue(storageQueueStore(memory, "math-sprout-queue"));
-    queue.enqueue(pending);
+    await queue.enqueue(pending);
     const reloaded = createAttemptQueue(storageQueueStore(memory, "math-sprout-queue"));
     expect(reloaded.snapshot().pending).toEqual([pending]);
-    const ignored = reloaded.enqueue({
+    const ignored = await reloaded.enqueue({
       ...pending,
       idempotencyKey: "after-reload-second",
       answer: "9",
@@ -4373,7 +4373,7 @@ describe("item templates and issuance", () => {
       submittedAt: tooEarly,
     };
     const queue = createAttemptQueue(memoryQueueStore());
-    queue.enqueue(attempt);
+    await queue.enqueue(attempt);
     let posts = 0;
     const post = async () => {
       posts += 1;
@@ -4601,8 +4601,8 @@ describe("item templates and issuance", () => {
       answer: "7",
       itemInstanceId: "issued-instance-02",
     };
-    queue.enqueue(first);
-    queue.enqueue(second);
+    await queue.enqueue(first);
+    await queue.enqueue(second);
     const posts: string[] = [];
     const flush = () =>
       queue.reconcile(async (attempt) => {
@@ -4634,8 +4634,8 @@ describe("item templates and issuance", () => {
       answer: "7",
       itemInstanceId: "issued-instance-02",
     };
-    queue.enqueue(first);
-    queue.enqueue(second);
+    await queue.enqueue(first);
+    await queue.enqueue(second);
     const posts: string[] = [];
     let passes = 0;
     const flush = () => {
@@ -4709,6 +4709,49 @@ describe("item templates and issuance", () => {
     ]);
   });
 
+  it("keeps an enqueue that arrives while reconcile is posting", async () => {
+    const queue = createAttemptQueue(memoryQueueStore());
+    const first: QueuedAttempt = {
+      idempotencyKey: "enqueue-mid-a",
+      childId: "child-1",
+      sessionId: "session-1",
+      itemId: "ops-g2-add",
+      answer: "42",
+      shownAt: shown(),
+      submittedAt: WHEN,
+      itemInstanceId: "issued-instance-a",
+    };
+    const second: QueuedAttempt = {
+      ...first,
+      idempotencyKey: "enqueue-mid-b",
+      answer: "7",
+      itemInstanceId: "issued-instance-b",
+    };
+    await queue.enqueue(first);
+    let releasePost: () => void = () => {};
+    const gate = new Promise<void>((resolve) => {
+      releasePost = resolve;
+    });
+    let entered: () => void = () => {};
+    const posting = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const reconciling = queue.reconcile(async () => {
+      entered();
+      await gate;
+      return { ok: false as const, reason: "offline" as const };
+    });
+    await posting;
+    const enqueued = queue.enqueue(second);
+    releasePost();
+    await reconciling;
+    await enqueued;
+    expect(queue.snapshot().pending.map((entry) => entry.idempotencyKey)).toEqual([
+      first.idempotencyKey,
+      second.idempotencyKey,
+    ]);
+  });
+
   it("parks a try after repeated server errors or after it ages out", async () => {
     const head: QueuedAttempt = {
       idempotencyKey: "stuck-head",
@@ -4731,8 +4774,8 @@ describe("item templates and issuance", () => {
       itemInstanceId: "issued-instance-02",
     };
     const queue = createAttemptQueue(memoryQueueStore());
-    queue.enqueue(head);
-    queue.enqueue(later);
+    await queue.enqueue(head);
+    await queue.enqueue(later);
     let laterPosts = 0;
     const serverError = () => {
       const classified = classifyAttemptFailure(500, { error: "Something went wrong." });
@@ -4794,8 +4837,8 @@ describe("item templates and issuance", () => {
     };
     const agedLater: QueuedAttempt = { ...later, idempotencyKey: "aged-later", answer: "3" };
     const aged = createAttemptQueue(memoryQueueStore());
-    aged.enqueue(agedHead);
-    aged.enqueue(agedLater);
+    await aged.enqueue(agedHead);
+    await aged.enqueue(agedLater);
     const stillWaiting = await aged.reconcile(
       async (entry) => {
         expect(entry.idempotencyKey).toBe(agedHead.idempotencyKey);
@@ -4855,7 +4898,7 @@ describe("item templates and issuance", () => {
       },
     };
     const queue = createAttemptQueue(storageQueueStore(memory, "math-sprout-queue"));
-    queue.enqueue({
+    await queue.enqueue({
       idempotencyKey: parkedAttempt.idempotencyKey,
       childId: parkedAttempt.childId,
       sessionId: parkedAttempt.sessionId,
@@ -5530,7 +5573,7 @@ describe("item templates and issuance", () => {
       submittedAt: WHEN,
     };
     const queue = createAttemptQueue(memoryQueueStore());
-    expect(queue.enqueue(queued).pending).toHaveLength(1);
+    expect((await queue.enqueue(queued)).pending).toHaveLength(1);
     const synced = await queue.reconcile(async (attempt) => {
       const result = submitAnswer(
         db,

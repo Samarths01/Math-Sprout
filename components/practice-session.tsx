@@ -355,7 +355,7 @@ function PracticeTurn({
         submittedAt: new Date().toISOString(), // Check time. Retries send this pair unchanged.
         ...(item.itemInstanceId ? { itemInstanceId: item.itemInstanceId } : {}),
       };
-      const saved = queue().enqueue(queued);
+      const saved = await queue().enqueue(queued);
       const armedKey = armedAttemptKey(saved, idempotencyKey, queued.itemInstanceId);
       if (!armedKey) return;
       idempotencyKey = armedKey;

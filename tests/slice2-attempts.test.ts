@@ -435,8 +435,8 @@ describe("offline queue reconcile", () => {
       shownAt: at(30_000),
       submittedAt: at(33_000),
     };
-    queue.enqueue(first);
-    queue.enqueue(second);
+    await queue.enqueue(first);
+    await queue.enqueue(second);
 
     let online = false;
     const post = async (attempt: QueuedAttempt): Promise<SyncPost> => {
@@ -497,7 +497,7 @@ describe("offline queue reconcile", () => {
       shownAt: at(0),
       submittedAt: at(2_000),
     };
-    queue.enqueue(attempt);
+    await queue.enqueue(attempt);
     let calls = 0;
     const dropped = await queue.reconcile(async () => {
       calls += 1;
@@ -567,8 +567,8 @@ describe("offline queue reconcile", () => {
       idempotencyKey: "paused-key-0002",
       submittedAt: at(4_000),
     };
-    queue.enqueue(attempt);
-    queue.enqueue(second);
+    await queue.enqueue(attempt);
+    await queue.enqueue(second);
     setConsent(db, guardian.id, child.id, "pause");
     expect(queueDisposition("paused")).toBe("hold");
     expect(queueDisposition("revoked")).toBe("drop");
@@ -583,7 +583,7 @@ describe("offline queue reconcile", () => {
     expect(consentQueueReason(null)).toBe("drop");
 
     const pauseOnly = createAttemptQueue(memoryQueueStore());
-    pauseOnly.enqueue(attempt);
+    await pauseOnly.enqueue(attempt);
     const stillHeld = await pauseOnly.reconcile(async () => ({
       ok: false as const,
       reason: consentQueueReason({ queueDisposition: "hold" }),
@@ -700,7 +700,7 @@ describe("offline queue reconcile", () => {
       shownAt: at(0),
       submittedAt: at(2_000),
     };
-    queue.enqueue(attempt);
+    await queue.enqueue(attempt);
     setConsent(db, guardian.id, child.id, "pause");
     registerPauseHold(db, guardian.id, child.id, attempt);
     expect(readPauseHold(db, guardian.id, child.id)?.waiting).toBe(1);
@@ -747,7 +747,7 @@ describe("offline queue reconcile", () => {
     expect(queue.rewards()).toEqual({ eventIds: [], totalXp: 0 });
 
     setConsent(db, guardian.id, child.id, "grant");
-    queue.enqueue(attempt);
+    await queue.enqueue(attempt);
     const again = await queue.reconcile(async (queued) => ({
       ok: true as const,
       result: submitAttempt(db, guardian.id, child.id, queued),
@@ -757,7 +757,7 @@ describe("offline queue reconcile", () => {
     expect(count(db, "attempts")).toBe(0);
   });
 
-  it("caps the unsynced queue so offline tries stay short", () => {
+  it("caps the unsynced queue so offline tries stay short", async () => {
     const queue = createAttemptQueue(memoryQueueStore());
     const attempts = Array.from({ length: OFFLINE_QUEUE_CAP }, (_, index) => ({
       idempotencyKey: `cap-key-${index}0001`,
@@ -768,8 +768,8 @@ describe("offline queue reconcile", () => {
       shownAt: at(0),
       submittedAt: at(2_000 + index),
     }));
-    for (const attempt of attempts) queue.enqueue(attempt);
-    const overflow = queue.enqueue({
+    for (const attempt of attempts) await queue.enqueue(attempt);
+    const overflow = await queue.enqueue({
       ...attempts[0],
       idempotencyKey: "cap-key-overflow",
       submittedAt: at(9_000),
@@ -777,7 +777,7 @@ describe("offline queue reconcile", () => {
     expect(overflow.capped).toBe(true);
     expect(overflow.pending).toHaveLength(OFFLINE_QUEUE_CAP);
     expect(overflow.pending.map((item) => item.idempotencyKey)).not.toContain("cap-key-overflow");
-    const again = queue.enqueue(attempts[0]);
+    const again = await queue.enqueue(attempts[0]);
     expect(again.capped).toBeUndefined();
     expect(again.pending).toHaveLength(OFFLINE_QUEUE_CAP);
   });
@@ -843,7 +843,7 @@ describe("offline queue reconcile", () => {
       ...input(session.sessionId, { idempotencyKey: "offline-band-0001" }),
       childId: child.id,
     };
-    queue.enqueue(attempt);
+    await queue.enqueue(attempt);
     const offline = await queue.reconcile(async () => ({ ok: false as const, reason: "offline" }));
     expect(offline.pending).toHaveLength(1);
     expect(count(db, "attempts")).toBe(0);
@@ -870,7 +870,7 @@ describe("offline queue reconcile", () => {
     expect(stored.band_label).toBe("Getting it");
   });
 
-  it("reloads a persisted queue from storage", () => {
+  it("reloads a persisted queue from storage", async () => {
     const saved = new Map<string, string>();
     const storage = {
       getItem: (key: string) => saved.get(key) ?? null,
@@ -879,7 +879,7 @@ describe("offline queue reconcile", () => {
       },
     };
     const queue = createAttemptQueue(storageQueueStore(storage, "math-sprout-queue"));
-    queue.enqueue({
+    await queue.enqueue({
       idempotencyKey: "stored-key-0001",
       childId: "child",
       sessionId: "session",
