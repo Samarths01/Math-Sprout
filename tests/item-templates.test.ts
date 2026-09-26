@@ -10,7 +10,6 @@ import Database from "better-sqlite3";
 import {
   ATTEMPT_LATENCY_CAP_MS,
   responseLatencyMs,
-  SUBMITTED_AT_SKEW_MS,
   type AttemptResult,
 } from "@/lib/attempt-contract";
 import { currentAppBuildSha } from "@/lib/app-build";
@@ -4034,8 +4033,8 @@ describe("item templates and issuance", () => {
       itemId: session.item.id,
       itemInstanceId: screen.itemInstanceId,
       answer: screen.canonicalAnswer,
-      shownAt: new Date(Date.parse(screen.issuedAt) + 1_000).toISOString(),
-      submittedAt: new Date(Date.parse(screen.issuedAt) + 3_000).toISOString(),
+      shownAt: new Date(Date.parse(screen.issuedAt) - 2_000).toISOString(),
+      submittedAt: screen.issuedAt,
     };
     const queue = createAttemptQueue(
       memoryQueueStore({
@@ -4074,7 +4073,7 @@ describe("item templates and issuance", () => {
       Math.min(queuedLatency, ATTEMPT_LATENCY_CAP_MS),
     );
     expect(Date.parse(storedTimes.submittedAt)).toBeGreaterThanOrEqual(Date.parse(screen.issuedAt));
-    expect(Date.parse(storedTimes.submittedAt)).toBeLessThanOrEqual(Date.now() + SUBMITTED_AT_SKEW_MS);
+    expect(Date.parse(storedTimes.submittedAt)).toBeLessThanOrEqual(Date.now());
     expect(timedOut.parked[0]?.shownAt).toBe(saved.shownAt);
     expect(timedOut.parked[0]?.submittedAt).toBe(saved.submittedAt);
     const replayed = await queue.retryParkedOnce(async (attempt) => {
@@ -4217,160 +4216,148 @@ describe("item templates and issuance", () => {
     expect(summary.minutes).toBe(Math.floor((119 + 120 + 120) / 60));
   });
 
-  it("rejects a submitted time ahead of the server or before the item was issued", () => {
-    expect(SUBMITTED_AT_SKEW_MS).toBe(2 * 60_000);
+  it("clamps a slow or fast device clock onto the server window and stores that day", () => {
+    const clocks = [
+      {
+        label: "20s slow",
+        key: "clock-20s-slow",
+        email: "clock-20s@example.com",
+        issuedAt: "2026-09-26T18:00:00.000Z",
+        receivedAt: "2026-09-26T18:01:00.000Z",
+        submittedAt: "2026-09-26T18:00:40.000Z",
+        storedAt: "2026-09-26T18:00:40.000Z",
+        clamped: 0,
+        day: "2026-09-26",
+      },
+      {
+        label: "10 minutes slow",
+        key: "clock-10m-slow",
+        email: "clock-10m@example.com",
+        issuedAt: "2026-09-26T07:00:30.000Z",
+        receivedAt: "2026-09-26T07:01:00.000Z",
+        submittedAt: "2026-09-26T06:51:00.000Z",
+        storedAt: "2026-09-26T07:00:30.000Z",
+        clamped: 1,
+        day: "2026-09-26",
+      },
+      {
+        label: "3 minutes fast",
+        key: "clock-3m-fast",
+        email: "clock-3m@example.com",
+        issuedAt: "2026-09-27T06:58:00.000Z",
+        receivedAt: "2026-09-27T06:59:00.000Z",
+        submittedAt: "2026-09-27T07:02:00.000Z",
+        storedAt: "2026-09-27T06:59:00.000Z",
+        clamped: 1,
+        day: "2026-09-26",
+      },
+    ];
+    for (const clock of clocks) {
+      const db = tempDb();
+      const { guardian, child, session } = granted(db, clock.email);
+      const screen = readItemInstance(db, session.item.itemInstanceId ?? "");
+      if (!screen) throw new Error("session did not issue");
+      db.prepare(`UPDATE item_instances SET issued_at = ? WHERE item_instance_id = ?`).run(
+        clock.issuedAt,
+        screen.itemInstanceId,
+      );
+      const saved = submitAnswer(
+        db,
+        guardian.id,
+        child.id,
+        {
+          idempotencyKey: clock.key,
+          sessionId: session.sessionId,
+          itemId: session.item.id,
+          itemInstanceId: screen.itemInstanceId,
+          answer: screen.canonicalAnswer,
+          shownAt: new Date(Date.parse(clock.submittedAt) - 8_000).toISOString(),
+          submittedAt: clock.submittedAt,
+        },
+        { now: clock.receivedAt },
+      );
+      if (isFormatRejected(saved)) throw new Error(`${clock.label} was rejected`);
+      const row = db
+        .prepare(
+          `SELECT submitted_at AS submittedAt, submitted_at_clamped AS clamped,
+                  estimator_evidence AS evidence, evidence_reason AS reason
+           FROM attempts WHERE id = ?`,
+        )
+        .get(saved.attemptId) as {
+        submittedAt: string;
+        clamped: number;
+        evidence: number;
+        reason: string | null;
+      };
+      expect(row.submittedAt, clock.label).toBe(clock.storedAt);
+      expect(row.clamped, clock.label).toBe(clock.clamped);
+      expect(row.evidence, clock.label).toBe(1);
+      expect(row.reason, clock.label).toBeNull();
+      expect(saved.flags, clock.label).not.toContain("too_fast");
+      const storedDay = localDate(row.submittedAt, child.timezone);
+      expect(storedDay, clock.label).toBe(clock.day);
+      const practiceDay = db
+        .prepare(
+          `SELECT local_day AS localDay FROM qualifying_events
+           WHERE child_id = ? AND kind = 'QualifyingPracticeDay'`,
+        )
+        .get(child.id) as { localDay: string };
+      expect(practiceDay.localDay, clock.label).toBe(storedDay);
+    }
+  });
+
+  it("parks a malformed submitted time instead of retrying it", async () => {
     const db = tempDb();
-    const { guardian, child, session } = granted(db, "submitted-bounds@example.com");
+    const { guardian, child, session } = granted(db, "submitted-invalid@example.com");
     const screen = readItemInstance(db, session.item.itemInstanceId ?? "");
     if (!screen) throw new Error("session did not issue");
-    const receivedAt = new Date(Date.parse(screen.issuedAt) + 60_000).toISOString();
-    const ahead = new Date(Date.parse(receivedAt) + SUBMITTED_AT_SKEW_MS + 1_000).toISOString();
-    let aheadError: unknown;
+    let missing: unknown;
     try {
-      submitAnswer(
-        db,
-        guardian.id,
-        child.id,
-        {
-          idempotencyKey: "submitted-ahead",
-          sessionId: session.sessionId,
-          itemId: session.item.id,
-          itemInstanceId: screen.itemInstanceId,
-          answer: screen.canonicalAnswer,
-          shownAt: screen.issuedAt,
-          submittedAt: ahead,
-        },
-        { now: receivedAt },
-      );
-    } catch (error) {
-      aheadError = error;
-    }
-    expect(aheadError).toBeInstanceOf(DomainError);
-    expect((aheadError as DomainError).code).toBe("submitted_at_window");
-    expect((aheadError as DomainError).message).toMatch(/ahead of the server/);
-    const tooEarly = new Date(Date.parse(screen.issuedAt) - SUBMITTED_AT_SKEW_MS - 1_000).toISOString();
-    let earlyError: unknown;
-    try {
-      submitAnswer(
-        db,
-        guardian.id,
-        child.id,
-        {
-          idempotencyKey: "submitted-before-issue",
-          sessionId: session.sessionId,
-          itemId: session.item.id,
-          itemInstanceId: screen.itemInstanceId,
-          answer: screen.canonicalAnswer,
-          shownAt: tooEarly,
-          submittedAt: tooEarly,
-        },
-        { now: receivedAt },
-      );
-    } catch (error) {
-      earlyError = error;
-    }
-    expect(earlyError).toBeInstanceOf(DomainError);
-    expect((earlyError as DomainError).code).toBe("submitted_at_window");
-    expect(publicErrorBody(earlyError)).toMatchObject({
-      status: 400,
-      body: { code: "submitted_at_window" },
-    });
-    const slowClock = new Date(Date.parse(screen.issuedAt) - 20_000).toISOString();
-    const slowShown = new Date(Date.parse(screen.issuedAt) - 30_000).toISOString();
-    const slowReceived = new Date(Date.parse(screen.issuedAt) + 10_000).toISOString();
-    const slow = submitAnswer(
-      db,
-      guardian.id,
-      child.id,
-      {
-        idempotencyKey: "submitted-slow-clock",
+      parseSubmitAttempt({
+        idempotencyKey: "submitted-missing",
         sessionId: session.sessionId,
         itemId: session.item.id,
         itemInstanceId: screen.itemInstanceId,
         answer: screen.canonicalAnswer,
-        shownAt: slowShown,
-        submittedAt: slowClock,
-      },
-      { now: slowReceived },
-    );
-    if (isFormatRejected(slow)) throw new Error("a readable answer was rejected");
-    const slowRow = db
-      .prepare(`SELECT submitted_at AS submittedAt FROM attempts WHERE id = ?`)
-      .get(slow.attemptId) as { submittedAt: string };
-    expect(slowRow.submittedAt).toBe(slowClock);
-    const next = readItemInstance(db, slow.nextItem.itemInstanceId ?? "");
-    if (!next) throw new Error("next item was not issued");
-    const boundaryReceived = new Date(Date.parse(next.issuedAt) + 60_000).toISOString();
-    const onTime = submitAnswer(
-      db,
-      guardian.id,
-      child.id,
-      {
-        idempotencyKey: "submitted-on-time",
+        shownAt: screen.issuedAt,
+      });
+    } catch (error) {
+      missing = error;
+    }
+    expect((missing as DomainError).code).toBe("submitted_at_invalid");
+    let unparseable: unknown;
+    try {
+      submitAnswer(db, guardian.id, child.id, {
+        idempotencyKey: "submitted-unparseable",
         sessionId: session.sessionId,
         itemId: session.item.id,
-        itemInstanceId: next.itemInstanceId,
-        answer: next.canonicalAnswer,
-        shownAt: next.issuedAt,
-        submittedAt: new Date(Date.parse(boundaryReceived) + SUBMITTED_AT_SKEW_MS).toISOString(),
-      },
-      { now: boundaryReceived },
-    );
-    if (isFormatRejected(onTime)) throw new Error("a readable answer was rejected");
-    const stored = db
-      .prepare(`SELECT shown_at AS shownAt, submitted_at AS submittedAt FROM attempts WHERE id = ?`)
-      .get(onTime.attemptId) as { shownAt: string; submittedAt: string };
-    expect(stored.shownAt).toBe(next.issuedAt);
-    expect(Date.parse(stored.submittedAt)).toBe(Date.parse(boundaryReceived) + SUBMITTED_AT_SKEW_MS);
-    expect(db.prepare(`SELECT COUNT(*) AS count FROM attempts`).get()).toEqual({ count: 2 });
-  });
-
-  it("parks a submitted time outside the issue window instead of retrying it", async () => {
-    const db = tempDb();
-    const { guardian, child, session } = granted(db, "submitted-window-park@example.com");
-    const screen = readItemInstance(db, session.item.itemInstanceId ?? "");
-    if (!screen) throw new Error("session did not issue");
-    const tooEarly = new Date(Date.parse(screen.issuedAt) - SUBMITTED_AT_SKEW_MS - 1_000).toISOString();
-    const receivedAt = new Date(Date.parse(screen.issuedAt) + 60_000).toISOString();
-    let earlyError: unknown;
-    try {
-      submitAnswer(
-        db,
-        guardian.id,
-        child.id,
-        {
-          idempotencyKey: "submitted-window-route",
-          sessionId: session.sessionId,
-          itemId: session.item.id,
-          itemInstanceId: screen.itemInstanceId,
-          answer: screen.canonicalAnswer,
-          shownAt: tooEarly,
-          submittedAt: tooEarly,
-        },
-        { now: receivedAt },
-      );
+        itemInstanceId: screen.itemInstanceId,
+        answer: screen.canonicalAnswer,
+        shownAt: screen.issuedAt,
+        submittedAt: "not-a-time",
+      });
     } catch (error) {
-      earlyError = error;
+      unparseable = error;
     }
-    const body = publicErrorBody(earlyError).body;
-    expect(body.code).toBe("submitted_at_window");
+    const body = publicErrorBody(unparseable).body;
+    expect(body.code).toBe("submitted_at_invalid");
     const classified = classifyAttemptFailure(400, body);
     expect(classified).toEqual({
       ok: false,
       reason: "park",
-      message: interfaceCopy("offline.window.kid"),
+      message: interfaceCopy("offline.time.kid"),
     });
-    if (!classified || classified.reason !== "park") throw new Error("window was not parked");
+    if (!classified || classified.reason !== "park") throw new Error("invalid time was not parked");
     expect(classified.message).not.toBe(body.error);
     const attempt: QueuedAttempt = {
-      idempotencyKey: "window-too-early",
+      idempotencyKey: "submitted-unparseable-queue",
       childId: child.id,
       sessionId: session.sessionId,
       itemId: session.item.id,
       itemInstanceId: screen.itemInstanceId,
       answer: screen.canonicalAnswer,
-      shownAt: tooEarly,
-      submittedAt: tooEarly,
+      shownAt: screen.issuedAt,
+      submittedAt: "not-a-time",
     };
     const queue = createAttemptQueue(memoryQueueStore());
     await queue.enqueue(attempt);
@@ -4383,8 +4370,7 @@ describe("item templates and issuance", () => {
     expect(posts).toBe(1);
     expect(parked.pending).toEqual([]);
     expect(parked.lastError).toBeUndefined();
-    expect(parked.parked.map((entry) => entry.idempotencyKey)).toEqual([attempt.idempotencyKey]);
-    expect(parked.parked[0]?.message).toBe(interfaceCopy("offline.window.kid"));
+    expect(parked.parked[0]?.message).toBe(interfaceCopy("offline.time.kid"));
     await queue.reconcile(post);
     expect(posts).toBe(1);
     const retried = await queue.retryParkedOnce(post);
@@ -4395,9 +4381,9 @@ describe("item templates and issuance", () => {
     await queue.retryParkedOnce(post);
     expect(posts).toBe(2);
     const client = readFileSync(path.join(process.cwd(), "components/practice-session.tsx"), "utf8");
-    expect(client).toContain('body?.code === "submitted_at_window"');
-    expect(client).toContain('interfaceCopy("offline.window.kid")');
-    expect(client).not.toContain("Submitted time is earlier");
+    expect(client).toContain('body?.code === "submitted_at_invalid"');
+    expect(client).toContain('interfaceCopy("offline.time.kid")');
+    expect(client).not.toContain("must be a valid time");
   });
 
   it("saves a late replay with HonestAttempt and no concept tick or band transition", async () => {
@@ -4510,7 +4496,10 @@ describe("item templates and issuance", () => {
     expect(kinds).toContain("HonestAttempt");
     expect(kinds).not.toContain("ConceptProgressTick");
     expect(kinds).not.toContain("MasteryBandTransition");
-    const replayDay = localDate(parked.submittedAt, child.timezone);
+    const storedReplay = db
+      .prepare(`SELECT submitted_at AS submittedAt FROM attempts WHERE id = ?`)
+      .get(saved.attempts[0]?.id) as { submittedAt: string };
+    const replayDay = localDate(storedReplay.submittedAt, child.timezone);
     const practiceDay = db
       .prepare(
         `SELECT COUNT(*) AS count FROM qualifying_events

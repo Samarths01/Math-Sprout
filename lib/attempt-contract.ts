@@ -107,14 +107,6 @@ export const SPAM_WINDOW_MS = 10_000;
  */
 export const ATTEMPT_LATENCY_CAP_MS = 120_000;
 
-/**
- * A device Check time may lead the server clock, or trail the item's
- * `issued_at`, by this much. `submittedAt` also picks the XP and streak day,
- * the spam window, and evidence order, so a time outside this window is
- * rejected rather than clamped.
- */
-export const SUBMITTED_AT_SKEW_MS = 2 * 60_000;
-
 export function responseLatencyMs(shownAt: string, submittedAt: string): number {
   const raw = Date.parse(submittedAt) - Date.parse(shownAt);
   if (!Number.isFinite(raw) || raw < 0) return 0;

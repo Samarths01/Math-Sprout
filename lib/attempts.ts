@@ -4,7 +4,6 @@ import {
   FOUR_BEAT_KEYS,
   integrityFlags,
   responseLatencyMs,
-  SUBMITTED_AT_SKEW_MS,
   type AttemptResult,
   type FourBeat,
   type IntegrityFlag,
@@ -132,41 +131,51 @@ function requireText(value: unknown, label: string): string {
   return value.trim();
 }
 
+function requireInstant(value: unknown, label: string): string {
+  if (typeof value !== "string" || value.trim().length === 0) {
+    throw new DomainError(
+      `${label} must be a valid time.`,
+      400,
+      undefined,
+      undefined,
+      "submitted_at_invalid",
+    );
+  }
+  return parseInstant(value, label);
+}
+
 function parseInstant(value: string, label: string): string {
   const ms = Date.parse(value);
   if (!Number.isFinite(ms)) {
-    throw new DomainError(`${label} must be a valid time.`, 400);
+    throw new DomainError(
+      `${label} must be a valid time.`,
+      400,
+      undefined,
+      undefined,
+      "submitted_at_invalid",
+    );
   }
   return new Date(ms).toISOString();
 }
 
 /**
- * `submittedAt` is the device Check time. It also picks the XP and streak day,
- * the spam window, and evidence order. Reject a time more than
- * `SUBMITTED_AT_SKEW_MS` ahead of the server, or more than that skew before
- * this item's server `issued_at`. A clock a little slow still lands inside
- * the window. Counted latency is capped apart from this check.
+ * Store the device Check time inside [issued_at, server receive time].
+ * A slow clock moves up to issue. A fast clock moves down to receive.
+ * Neither case is rejected. The flag is informational and gates nothing.
+ * Response time stays the raw device shown-to-Check span.
  */
-function rejectSubmittedAt(submittedAt: string, receivedAtMs: number, issuedAt?: string): void {
-  const submittedMs = Date.parse(submittedAt);
-  if (submittedMs > receivedAtMs + SUBMITTED_AT_SKEW_MS) {
-    throw new DomainError(
-      "Submitted time is ahead of the server.",
-      400,
-      undefined,
-      undefined,
-      "submitted_at_window",
-    );
-  }
-  if (issuedAt !== undefined && submittedMs < Date.parse(issuedAt) - SUBMITTED_AT_SKEW_MS) {
-    throw new DomainError(
-      "Submitted time is earlier than this problem was issued.",
-      400,
-      undefined,
-      undefined,
-      "submitted_at_window",
-    );
-  }
+function clampSubmittedAt(
+  deviceSubmittedAt: string,
+  receivedAtMs: number,
+  issuedAt?: string,
+): { stored: string; clamped: 0 | 1 } {
+  const deviceMs = Date.parse(deviceSubmittedAt);
+  const lower = issuedAt !== undefined ? Date.parse(issuedAt) : Number.NEGATIVE_INFINITY;
+  const storedMs = Math.min(Math.max(deviceMs, lower), receivedAtMs);
+  return {
+    stored: new Date(storedMs).toISOString(),
+    clamped: storedMs === deviceMs ? 0 : 1,
+  };
 }
 
 export function parseSubmitAttempt(
@@ -190,8 +199,8 @@ export function parseSubmitAttempt(
   if (body.answer.length > 80) {
     throw new DomainError("Answer is too long.", 400);
   }
-  const shownAt = requireText(body.shownAt, "Shown time");
-  const submittedAt = requireText(body.submittedAt, "Submitted time");
+  const shownAt = requireInstant(body.shownAt, "Shown time");
+  const submittedAt = requireInstant(body.submittedAt, "Submitted time");
   const itemInstanceId =
     typeof body.itemInstanceId === "string" && body.itemInstanceId.trim().length > 0
       ? body.itemInstanceId.trim()
@@ -526,7 +535,7 @@ export function submitAnswer(
     throw new DomainError("Answer must be a string up to 80 characters.", 400);
   }
   const shownAt = parseInstant(input.shownAt, "Shown time");
-  const submittedAt = parseInstant(input.submittedAt, "Submitted time");
+  const deviceSubmittedAt = parseInstant(input.submittedAt, "Submitted time");
   const requestedNow = options?.now ? Date.parse(options.now) : Number.NaN;
   const receivedAtMs = Number.isFinite(requestedNow) ? requestedNow : Date.parse(nowIso());
   const sessionId = input.sessionId.trim();
@@ -541,7 +550,6 @@ export function submitAnswer(
   const commit = db.transaction((): { result: AttemptResult | FormatRejected; log: AttemptLog | null } => {
     const existing = findAttempt(db, childId, idempotencyKey);
     if (existing) return { result: resultFromRow(db, existing, true), log: null };
-    rejectSubmittedAt(submittedAt, receivedAtMs);
 
     const child = getChild(db, guardianId, childId);
     const gate = practiceGate(child.consentStatus);
@@ -559,21 +567,26 @@ export function submitAnswer(
     const item = catalogItem(itemId);
     if (!item) throw new DomainError("That problem is not in this practice pack.", 400);
 
-    const windowStart = new Date(
-      Date.parse(submittedAt) - SPAM_WINDOW_MS,
-    ).toISOString();
-    const prior = db
-      .prepare(
-        `SELECT COUNT(*) AS count FROM attempts
-         WHERE child_id = ? AND submitted_at > ? AND submitted_at <= ?`,
-      )
-      .get(childId, windowStart, submittedAt) as { count: number };
-    const elapsedMs = responseLatencyMs(shownAt, submittedAt);
-    const flags = integrityFlags({
-      answer: input.answer,
-      elapsedMs,
-      priorInWindow: prior.count,
-    });
+    let submittedAt = deviceSubmittedAt;
+    let submittedAtClamped: 0 | 1 = 0;
+    let flags: IntegrityFlag[] = [];
+    const bindClock = (issuedAt?: string) => {
+      const clock = clampSubmittedAt(deviceSubmittedAt, receivedAtMs, issuedAt);
+      submittedAt = clock.stored;
+      submittedAtClamped = clock.clamped;
+      const windowStart = new Date(Date.parse(submittedAt) - SPAM_WINDOW_MS).toISOString();
+      const prior = db
+        .prepare(
+          `SELECT COUNT(*) AS count FROM attempts
+           WHERE child_id = ? AND submitted_at > ? AND submitted_at <= ?`,
+        )
+        .get(childId, windowStart, submittedAt) as { count: number };
+      flags = integrityFlags({
+        answer: input.answer,
+        elapsedMs: responseLatencyMs(shownAt, deviceSubmittedAt),
+        priorInWindow: prior.count,
+      });
+    };
     let correct = false;
     let beats: FourBeat;
     let economy: {
@@ -628,7 +641,7 @@ export function submitAnswer(
           instanceHasSavedAttempt(db, instance.itemInstanceId),
         );
       }
-      rejectSubmittedAt(submittedAt, receivedAtMs, instance.issuedAt);
+      bindClock(instance.issuedAt);
       const skillRow = db
         .prepare(
           `SELECT skill_id FROM item_template_versions
@@ -752,6 +765,7 @@ export function submitAnswer(
       }
       consumeItemInstance(db, instance, idempotencyKey, submittedAt);
     } else {
+      bindClock();
       correct = gradeAnswer(itemId, input.answer);
       economy = planAttemptEconomy(db, {
         childId,
@@ -784,13 +798,13 @@ export function submitAnswer(
          submitted_at, correct, lane, celebration_tier, flags_json, beats_json,
          client_view_json, created_at, policy_version, build_sha, resume_presentation,
          item_instance_id, template_id, difficulty_step, estimator_evidence, outcome,
-         evidence_reason
+         evidence_reason, submitted_at_clamped
        ) VALUES (
          @id, @child_id, @session_id, @idempotency_key, @item_id, @answer, @shown_at,
          @submitted_at, @correct, @lane, @celebration_tier, @flags_json, @beats_json,
          @client_view_json, @created_at, @policy_version, @build_sha, @resume_presentation,
          @item_instance_id, @template_id, @difficulty_step, @estimator_evidence, @outcome,
-         @evidence_reason
+         @evidence_reason, @submitted_at_clamped
        )`,
     ).run({
       id: attemptId,
@@ -817,6 +831,7 @@ export function submitAnswer(
       estimator_evidence: estimatorEvidence,
       outcome: attemptOutcome,
       evidence_reason: evidenceReason,
+      submitted_at_clamped: submittedAtClamped,
     });
     if (!skipEconomy) commitAttemptEconomy(db, {
       childId,

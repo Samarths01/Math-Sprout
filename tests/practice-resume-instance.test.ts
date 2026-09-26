@@ -117,12 +117,6 @@ describe("stuck item survives a practice reload", () => {
       .prepare(`SELECT canonical_answer AS answer FROM item_instances WHERE item_instance_id = ?`)
       .get(firstInstanceId) as { answer: string } | undefined;
     expect(issued?.answer).toBeTruthy();
-    getDb()
-      .prepare(
-        `UPDATE item_instances SET issued_at = ?
-         WHERE item_instance_id = ? AND issued_at > ?`,
-      )
-      .run("2026-06-15T17:59:59.000Z", firstInstanceId, "2026-06-15T18:00:02.000Z");
 
     const answered = await call(
       submitAttemptRoute,

@@ -114,11 +114,11 @@ async function postAttempt(
         message: body?.error ?? "Practice is blocked.",
       };
     }
-    if (body?.code === "submitted_at_window") {
+    if (body?.code === "submitted_at_invalid") {
       return {
         ok: false,
         reason: "park",
-        message: interfaceCopy("offline.window.kid"),
+        message: interfaceCopy("offline.time.kid"),
       };
     }
     if (!response.ok || !body || typeof body.attemptId !== "string") {
@@ -241,9 +241,9 @@ function PracticeTurn({
   const [formatLocked, setFormatLocked] = useState(false);
   // shownAt is when this turn mounts, including after a reload. Check sends
   // that instant with submittedAt, and every retry sends the same pair.
-  // Counted response time is clamped to 120 seconds (ATTEMPT_LATENCY_CAP_MS).
-  // SUBMITTED_AT_SKEW_MS (2 minutes) rejects a Check time ahead of the server,
-  // or more than 2 minutes before the problem was issued.
+  // Counted response time is the device shown-to-Check span, clamped to
+  // 120 seconds (ATTEMPT_LATENCY_CAP_MS). The stored Check time is clamped
+  // to the server issue time and the server receive time.
   const [shownAt] = useState(() => new Date().toISOString());
   const openedQuiet = useRef(initialQuiet);
   const submittingRef = useRef(false);
