@@ -142,17 +142,30 @@ function parseInstant(value: string, label: string): string {
 
 /**
  * `submittedAt` is the device Check time. It also picks the XP and streak day,
- * the spam window, and evidence order. Reject a time ahead of the server, or
- * earlier than this item's server `issued_at`. Counted latency is capped apart
- * from this check.
+ * the spam window, and evidence order. Reject a time more than
+ * `SUBMITTED_AT_SKEW_MS` ahead of the server, or more than that skew before
+ * this item's server `issued_at`. A clock a little slow still lands inside
+ * the window. Counted latency is capped apart from this check.
  */
 function rejectSubmittedAt(submittedAt: string, receivedAtMs: number, issuedAt?: string): void {
   const submittedMs = Date.parse(submittedAt);
   if (submittedMs > receivedAtMs + SUBMITTED_AT_SKEW_MS) {
-    throw new DomainError("Submitted time is ahead of the server.", 400);
+    throw new DomainError(
+      "Submitted time is ahead of the server.",
+      400,
+      undefined,
+      undefined,
+      "submitted_at_window",
+    );
   }
-  if (issuedAt !== undefined && submittedMs < Date.parse(issuedAt)) {
-    throw new DomainError("Submitted time is earlier than this problem was issued.", 400);
+  if (issuedAt !== undefined && submittedMs < Date.parse(issuedAt) - SUBMITTED_AT_SKEW_MS) {
+    throw new DomainError(
+      "Submitted time is earlier than this problem was issued.",
+      400,
+      undefined,
+      undefined,
+      "submitted_at_window",
+    );
   }
 }
 

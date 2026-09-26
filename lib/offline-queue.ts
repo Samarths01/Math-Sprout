@@ -142,14 +142,22 @@ export function consentQueueReason(
  * A 409 is dropped only when `savedAttempt` is true: the server already stored
  * an attempt for this item. Every other 409 is parked with the session-ended
  * message, answer kept. A missing session, a missing child, and a routing 404
- * stay retryable. 5xx stays retryable until the park limit. Other statuses
- * return null so the caller keeps its existing mapping.
+ * stay retryable. A `submitted_at_window` code is parked with kid copy and
+ * is not a retryable error. 5xx stays retryable until the park limit. Other
+ * statuses return null so the caller keeps its existing mapping.
  */
 export function classifyAttemptFailure(
   status: number,
   body: { error?: unknown; retryable?: unknown; code?: unknown; savedAttempt?: unknown } | null,
 ): Extract<SyncPost, { ok: false; reason: "invalid_attempt" | "error" | "drop" | "park" }> | null {
   const unknownInstance = status === 404 && body?.code === "unknown_instance";
+  if (body?.code === "submitted_at_window") {
+    return {
+      ok: false,
+      reason: "park",
+      message: interfaceCopy("offline.window.kid"),
+    };
+  }
   if ((status === 400 && body?.error === "invalid_attempt" && body.retryable === false) || unknownInstance) {
     return { ok: false, reason: "invalid_attempt" };
   }

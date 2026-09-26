@@ -4225,7 +4225,8 @@ describe("item templates and issuance", () => {
     if (!screen) throw new Error("session did not issue");
     const receivedAt = new Date(Date.parse(screen.issuedAt) + 60_000).toISOString();
     const ahead = new Date(Date.parse(receivedAt) + SUBMITTED_AT_SKEW_MS + 1_000).toISOString();
-    expect(() =>
+    let aheadError: unknown;
+    try {
       submitAnswer(
         db,
         guardian.id,
@@ -4240,10 +4241,16 @@ describe("item templates and issuance", () => {
           submittedAt: ahead,
         },
         { now: receivedAt },
-      ),
-    ).toThrow(/ahead of the server/);
-    const early = new Date(Date.parse(screen.issuedAt) - 1_000).toISOString();
-    expect(() =>
+      );
+    } catch (error) {
+      aheadError = error;
+    }
+    expect(aheadError).toBeInstanceOf(DomainError);
+    expect((aheadError as DomainError).code).toBe("submitted_at_window");
+    expect((aheadError as DomainError).message).toMatch(/ahead of the server/);
+    const tooEarly = new Date(Date.parse(screen.issuedAt) - SUBMITTED_AT_SKEW_MS - 1_000).toISOString();
+    let earlyError: unknown;
+    try {
       submitAnswer(
         db,
         guardian.id,
@@ -4254,12 +4261,46 @@ describe("item templates and issuance", () => {
           itemId: session.item.id,
           itemInstanceId: screen.itemInstanceId,
           answer: screen.canonicalAnswer,
-          shownAt: early,
-          submittedAt: early,
+          shownAt: tooEarly,
+          submittedAt: tooEarly,
         },
         { now: receivedAt },
-      ),
-    ).toThrow(/earlier than this problem was issued/);
+      );
+    } catch (error) {
+      earlyError = error;
+    }
+    expect(earlyError).toBeInstanceOf(DomainError);
+    expect((earlyError as DomainError).code).toBe("submitted_at_window");
+    expect(publicErrorBody(earlyError)).toMatchObject({
+      status: 400,
+      body: { code: "submitted_at_window" },
+    });
+    const slowClock = new Date(Date.parse(screen.issuedAt) - 20_000).toISOString();
+    const slowShown = new Date(Date.parse(screen.issuedAt) - 30_000).toISOString();
+    const slowReceived = new Date(Date.parse(screen.issuedAt) + 10_000).toISOString();
+    const slow = submitAnswer(
+      db,
+      guardian.id,
+      child.id,
+      {
+        idempotencyKey: "submitted-slow-clock",
+        sessionId: session.sessionId,
+        itemId: session.item.id,
+        itemInstanceId: screen.itemInstanceId,
+        answer: screen.canonicalAnswer,
+        shownAt: slowShown,
+        submittedAt: slowClock,
+      },
+      { now: slowReceived },
+    );
+    if (isFormatRejected(slow)) throw new Error("a readable answer was rejected");
+    const slowRow = db
+      .prepare(`SELECT submitted_at AS submittedAt FROM attempts WHERE id = ?`)
+      .get(slow.attemptId) as { submittedAt: string };
+    expect(slowRow.submittedAt).toBe(slowClock);
+    const next = readItemInstance(db, slow.nextItem.itemInstanceId ?? "");
+    if (!next) throw new Error("next item was not issued");
+    const boundaryReceived = new Date(Date.parse(next.issuedAt) + 60_000).toISOString();
     const onTime = submitAnswer(
       db,
       guardian.id,
@@ -4268,20 +4309,95 @@ describe("item templates and issuance", () => {
         idempotencyKey: "submitted-on-time",
         sessionId: session.sessionId,
         itemId: session.item.id,
-        itemInstanceId: screen.itemInstanceId,
-        answer: screen.canonicalAnswer,
-        shownAt: screen.issuedAt,
-        submittedAt: new Date(Date.parse(receivedAt) + SUBMITTED_AT_SKEW_MS).toISOString(),
+        itemInstanceId: next.itemInstanceId,
+        answer: next.canonicalAnswer,
+        shownAt: next.issuedAt,
+        submittedAt: new Date(Date.parse(boundaryReceived) + SUBMITTED_AT_SKEW_MS).toISOString(),
       },
-      { now: receivedAt },
+      { now: boundaryReceived },
     );
     if (isFormatRejected(onTime)) throw new Error("a readable answer was rejected");
     const stored = db
       .prepare(`SELECT shown_at AS shownAt, submitted_at AS submittedAt FROM attempts WHERE id = ?`)
       .get(onTime.attemptId) as { shownAt: string; submittedAt: string };
-    expect(stored.shownAt).toBe(screen.issuedAt);
-    expect(Date.parse(stored.submittedAt)).toBe(Date.parse(receivedAt) + SUBMITTED_AT_SKEW_MS);
-    expect(db.prepare(`SELECT COUNT(*) AS count FROM attempts`).get()).toEqual({ count: 1 });
+    expect(stored.shownAt).toBe(next.issuedAt);
+    expect(Date.parse(stored.submittedAt)).toBe(Date.parse(boundaryReceived) + SUBMITTED_AT_SKEW_MS);
+    expect(db.prepare(`SELECT COUNT(*) AS count FROM attempts`).get()).toEqual({ count: 2 });
+  });
+
+  it("parks a submitted time outside the issue window instead of retrying it", async () => {
+    const db = tempDb();
+    const { guardian, child, session } = granted(db, "submitted-window-park@example.com");
+    const screen = readItemInstance(db, session.item.itemInstanceId ?? "");
+    if (!screen) throw new Error("session did not issue");
+    const tooEarly = new Date(Date.parse(screen.issuedAt) - SUBMITTED_AT_SKEW_MS - 1_000).toISOString();
+    const receivedAt = new Date(Date.parse(screen.issuedAt) + 60_000).toISOString();
+    let earlyError: unknown;
+    try {
+      submitAnswer(
+        db,
+        guardian.id,
+        child.id,
+        {
+          idempotencyKey: "submitted-window-route",
+          sessionId: session.sessionId,
+          itemId: session.item.id,
+          itemInstanceId: screen.itemInstanceId,
+          answer: screen.canonicalAnswer,
+          shownAt: tooEarly,
+          submittedAt: tooEarly,
+        },
+        { now: receivedAt },
+      );
+    } catch (error) {
+      earlyError = error;
+    }
+    const body = publicErrorBody(earlyError).body;
+    expect(body.code).toBe("submitted_at_window");
+    const classified = classifyAttemptFailure(400, body);
+    expect(classified).toEqual({
+      ok: false,
+      reason: "park",
+      message: interfaceCopy("offline.window.kid"),
+    });
+    if (!classified || classified.reason !== "park") throw new Error("window was not parked");
+    expect(classified.message).not.toBe(body.error);
+    const attempt: QueuedAttempt = {
+      idempotencyKey: "window-too-early",
+      childId: child.id,
+      sessionId: session.sessionId,
+      itemId: session.item.id,
+      itemInstanceId: screen.itemInstanceId,
+      answer: screen.canonicalAnswer,
+      shownAt: tooEarly,
+      submittedAt: tooEarly,
+    };
+    const queue = createAttemptQueue(memoryQueueStore());
+    queue.enqueue(attempt);
+    let posts = 0;
+    const post = async () => {
+      posts += 1;
+      return classified;
+    };
+    const parked = await queue.reconcile(post);
+    expect(posts).toBe(1);
+    expect(parked.pending).toEqual([]);
+    expect(parked.lastError).toBeUndefined();
+    expect(parked.parked.map((entry) => entry.idempotencyKey)).toEqual([attempt.idempotencyKey]);
+    expect(parked.parked[0]?.message).toBe(interfaceCopy("offline.window.kid"));
+    await queue.reconcile(post);
+    expect(posts).toBe(1);
+    const retried = await queue.retryParkedOnce(post);
+    expect(posts).toBe(2);
+    expect(retried.pending).toEqual([]);
+    expect(retried.parked).toEqual([]);
+    await queue.reconcile(post);
+    await queue.retryParkedOnce(post);
+    expect(posts).toBe(2);
+    const client = readFileSync(path.join(process.cwd(), "components/practice-session.tsx"), "utf8");
+    expect(client).toContain('body?.code === "submitted_at_window"');
+    expect(client).toContain('interfaceCopy("offline.window.kid")');
+    expect(client).not.toContain("Submitted time is earlier");
   });
 
   it("saves a late replay with HonestAttempt and no concept tick or band transition", async () => {

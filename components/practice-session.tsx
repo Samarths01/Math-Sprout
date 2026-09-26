@@ -96,7 +96,7 @@ async function postAttempt(
       ...(timeoutMs ? { signal: AbortSignal.timeout(timeoutMs) } : {}),
     });
     const body = (await response.json().catch(() => null)) as
-      | (AttemptResult & { error?: string; queueDisposition?: unknown })
+      | (AttemptResult & { error?: string; queueDisposition?: unknown; code?: unknown })
       | null;
     if (isFormatRejected(body)) {
       return { ok: false, reason: "format_rejected", rejected: body };
@@ -112,6 +112,13 @@ async function postAttempt(
         ok: false,
         reason: consentQueueReason(body),
         message: body?.error ?? "Practice is blocked.",
+      };
+    }
+    if (body?.code === "submitted_at_window") {
+      return {
+        ok: false,
+        reason: "park",
+        message: interfaceCopy("offline.window.kid"),
       };
     }
     if (!response.ok || !body || typeof body.attemptId !== "string") {
@@ -235,7 +242,8 @@ function PracticeTurn({
   // shownAt is when this turn mounts, including after a reload. Check sends
   // that instant with submittedAt, and every retry sends the same pair.
   // Counted response time is clamped to 120 seconds (ATTEMPT_LATENCY_CAP_MS).
-  // SUBMITTED_AT_SKEW_MS (2 minutes) rejects a Check time ahead of the server.
+  // SUBMITTED_AT_SKEW_MS (2 minutes) rejects a Check time ahead of the server,
+  // or more than 2 minutes before the problem was issued.
   const [shownAt] = useState(() => new Date().toISOString());
   const openedQuiet = useRef(initialQuiet);
   const submittingRef = useRef(false);
