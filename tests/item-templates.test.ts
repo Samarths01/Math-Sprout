@@ -19,6 +19,7 @@ import { advancePracticeSlot, parseSubmitAttempt, startPracticeSession, submitAn
 import { readAttemptLog } from "@/lib/attempt-log";
 import { choosePracticeLane, endPracticeSession } from "@/lib/boundary";
 import { interfaceCopy } from "@/lib/interface-copy";
+import { localDate } from "@/lib/local-time";
 import { AnswerBlank } from "@/components/answer-blank";
 import { PracticeProblem } from "@/components/practice-problem";
 import { ParkedAttemptNotice } from "@/components/practice-session";
@@ -4393,6 +4394,14 @@ describe("item templates and issuance", () => {
     expect(kinds).toContain("HonestAttempt");
     expect(kinds).not.toContain("ConceptProgressTick");
     expect(kinds).not.toContain("MasteryBandTransition");
+    const replayDay = localDate(parked.submittedAt, child.timezone);
+    const practiceDay = db
+      .prepare(
+        `SELECT COUNT(*) AS count FROM qualifying_events
+         WHERE child_id = ? AND kind = 'QualifyingPracticeDay' AND local_day = ?`,
+      )
+      .get(child.id, replayDay) as { count: number };
+    expect(practiceDay.count).toBe(1);
   });
 
   it("counts a parked answer normally when no newer attempt exists on that skill", async () => {
